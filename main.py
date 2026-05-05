@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.templating import Jinja2Templates
@@ -17,18 +16,24 @@ RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 app = FastAPI(title="Evalia CRB", version="1.0")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
+
 def load_rubric():
     with open(RUBRIC_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
+
 
 def normalize_text(text):
     if pd.isna(text):
         return ""
     text = str(text).strip().lower()
-    text = "".join(c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn")
+    text = "".join(
+        c for c in unicodedata.normalize("NFD", text)
+        if unicodedata.category(c) != "Mn"
+    )
     text = re.sub(r"[^a-z0-9ñ\s/.-]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
 
 def fuzzy_contains(answer, target, threshold=78):
     answer_n = normalize_text(answer)
@@ -39,6 +44,7 @@ def fuzzy_contains(answer, target, threshold=78):
         return True, 100
     score = fuzz.partial_ratio(answer_n, target_n)
     return score >= threshold, score
+
 
 def score_accepted_answers(answer, question):
     accepted = question.get("accepted_answers", [])
@@ -52,6 +58,7 @@ def score_accepted_answers(answer, question):
             return question["max_score"], min(score / 100, 1.0), f"Respuesta coincide con: {target}."
     return 0, best / 100, "No coincide suficientemente con las respuestas aceptadas."
 
+
 def score_true_false(answer, question):
     a = normalize_text(answer)
     accepted = [normalize_text(x) for x in question.get("accepted_answers", [])]
@@ -60,6 +67,7 @@ def score_true_false(answer, question):
     if accepted and a[:1] == accepted[0][:1]:
         return question["max_score"], 0.9, "Respuesta cerrada correcta por inicial."
     return 0, 0.9 if a else 0.2, "Respuesta cerrada incorrecta o vacía."
+
 
 def score_criteria(answer, question):
     criteria = question.get("criteria", [])
@@ -80,16 +88,17 @@ def score_criteria(answer, question):
         variants.extend(criterion.get("semantic_variants", []))
         variants.extend(criterion.get("accepted_values", []))
 
-        best = 0
-        hit = False
+        criterion_best = 0
+        criterion_hit = False
         for v in variants:
             ok, score = fuzzy_contains(answer, v, threshold=68)
-            best = max(best, score)
+            criterion_best = max(criterion_best, score)
             if ok:
-                hit = True
+                criterion_hit = True
 
-        confidence_scores.append(best / 100 if best else 0)
-        if hit:
+        confidence_scores.append(criterion_best / 100 if criterion_best else 0)
+
+        if criterion_hit:
             total += weight
             matched.append(concept)
         else:
@@ -105,6 +114,7 @@ def score_criteria(answer, question):
     if missing:
         feedback.append("Criterios no detectados: " + "; ".join([m for m in missing if m]))
     return round(total, 2), round(confidence, 2), " | ".join(feedback)
+
 
 def score_enumeration(answer, question):
     max_score = float(question.get("max_score", 0))
@@ -144,6 +154,7 @@ def score_enumeration(answer, question):
     confidence = counted / required if required else 0
     return round(score, 2), round(confidence, 2), f"Elementos válidos detectados: {counted}/{required}. {', '.join(sorted(set(hits)))}"
 
+
 def score_matching(answer, question):
     max_score = float(question.get("max_score", 0))
     pairs = question.get("pairs", [])
@@ -160,6 +171,7 @@ def score_matching(answer, question):
             found.append(f"{left} -> {right}")
     confidence = total / max_score if max_score else 0
     return round(min(total, max_score), 2), round(confidence, 2), "Relaciones detectadas: " + "; ".join(found)
+
 
 def score_answer(answer, question):
     item_type = question.get("item_type", "")
@@ -180,13 +192,16 @@ def score_answer(answer, question):
     status = "aceptado" if conf >= 0.85 else ("revisar" if conf < 0.60 else "aceptado_con_cautela")
     return score, conf, fb, status
 
+
 def validate_columns(df, rubric):
     required = rubric.get("input_format", {}).get("required_columns", [])
     return [c for c in required if c not in df.columns]
 
+
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request, "index.html")
+
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
@@ -249,10 +264,14 @@ async def upload(file: UploadFile = File(...)):
         pd.DataFrame(feedback_rows).to_excel(writer, sheet_name="feedback", index=False)
 
     return HTMLResponse(
-        f"<h2>Procesamiento completado</h2><p>Archivo generado correctamente.</p>"
-        f"<p><a href='/download/{output_name}'>Descargar resultados Excel</a></p>"
-        "<p><a href='/'>Volver</a></p>"
+        f"""
+        <h2>Procesamiento completado</h2>
+        <p>Archivo generado correctamente.</p>
+        <p><a href="/download/{output_name}">Descargar resultados Excel</a></p>
+        <p><a href="/">Volver</a></p>
+        """
     )
+
 
 @app.get("/download/{filename}")
 def download(filename: str):
@@ -262,3 +281,4 @@ def download(filename: str):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=filename
     )
+
