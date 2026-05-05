@@ -1,0 +1,215 @@
+{
+  "platform": "Evalia",
+  "engine": "CRB",
+  "version": "1.0",
+  "exam_id": "psicolinguistica_2026_piloto",
+  "domain": "psicolinguistica",
+  "language": "es",
+  "total_score": 81,
+  "input_format": {
+    "required_columns": [
+      "student_id",
+      "nombre",
+      "Q1",
+      "Q2",
+      "Q3",
+      "Q4",
+      "Q5",
+      "Q6",
+      "Q7",
+      "Q8",
+      "Q9",
+      "Q10",
+      "Q11",
+      "Q12",
+      "Q13",
+      "Q14",
+      "Q15",
+      "Q16",
+      "Q17",
+      "Q18",
+      "Q19",
+      "Q20",
+      "Q21",
+      "Q22",
+      "Q23",
+      "Q24",
+      "Q25",
+      "Q26",
+      "Q27",
+      "Q28",
+      "Q29",
+      "Q30",
+      "Q31",
+      "Q32",
+      "Q33",
+      "Q34"
+    ]
+  },
+  "global_confidence_rules": {
+    "auto_accept_threshold": 0.85,
+    "manual_review_threshold": 0.60,
+    "review_if_empty_answer": true,
+    "review_if_ocr_confidence_low": true
+  },
+  "questions": [
+    {
+      "id": "Q1",
+      "prompt": "Defina psicolingüística e indique dos de sus principales áreas de estudio.",
+      "item_type": "definition_plus_enumeration",
+      "max_score": 2,
+      "criteria": [
+        {
+          "concept": "procesamiento cognitivo del lenguaje",
+          "weight": 1.0,
+          "semantic_variants": [
+            "procesamiento mental del lenguaje",
+            "cómo la mente procesa el lenguaje",
+            "procesos psicológicos del lenguaje"
+          ]
+        },
+        {
+          "concept": "áreas de estudio válidas",
+          "weight": 1.0,
+          "accepted_values": [
+            "adquisición",
+            "comprensión",
+            "producción",
+            "percepción",
+            "lectura",
+            "acceso léxico",
+            "procesamiento fonológico"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "Q2",
+      "prompt": "La psicolingüística estudia el __________ del lenguaje.",
+      "item_type": "completion",
+      "max_score": 1,
+      "accepted_answers": [
+        "procesamiento cognitivo",
+        "procesamiento mental",
+        "procesamiento"
+      ]
+    },
+    {
+      "id": "Q3",
+      "prompt": "Explique la diferencia entre fonética y fonología.",
+      "item_type": "differentiation",
+      "max_score": 2,
+      "criteria": [
+        {
+          "concept": "fonética como propiedades físicas, articulatorias o acústicas",
+          "weight": 1.0
+        },
+        {
+          "concept": "fonología como organización o función de sonidos en la lengua",
+          "weight": 1.0
+        }
+      ]
+    },
+    {
+      "id": "Q4",
+      "prompt": "¿Qué significa que el español sea una lengua transparente y qué implicancias tiene para el aprendizaje lector?",
+      "item_type": "causal_explanation",
+      "max_score": 3,
+      "criteria": [
+        {
+          "concept": "correspondencia grafema-fonema regular",
+          "weight": 1.5
+        },
+        {
+          "concept": "facilita decodificación o aprendizaje lector inicial",
+          "weight": 1.5
+        }
+      ]
+    },
+    {
+      "id": "Q5",
+      "prompt": "La fonología estudia las propiedades físicas y articulatorias de los sonidos. V/F",
+      "item_type": "true_false",
+      "max_score": 1,
+      "accepted_answers": [
+        "F",
+        "Falso",
+        "No"
+      ]
+    },
+    {
+      "id": "Q6",
+      "prompt": "Explique qué demostraron los resultados del experimento tipo Ganong realizado en clases.",
+      "item_type": "experimental_interpretation",
+      "max_score": 3,
+      "criteria": [
+        {
+          "concept": "percepción fonémica influida por contexto léxico",
+          "weight": 1.0
+        },
+        {
+          "concept": "procesamiento top-down o interactivo",
+          "weight": 1.0
+        },
+        {
+          "concept": "ambigüedad fonémica o efecto lexical",
+          "weight": 1.0
+        }
+      ]
+    },
+    {
+      "id": "Q7",
+      "prompt": "Señale tres diferencias entre lenguaje oral y lenguaje escrito.",
+      "item_type": "enumeration",
+      "max_score": 3,
+      "constraints": {
+        "required_number_of_items": 3
+      },
+      "accepted_concepts": [
+        "oral auditivo / escrito visual",
+        "oral efímero / escrito permanente",
+        "oral contextual / escrito más autónomo",
+        "oral espontáneo / escrito planificado",
+        "oral con prosodia / escrito sin prosodia directa",
+        "oral interactivo / escrito diferido"
+      ]
+    },
+    {
+      "id": "Q8",
+      "prompt": "¿Cuál es la principal unidad de segmentación perceptiva de las palabras en español según De Vega?",
+      "item_type": "short_exact_answer",
+      "max_score": 1,
+      "accepted_answers": [
+        "sílaba",
+        "la sílaba"
+      ]
+    },
+    {
+      "id": "Q9",
+      "prompt": "¿Cuál modelo explica mejor por qué comprendemos palabras mal escritas?",
+      "item_type": "justification",
+      "max_score": 2,
+      "criteria": [
+        {
+          "concept": "modelo interactivo, conexionista o paralelo",
+          "weight": 1.0
+        },
+        {
+          "concept": "fundamento por contexto o top-down",
+          "weight": 1.0
+        }
+      ]
+    },
+    {
+      "id": "Q10",
+      "prompt": "El contexto léxico puede influir en la percepción fonémica. V/F",
+      "item_type": "true_false",
+      "max_score": 1,
+      "accepted_answers": [
+        "V",
+        "Verdadero",
+        "Sí"
+      ]
+    }
+  ]
+}
