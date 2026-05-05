@@ -1,6 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, Request
+from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.templating import Jinja2Templates
 from pathlib import Path
 import pandas as pd
 import json
@@ -14,7 +13,6 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
 app = FastAPI(title="Evalia CRB", version="1.0")
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
 def load_rubric():
@@ -50,6 +48,7 @@ def score_accepted_answers(answer, question):
     accepted = question.get("accepted_answers", [])
     if not accepted:
         return 0, 0.0, "Sin respuestas aceptadas configuradas."
+
     best = 0
     for target in accepted:
         ok, score = fuzzy_contains(answer, target, threshold=80)
@@ -90,6 +89,7 @@ def score_criteria(answer, question):
 
         criterion_best = 0
         criterion_hit = False
+
         for v in variants:
             ok, score = fuzzy_contains(answer, v, threshold=68)
             criterion_best = max(criterion_best, score)
@@ -113,6 +113,7 @@ def score_criteria(answer, question):
         feedback.append("Criterios detectados: " + "; ".join([m for m in matched if m]))
     if missing:
         feedback.append("Criterios no detectados: " + "; ".join([m for m in missing if m]))
+
     return round(total, 2), round(confidence, 2), " | ".join(feedback)
 
 
@@ -125,19 +126,23 @@ def score_enumeration(answer, question):
         total_hits = 0
         total_required = 0
         details = []
+
         for cat, vals in accepted.items():
             cat_hits = 0
             for v in vals:
                 ok, _ = fuzzy_contains(answer, v, threshold=68)
                 if ok:
                     cat_hits += 1
+
             needed = question.get("constraints", {}).get("min_per_category", 1)
             counted = min(cat_hits, needed)
             total_hits += counted
             total_required += needed
             details.append(f"{cat}: {counted}/{needed}")
+
         score = max_score * (total_hits / total_required) if total_required else 0
         conf = min(1.0, total_hits / total_required) if total_required else 0
+
         return round(score, 2), round(conf, 2), "Enumeración categorizada: " + "; ".join(details)
 
     hits = []
@@ -152,6 +157,7 @@ def score_enumeration(answer, question):
     counted = min(len(set(hits)), required)
     score = max_score * (counted / required) if required else 0
     confidence = counted / required if required else 0
+
     return round(score, 2), round(confidence, 2), f"Elementos válidos detectados: {counted}/{required}. {', '.join(sorted(set(hits)))}"
 
 
@@ -160,21 +166,26 @@ def score_matching(answer, question):
     pairs = question.get("pairs", [])
     total = 0.0
     found = []
+
     for pair in pairs:
         left = pair.get("prompt_value", "")
         right = pair.get("correct_match", "")
         weight = float(pair.get("weight", 1.0))
         ok_left, _ = fuzzy_contains(answer, left, threshold=65)
         ok_right, _ = fuzzy_contains(answer, right, threshold=65)
+
         if ok_left and ok_right:
             total += weight
             found.append(f"{left} -> {right}")
+
     confidence = total / max_score if max_score else 0
+
     return round(min(total, max_score), 2), round(confidence, 2), "Relaciones detectadas: " + "; ".join(found)
 
 
 def score_answer(answer, question):
     item_type = question.get("item_type", "")
+
     if not str(answer).strip():
         return 0, 0.1, "Respuesta vacía.", "revisar"
 
@@ -199,23 +210,78 @@ def validate_columns(df, rubric):
 
 
 @app.get("/", response_class=HTMLResponse)
-def home(request: Request):
-    return templates.TemplateResponse(request, "index.html")
+def home():
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+      <meta charset="UTF-8">
+      <title>Evalia CRB</title>
+      <style>
+        body {
+          font-family: Arial, sans-serif;
+          margin: 40px;
+          background: #f7f7f8;
+          color: #222;
+        }
+        .card {
+          background: white;
+          padding: 28px;
+          border-radius: 16px;
+          max-width: 760px;
+          box-shadow: 0 4px 18px rgba(0,0,0,.08);
+        }
+        h1 { margin-top: 0; }
+        .muted { color: #666; }
+        input, button { font-size: 16px; margin-top: 12px; }
+        button {
+          padding: 10px 18px;
+          border: none;
+          border-radius: 10px;
+          cursor: pointer;
+          background: #222;
+          color: white;
+        }
+        code {
+          background:#eee;
+          padding:2px 6px;
+          border-radius:6px;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>Evalia CRB</h1>
+        <p class="muted">MVP 1 · Corrección automatizada de respuestas breves desde Excel</p>
+
+        <form action="/upload" enctype="multipart/form-data" method="post">
+          <p>Sube un Excel con columnas <code>student_id</code>, <code>nombre</code>, <code>Q1</code> ... <code>Q34</code>.</p>
+          <input name="file" type="file" accept=".xlsx,.xls" required>
+          <br>
+          <button type="submit">Procesar certamen</button>
+        </form>
+      </div>
+    </body>
+    </html>
+    """)
 
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
     rubric = load_rubric()
     input_path = OUTPUT_DIR / file.filename
+
     with open(input_path, "wb") as f:
         f.write(await file.read())
 
     df = pd.read_excel(input_path)
     missing = validate_columns(df, rubric)
+
     if missing:
         return HTMLResponse(
             f"<h2>Error de formato</h2><p>Faltan columnas: {', '.join(missing)}</p>"
             "<p>El Excel debe incluir: student_id, nombre, Q1...Q34.</p>"
+            "<p><a href='/'>Volver</a></p>"
         )
 
     questions = rubric.get("questions", [])
@@ -234,9 +300,11 @@ async def upload(file: UploadFile = File(...)):
             qid = q["id"]
             answer = row.get(qid, "")
             score, conf, fb, status = score_answer(answer, q)
+
             score_row[f"{qid}_score"] = score
             conf_row[f"{qid}_confidence"] = conf
             total += score
+
             feedback_rows.append({
                 "student_id": sid,
                 "nombre": nombre,
