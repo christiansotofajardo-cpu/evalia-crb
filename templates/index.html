@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Evalia CRB</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 40px;
+      background: #f7f7f8;
+      color: #222;
+    }
+    .card {
+      background: white;
+      padding: 28px;
+      border-radius: 16px;
+      max-width: 760px;
+      box-shadow: 0 4px 18px rgba(0,0,0,.08);
+    }
+    h1 { margin-top: 0; }
+    .muted { color: #666; }
+    input, button { font-size: 16px; margin-top: 12px; }
+    button {
+      padding: 10px 18px;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      background: #222;
+      color: white;
+    }
+    code {
+      background:#eee;
+      padding:2px 6px;
+      border-radius:6px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Evalia CRB</h1>
+    <p class="muted">MVP 1 · Corrección automatizada de respuestas breves desde Excel</p>
+
+    <form action="/upload" enctype="multipart/form-data" method="post">
+      <p>Sube un Excel con columnas <code>student_id</code>, <code>nombre</code>, <code>Q1</code> ... <code>Q10</code>.</p>
+      <input name="file" type="file" accept=".xlsx,.xls" required>
+      <br>
+      <button type="submit">Procesar certamen</button>
+    </form>
+  </div>
+</body>
+</html>
