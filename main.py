@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, FileResponse
 from pathlib import Path
 import pandas as pd
@@ -6,18 +6,82 @@ import json
 import re
 import unicodedata
 from rapidfuzz import fuzz
+from html import escape
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
-RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
-app = FastAPI(title="Evalia CRB", version="1.5")
+# Evalia v2.0: rúbricas dinámicas
+RUBRICS_DIR = BASE_DIR / "rubrics"
+RUBRICS_DIR.mkdir(exist_ok=True)
+
+# Compatibilidad: si todavía existe la rúbrica antigua en raíz,
+# Evalia puede usarla como respaldo.
+LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
+
+app = FastAPI(title="Evalia CRB", version="2.0")
 
 
-def load_rubric():
-    with open(RUBRIC_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+def get_available_rubrics():
+    """
+    Busca todas las rúbricas JSON disponibles en /rubrics.
+    Si no hay rúbricas en /rubrics, intenta usar la rúbrica antigua
+    ubicada en la raíz del proyecto.
+    """
+    rubrics = []
+
+    for path in sorted(RUBRICS_DIR.glob("*.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            rubric_name = data.get("name") or data.get("title") or path.stem.replace("_", " ").title()
+            rubrics.append({"filename": path.name, "name": rubric_name, "path": path})
+        except Exception:
+            continue
+
+    if not rubrics and LEGACY_RUBRIC_PATH.exists():
+        try:
+            with open(LEGACY_RUBRIC_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            rubric_name = data.get("name") or data.get("title") or "Psicolingüística 2026"
+            rubrics.append({"filename": LEGACY_RUBRIC_PATH.name, "name": rubric_name, "path": LEGACY_RUBRIC_PATH})
+        except Exception:
+            pass
+
+    return rubrics
+
+
+def safe_rubric_path(selected_filename):
+    """Evita path traversal: solo permite cargar rúbricas registradas."""
+    for r in get_available_rubrics():
+        if r["filename"] == selected_filename:
+            return r["path"]
+    return None
+
+
+def load_rubric(selected_filename=None):
+    available = get_available_rubrics()
+    if not available:
+        raise FileNotFoundError(
+            "No se encontraron rúbricas JSON. Crea la carpeta /rubrics y agrega al menos una rúbrica .json."
+        )
+
+    if selected_filename:
+        path = safe_rubric_path(selected_filename)
+        if path is None:
+            raise FileNotFoundError("La rúbrica seleccionada no existe o no está permitida.")
+    else:
+        path = available[0]["path"]
+
+    with open(path, "r", encoding="utf-8") as f:
+        rubric = json.load(f)
+
+    rubric["_rubric_filename"] = path.name
+    rubric["_rubric_display_name"] = rubric.get("name") or rubric.get("title") or path.stem.replace("_", " ").title()
+    return rubric
 
 
 def normalize_text(text):
@@ -209,448 +273,227 @@ def validate_columns(df, rubric):
     return [c for c in required if c not in df.columns]
 
 
-def base_html(content: str, title: str = "Evalia CRB"):
+def base_css():
+    return """
+    <style>
+      :root { --bg:#f5f6f8; --card:#ffffff; --ink:#15171a; --muted:#667085; --line:#e5e7eb; --accent:#111827; --soft:#f9fafb; --ok:#067647; }
+      * { box-sizing: border-box; }
+      body { margin:0; min-height:100vh; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; background: radial-gradient(circle at top left, rgba(17,24,39,.08), transparent 28%), var(--bg); color:var(--ink); }
+      .page { width:100%; min-height:100vh; display:flex; justify-content:center; padding:42px 20px; }
+      .shell { width:100%; max-width:920px; }
+      .topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:26px; }
+      .brand { display:flex; align-items:center; gap:12px; }
+      .logo { width:42px; height:42px; border-radius:14px; background:#111827; color:white; display:grid; place-items:center; font-weight:800; letter-spacing:-.03em; }
+      .brand-title { font-size:22px; font-weight:800; letter-spacing:-.04em; }
+      .brand-subtitle { color:var(--muted); font-size:13px; margin-top:2px; }
+      .badge { padding:8px 12px; background:white; border:1px solid var(--line); border-radius:999px; color:var(--muted); font-size:13px; }
+      .hero { background:rgba(255,255,255,.86); backdrop-filter:blur(12px); border:1px solid var(--line); border-radius:28px; box-shadow:0 20px 60px rgba(17,24,39,.08); overflow:hidden; }
+      .hero-inner { padding:34px; }
+      h1 { margin:0; font-size:42px; line-height:1.04; letter-spacing:-.06em; }
+      .lead { margin:14px 0 26px; color:var(--muted); font-size:17px; line-height:1.55; max-width:720px; }
+      .panel { background:var(--soft); border:1px solid var(--line); border-radius:22px; padding:22px; }
+      .field-label { display:block; font-weight:700; margin-bottom:8px; font-size:14px; }
+      select { width:100%; padding:14px; border:1px solid var(--line); border-radius:14px; background:white; font-size:15px; color:var(--ink); margin-bottom:18px; }
+      .dropzone { position:relative; border:2px dashed #cbd5e1; background:white; border-radius:20px; padding:30px 22px; text-align:center; transition:.18s ease; cursor:pointer; }
+      .dropzone:hover { border-color:#111827; transform:translateY(-1px); box-shadow:0 12px 28px rgba(17,24,39,.08); }
+      .dropzone input { position:absolute; inset:0; opacity:0; cursor:pointer; }
+      .drop-icon { font-size:34px; margin-bottom:10px; }
+      .drop-title { font-weight:800; font-size:18px; }
+      .drop-subtitle { color:var(--muted); margin-top:6px; font-size:14px; }
+      .file-name { margin-top:12px; font-size:14px; color:var(--ok); font-weight:700; min-height:18px; }
+      .actions { display:flex; align-items:center; gap:14px; margin-top:18px; flex-wrap:wrap; }
+      button, .button { border:none; border-radius:14px; padding:13px 19px; font-size:15px; font-weight:800; background:var(--accent); color:white; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; gap:8px; transition:.18s ease; }
+      button:hover, .button:hover { transform:translateY(-1px); box-shadow:0 14px 24px rgba(17,24,39,.18); }
+      .hint { color:var(--muted); font-size:13px; }
+      .features { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; padding:18px 34px 30px; }
+      .feature { background:white; border:1px solid var(--line); border-radius:18px; padding:16px; color:var(--muted); font-size:13px; }
+      .feature strong { display:block; color:var(--ink); font-size:14px; margin-bottom:5px; }
+      .loader { display:none; align-items:center; gap:10px; color:var(--muted); font-size:14px; margin-top:14px; }
+      .spinner { width:18px; height:18px; border:3px solid #e5e7eb; border-top-color:#111827; border-radius:50%; animation:spin 1s linear infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .result-card { background:white; border:1px solid var(--line); border-radius:28px; box-shadow:0 20px 60px rgba(17,24,39,.08); padding:34px; }
+      .result-title { font-size:30px; font-weight:900; letter-spacing:-.04em; margin:0 0 10px; }
+      .metric-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:24px 0; }
+      .metric { border:1px solid var(--line); border-radius:18px; padding:16px; background:var(--soft); }
+      .metric-value { font-size:24px; font-weight:900; }
+      .metric-label { color:var(--muted); font-size:13px; margin-top:4px; }
+      .error { color:#b42318; background:#fff4f2; border:1px solid #fecdca; border-radius:18px; padding:18px; }
+      code { background:#eef2f7; padding:2px 6px; border-radius:6px; }
+      @media (max-width:760px) { h1{font-size:32px;} .features,.metric-grid{grid-template-columns:1fr;} .topbar{align-items:flex-start; gap:14px; flex-direction:column;} }
+    </style>
+    """
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    rubrics = get_available_rubrics()
+
+    if not rubrics:
+        rubric_options = ""
+        disabled = "disabled"
+        rubric_warning = """
+        <div class="error" style="margin-bottom:18px;">
+          <strong>No hay rúbricas disponibles.</strong><br>
+          Crea una carpeta <code>rubrics</code> y agrega al menos un archivo <code>.json</code>.
+        </div>
+        """
+    else:
+        rubric_options = "\n".join(
+            f'<option value="{escape(r["filename"])}">{escape(r["name"])} · {escape(r["filename"])}</option>'
+            for r in rubrics
+        )
+        disabled = ""
+        rubric_warning = ""
+
     return HTMLResponse(f"""
     <!DOCTYPE html>
     <html lang="es">
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>{title}</title>
-      <style>
-        :root {{
-          --bg: #f5f6f8;
-          --card: #ffffff;
-          --text: #171717;
-          --muted: #666f7a;
-          --line: #d9dde3;
-          --primary: #111827;
-          --primary-hover: #000000;
-          --soft: #f0f2f5;
-          --success: #137333;
-          --warning: #9a6700;
-        }}
-
-        * {{ box-sizing: border-box; }}
-
-        body {{
-          margin: 0;
-          font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-          background:
-            radial-gradient(circle at top left, rgba(30, 64, 175, 0.08), transparent 28%),
-            var(--bg);
-          color: var(--text);
-        }}
-
-        .page {{
-          min-height: 100vh;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          padding: 36px 20px;
-        }}
-
-        .shell {{
-          width: 100%;
-          max-width: 920px;
-        }}
-
-        .brand {{
-          display: flex;
-          align-items: center;
-          gap: 14px;
-          margin-bottom: 18px;
-        }}
-
-        .logo {{
-          width: 44px;
-          height: 44px;
-          border-radius: 14px;
-          background: var(--primary);
-          color: white;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          font-weight: 800;
-          letter-spacing: -0.04em;
-        }}
-
-        .brand h1 {{
-          margin: 0;
-          font-size: 34px;
-          letter-spacing: -0.04em;
-        }}
-
-        .brand p {{
-          margin: 4px 0 0;
-          color: var(--muted);
-          font-size: 15px;
-        }}
-
-        .card {{
-          background: var(--card);
-          border: 1px solid rgba(0,0,0,0.04);
-          border-radius: 26px;
-          padding: 34px;
-          box-shadow: 0 24px 70px rgba(17, 24, 39, 0.10);
-        }}
-
-        .eyebrow {{
-          display: inline-flex;
-          align-items: center;
-          gap: 8px;
-          color: var(--muted);
-          background: var(--soft);
-          padding: 7px 11px;
-          border-radius: 999px;
-          font-size: 13px;
-          margin-bottom: 18px;
-        }}
-
-        h2 {{
-          margin: 0 0 10px;
-          font-size: 28px;
-          letter-spacing: -0.03em;
-        }}
-
-        .lead {{
-          margin: 0 0 24px;
-          color: var(--muted);
-          line-height: 1.55;
-          max-width: 760px;
-        }}
-
-        .dropzone {{
-          border: 2px dashed var(--line);
-          background: #fbfbfc;
-          border-radius: 22px;
-          padding: 34px;
-          text-align: center;
-          transition: all .2s ease;
-          cursor: pointer;
-        }}
-
-        .dropzone:hover, .dropzone.dragover {{
-          border-color: var(--primary);
-          background: #f8fafc;
-          transform: translateY(-1px);
-        }}
-
-        .drop-icon {{
-          width: 54px;
-          height: 54px;
-          margin: 0 auto 14px;
-          border-radius: 18px;
-          background: var(--soft);
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          font-size: 26px;
-        }}
-
-        .drop-title {{
-          font-weight: 750;
-          font-size: 19px;
-          margin-bottom: 6px;
-        }}
-
-        .drop-subtitle {{
-          color: var(--muted);
-          font-size: 14px;
-        }}
-
-        input[type="file"] {{ display: none; }}
-
-        .file-name {{
-          margin-top: 14px;
-          color: var(--primary);
-          font-size: 14px;
-          font-weight: 650;
-        }}
-
-        .actions {{
-          display: flex;
-          gap: 12px;
-          align-items: center;
-          justify-content: space-between;
-          margin-top: 22px;
-          flex-wrap: wrap;
-        }}
-
-        .btn {{
-          appearance: none;
-          border: none;
-          border-radius: 14px;
-          padding: 13px 22px;
-          font-size: 15px;
-          font-weight: 750;
-          cursor: pointer;
-          text-decoration: none;
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          gap: 8px;
-        }}
-
-        .btn-primary {{
-          background: var(--primary);
-          color: white;
-        }}
-
-        .btn-primary:hover {{ background: var(--primary-hover); }}
-
-        .btn-secondary {{
-          background: var(--soft);
-          color: var(--primary);
-        }}
-
-        .hint {{
-          color: var(--muted);
-          font-size: 13px;
-        }}
-
-        .features {{
-          display: grid;
-          grid-template-columns: repeat(4, minmax(0, 1fr));
-          gap: 12px;
-          margin-top: 24px;
-        }}
-
-        .feature {{
-          background: #fbfbfc;
-          border: 1px solid #edf0f3;
-          border-radius: 16px;
-          padding: 14px;
-          color: #374151;
-          font-size: 13px;
-          line-height: 1.35;
-        }}
-
-        .loader {{
-          display: none;
-          margin-top: 22px;
-          padding: 18px;
-          background: #fbfbfc;
-          border-radius: 18px;
-          color: var(--muted);
-        }}
-
-        .bar {{
-          height: 8px;
-          background: var(--soft);
-          border-radius: 999px;
-          overflow: hidden;
-          margin-top: 12px;
-        }}
-
-        .bar span {{
-          display: block;
-          height: 100%;
-          width: 45%;
-          background: var(--primary);
-          border-radius: 999px;
-          animation: move 1.3s infinite ease-in-out;
-        }}
-
-        @keyframes move {{
-          0% {{ transform: translateX(-120%); }}
-          100% {{ transform: translateX(240%); }}
-        }}
-
-        .stats {{
-          display: grid;
-          grid-template-columns: repeat(4, minmax(0, 1fr));
-          gap: 12px;
-          margin: 24px 0;
-        }}
-
-        .stat {{
-          background: #fbfbfc;
-          border: 1px solid #edf0f3;
-          border-radius: 18px;
-          padding: 18px;
-        }}
-
-        .stat-number {{
-          font-size: 26px;
-          font-weight: 850;
-          letter-spacing: -0.04em;
-        }}
-
-        .stat-label {{
-          color: var(--muted);
-          font-size: 13px;
-          margin-top: 4px;
-        }}
-
-        .success {{ color: var(--success); }}
-        .warning {{ color: var(--warning); }}
-
-        .error-box {{
-          background: #fff8f6;
-          border: 1px solid #ffd7ce;
-          color: #7a271a;
-          border-radius: 18px;
-          padding: 18px;
-          margin-top: 18px;
-          line-height: 1.5;
-        }}
-
-        code {{
-          background: var(--soft);
-          padding: 2px 6px;
-          border-radius: 7px;
-          font-size: 13px;
-        }}
-
-        @media (max-width: 760px) {{
-          .card {{ padding: 24px; }}
-          .features, .stats {{ grid-template-columns: 1fr 1fr; }}
-          .brand h1 {{ font-size: 30px; }}
-        }}
-      </style>
+      <title>Evalia · Evaluación Automatizada Inteligente</title>
+      {base_css()}
     </head>
     <body>
-      <main class="page">
-        <section class="shell">
-          {content}
-        </section>
-      </main>
+      <div class="page">
+        <main class="shell">
+          <div class="topbar">
+            <div class="brand">
+              <div class="logo">E</div>
+              <div>
+                <div class="brand-title">Evalia</div>
+                <div class="brand-subtitle">Evaluación Automatizada Inteligente</div>
+              </div>
+            </div>
+            <div class="badge">CRB Engine · v2.0 multi-rúbrica</div>
+          </div>
+
+          <section class="hero">
+            <div class="hero-inner">
+              <h1>Corrige respuestas breves con rúbricas configurables.</h1>
+              <p class="lead">
+                Evalia aplica un motor Criteria/Rubric Based para evaluar respuestas desde Excel,
+                calcular puntajes, estimar confianza y generar retroalimentación por ítem.
+              </p>
+
+              {rubric_warning}
+
+              <form action="/upload" enctype="multipart/form-data" method="post" id="uploadForm">
+                <div class="panel">
+                  <label class="field-label" for="rubric">Selecciona rúbrica de evaluación</label>
+                  <select name="rubric" id="rubric" {disabled}>
+                    {rubric_options}
+                  </select>
+
+                  <label class="field-label">Archivo de respuestas</label>
+                  <div class="dropzone" id="dropzone">
+                    <input name="file" id="fileInput" type="file" accept=".xlsx,.xls" required {disabled}>
+                    <div class="drop-icon">📄</div>
+                    <div class="drop-title">Arrastra tu Excel aquí</div>
+                    <div class="drop-subtitle">o haz clic para seleccionar archivo · formatos .xlsx / .xls</div>
+                    <div class="file-name" id="fileName"></div>
+                  </div>
+
+                  <div class="actions">
+                    <button type="submit" id="submitBtn" {disabled}>Evaluar respuestas</button>
+                    <span class="hint">El Excel debe contener las columnas definidas por la rúbrica seleccionada.</span>
+                  </div>
+
+                  <div class="loader" id="loader">
+                    <div class="spinner"></div>
+                    <span>Analizando respuestas · aplicando rúbrica · generando reporte...</span>
+                  </div>
+                </div>
+              </form>
+            </div>
+
+            <div class="features">
+              <div class="feature"><strong>Multi-rúbrica</strong>Selecciona distintas evaluaciones JSON.</div>
+              <div class="feature"><strong>Scoring automático</strong>Puntajes por ítem y total.</div>
+              <div class="feature"><strong>Confianza</strong>Marca respuestas seguras y dudosas.</div>
+              <div class="feature"><strong>Excel final</strong>Scores, confidence y feedback.</div>
+            </div>
+          </section>
+        </main>
+      </div>
+
+      <script>
+        const fileInput = document.getElementById("fileInput");
+        const fileName = document.getElementById("fileName");
+        const form = document.getElementById("uploadForm");
+        const loader = document.getElementById("loader");
+        const submitBtn = document.getElementById("submitBtn");
+
+        if (fileInput) {{
+          fileInput.addEventListener("change", () => {{
+            if (fileInput.files.length > 0) {{
+              fileName.textContent = "Archivo seleccionado: " + fileInput.files[0].name;
+            }}
+          }});
+        }}
+
+        if (form) {{
+          form.addEventListener("submit", () => {{
+            if (loader) loader.style.display = "flex";
+            if (submitBtn) {{
+              submitBtn.disabled = true;
+              submitBtn.textContent = "Procesando...";
+            }}
+          }});
+        }}
+      </script>
     </body>
     </html>
     """)
 
 
-@app.get("/", response_class=HTMLResponse)
-def home():
-    content = """
-      <div class="brand">
-        <div class="logo">Ev</div>
-        <div>
-          <h1>Evalia</h1>
-          <p>Evaluación automatizada inteligente basada en rúbricas</p>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="eyebrow">MVP 1.5 · Motor CRB operativo</div>
-        <h2>Corrige respuestas breves desde Excel</h2>
-        <p class="lead">
-          Sube un archivo Excel con columnas <code>student_id</code>, <code>nombre</code>, <code>Q1</code> ... <code>Q34</code>.
-          Evalia aplicará la rúbrica configurada, calculará puntajes, confianza, estado de revisión y feedback por ítem.
-        </p>
-
-        <form id="uploadForm" action="/upload" enctype="multipart/form-data" method="post">
-          <label class="dropzone" id="dropzone" for="fileInput">
-            <div class="drop-icon">📄</div>
-            <div class="drop-title">Arrastra tu Excel aquí</div>
-            <div class="drop-subtitle">o haz clic para seleccionar archivo · .xlsx / .xls</div>
-            <div class="file-name" id="fileName">Ningún archivo seleccionado</div>
-          </label>
-
-          <input id="fileInput" name="file" type="file" accept=".xlsx,.xls" required>
-
-          <div class="actions">
-            <button class="btn btn-primary" type="submit">Evaluar respuestas</button>
-            <span class="hint">Rúbrica activa: <code>rubric_psicolinguistica_2026.json</code></span>
-          </div>
-
-          <div class="loader" id="loader">
-            <strong>Procesando evaluación...</strong><br>
-            Analizando respuestas, aplicando criterios y generando reporte Excel.
-            <div class="bar"><span></span></div>
-          </div>
-        </form>
-
-        <div class="features">
-          <div class="feature">✓ Corrección automática por rúbrica</div>
-          <div class="feature">✓ Puntaje y confianza por ítem</div>
-          <div class="feature">✓ Feedback explicativo</div>
-          <div class="feature">✓ Exportación Excel</div>
-        </div>
-      </div>
-
-      <script>
-        const fileInput = document.getElementById('fileInput');
-        const fileName = document.getElementById('fileName');
-        const dropzone = document.getElementById('dropzone');
-        const form = document.getElementById('uploadForm');
-        const loader = document.getElementById('loader');
-
-        fileInput.addEventListener('change', () => {
-          fileName.textContent = fileInput.files.length ? fileInput.files[0].name : 'Ningún archivo seleccionado';
-        });
-
-        ['dragenter', 'dragover'].forEach(eventName => {
-          dropzone.addEventListener(eventName, (e) => {
-            e.preventDefault();
-            dropzone.classList.add('dragover');
-          });
-        });
-
-        ['dragleave', 'drop'].forEach(eventName => {
-          dropzone.addEventListener(eventName, (e) => {
-            e.preventDefault();
-            dropzone.classList.remove('dragover');
-          });
-        });
-
-        dropzone.addEventListener('drop', (e) => {
-          const files = e.dataTransfer.files;
-          if (files.length) {
-            fileInput.files = files;
-            fileName.textContent = files[0].name;
-          }
-        });
-
-        form.addEventListener('submit', () => {
-          loader.style.display = 'block';
-        });
-      </script>
-    """
-    return base_html(content)
-
-
 @app.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    rubric = load_rubric()
-    input_path = OUTPUT_DIR / file.filename
+async def upload(file: UploadFile = File(...), rubric: str = Form(...)):
+    try:
+        selected_rubric = load_rubric(rubric)
+    except Exception as e:
+        return HTMLResponse(f"""
+        <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Error · Evalia</title>{base_css()}</head>
+        <body><div class="page"><main class="shell"><div class="result-card">
+        <div class="error"><strong>Error al cargar la rúbrica.</strong><br>{escape(str(e))}</div>
+        <br><a class="button" href="/">Volver</a></div></main></div></body></html>
+        """)
 
+    input_path = OUTPUT_DIR / file.filename
     with open(input_path, "wb") as f:
         f.write(await file.read())
 
-    df = pd.read_excel(input_path)
-    missing = validate_columns(df, rubric)
+    try:
+        df = pd.read_excel(input_path)
+    except Exception as e:
+        return HTMLResponse(f"""
+        <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Error · Evalia</title>{base_css()}</head>
+        <body><div class="page"><main class="shell"><div class="result-card">
+        <div class="error"><strong>No se pudo leer el Excel.</strong><br>{escape(str(e))}</div>
+        <br><a class="button" href="/">Volver</a></div></main></div></body></html>
+        """)
 
+    missing = validate_columns(df, selected_rubric)
     if missing:
-        content = f"""
-          <div class="brand">
-            <div class="logo">Ev</div>
-            <div>
-              <h1>Evalia</h1>
-              <p>Evaluación automatizada inteligente basada en rúbricas</p>
-            </div>
-          </div>
-          <div class="card">
-            <div class="eyebrow">Error de formato</div>
-            <h2>No se pudo procesar el archivo</h2>
-            <div class="error-box">
-              <strong>Faltan columnas requeridas:</strong><br>
-              {', '.join(missing)}
-              <br><br>
-              El Excel debe incluir <code>student_id</code>, <code>nombre</code>, <code>Q1</code> ... <code>Q34</code>.
-            </div>
-            <div class="actions">
-              <a class="btn btn-secondary" href="/">Volver</a>
-            </div>
-          </div>
-        """
-        return base_html(content, title="Evalia · Error")
+        expected = selected_rubric.get("input_format", {}).get("required_columns", [])
+        return HTMLResponse(f"""
+        <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Error de formato · Evalia</title>{base_css()}</head>
+        <body><div class="page"><main class="shell"><div class="result-card">
+        <h1 class="result-title">Error de formato</h1>
+        <div class="error"><strong>Faltan columnas requeridas:</strong><br>{escape(", ".join(missing))}</div>
+        <p class="lead">La rúbrica <strong>{escape(selected_rubric.get("_rubric_display_name", ""))}</strong> espera las siguientes columnas:<br><code>{escape(", ".join(expected))}</code></p>
+        <a class="button" href="/">Volver</a></div></main></div></body></html>
+        """)
 
-    questions = rubric.get("questions", [])
+    questions = selected_rubric.get("questions", [])
     score_rows = []
     conf_rows = []
     feedback_rows = []
+
+    accepted_count = 0
+    caution_count = 0
+    review_count = 0
+    total_answers = 0
 
     for _, row in df.iterrows():
         sid = row.get("student_id")
@@ -667,10 +510,19 @@ async def upload(file: UploadFile = File(...)):
             score_row[f"{qid}_score"] = score
             conf_row[f"{qid}_confidence"] = conf
             total += score
+            total_answers += 1
+
+            if status == "aceptado":
+                accepted_count += 1
+            elif status == "aceptado_con_cautela":
+                caution_count += 1
+            else:
+                review_count += 1
 
             feedback_rows.append({
                 "student_id": sid,
                 "nombre": nombre,
+                "rubric": selected_rubric.get("_rubric_display_name", ""),
                 "question_id": qid,
                 "prompt": q.get("prompt", ""),
                 "answer": answer,
@@ -681,80 +533,50 @@ async def upload(file: UploadFile = File(...)):
                 "feedback": fb
             })
 
+        total_score = float(selected_rubric.get("total_score", 0)) or sum(float(q.get("max_score", 0)) for q in questions) or 1
         score_row["total"] = round(total, 2)
-        score_row["porcentaje"] = round((total / float(rubric.get("total_score", 81))) * 100, 2)
+        score_row["porcentaje"] = round((total / total_score) * 100, 2)
         score_rows.append(score_row)
         conf_rows.append(conf_row)
 
-    output_name = f"evalia_resultados_{Path(file.filename).stem}.xlsx"
+    output_name = f"evalia_resultados_{Path(file.filename).stem}_{Path(selected_rubric.get('_rubric_filename', 'rubrica')).stem}.xlsx"
     output_path = OUTPUT_DIR / output_name
 
-    scores_df = pd.DataFrame(score_rows)
-    conf_df = pd.DataFrame(conf_rows)
-    feedback_df = pd.DataFrame(feedback_rows)
-
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        scores_df.to_excel(writer, sheet_name="scores", index=False)
-        conf_df.to_excel(writer, sheet_name="confidence", index=False)
-        feedback_df.to_excel(writer, sheet_name="feedback", index=False)
+        pd.DataFrame(score_rows).to_excel(writer, sheet_name="scores", index=False)
+        pd.DataFrame(conf_rows).to_excel(writer, sheet_name="confidence", index=False)
+        pd.DataFrame(feedback_rows).to_excel(writer, sheet_name="feedback", index=False)
+        pd.DataFrame([{
+            "rubric": selected_rubric.get("_rubric_display_name", ""),
+            "rubric_file": selected_rubric.get("_rubric_filename", ""),
+            "students_processed": len(df),
+            "questions_evaluated": len(questions),
+            "total_answers": total_answers,
+            "accepted": accepted_count,
+            "accepted_with_caution": caution_count,
+            "review_required": review_count
+        }]).to_excel(writer, sheet_name="summary", index=False)
 
-    n_students = len(scores_df)
-    n_questions = len(questions)
-    total_items = len(feedback_df)
-    accepted = int((feedback_df["status"] == "aceptado").sum()) if total_items else 0
-    caution = int((feedback_df["status"] == "aceptado_con_cautela").sum()) if total_items else 0
-    review = int((feedback_df["status"] == "revisar").sum()) if total_items else 0
-    auto_rate = round(((accepted + caution) / total_items) * 100, 1) if total_items else 0
-    review_rate = round((review / total_items) * 100, 1) if total_items else 0
-    avg_score = round(scores_df["porcentaje"].mean(), 1) if "porcentaje" in scores_df else 0
+    auto_rate = round((accepted_count / total_answers) * 100, 1) if total_answers else 0
+    review_rate = round((review_count / total_answers) * 100, 1) if total_answers else 0
 
-    content = f"""
-      <div class="brand">
-        <div class="logo">Ev</div>
-        <div>
-          <h1>Evalia</h1>
-          <p>Evaluación automatizada inteligente basada en rúbricas</p>
+    return HTMLResponse(f"""
+    <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Resultados · Evalia</title>{base_css()}</head>
+    <body><div class="page"><main class="shell">
+      <div class="topbar"><div class="brand"><div class="logo">E</div><div><div class="brand-title">Evalia</div><div class="brand-subtitle">Reporte generado</div></div></div><div class="badge">CRB Engine · v2.0</div></div>
+      <section class="result-card">
+        <h1 class="result-title">Procesamiento completado</h1>
+        <p class="lead">Evalia aplicó la rúbrica <strong>{escape(selected_rubric.get("_rubric_display_name", ""))}</strong> y generó un reporte Excel con puntajes, confianza, feedback y resumen.</p>
+        <div class="metric-grid">
+          <div class="metric"><div class="metric-value">{len(df)}</div><div class="metric-label">estudiante(s)</div></div>
+          <div class="metric"><div class="metric-value">{len(questions)}</div><div class="metric-label">preguntas evaluadas</div></div>
+          <div class="metric"><div class="metric-value">{auto_rate}%</div><div class="metric-label">aceptación automática</div></div>
+          <div class="metric"><div class="metric-value">{review_rate}%</div><div class="metric-label">requiere revisión</div></div>
         </div>
-      </div>
-
-      <div class="card">
-        <div class="eyebrow success">✓ Procesamiento completado</div>
-        <h2>Reporte generado correctamente</h2>
-        <p class="lead">
-          Evalia evaluó el archivo <strong>{file.filename}</strong> y generó un reporte Excel con puntajes,
-          confianza y feedback detallado por ítem.
-        </p>
-
-        <div class="stats">
-          <div class="stat">
-            <div class="stat-number">{n_students}</div>
-            <div class="stat-label">estudiante(s)</div>
-          </div>
-          <div class="stat">
-            <div class="stat-number">{n_questions}</div>
-            <div class="stat-label">preguntas</div>
-          </div>
-          <div class="stat">
-            <div class="stat-number">{auto_rate}%</div>
-            <div class="stat-label">aceptación automática</div>
-          </div>
-          <div class="stat">
-            <div class="stat-number warning">{review_rate}%</div>
-            <div class="stat-label">requiere revisión</div>
-          </div>
-        </div>
-
-        <p class="lead">
-          Puntaje promedio estimado del archivo: <strong>{avg_score}%</strong>.
-        </p>
-
-        <div class="actions">
-          <a class="btn btn-primary" href="/download/{output_name}">Descargar reporte Excel</a>
-          <a class="btn btn-secondary" href="/">Procesar otro archivo</a>
-        </div>
-      </div>
-    """
-    return base_html(content, title="Evalia · Resultados")
+        <div class="actions"><a class="button" href="/download/{output_name}">Descargar reporte Excel</a><a class="button" style="background:#475467;" href="/">Evaluar otro archivo</a></div>
+      </section>
+    </main></div></body></html>
+    """)
 
 
 @app.get("/download/{filename}")
