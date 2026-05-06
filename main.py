@@ -12,7 +12,7 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
-app = FastAPI(title="Evalia CRB", version="1.0")
+app = FastAPI(title="Evalia CRB", version="1.5")
 
 
 def load_rubric():
@@ -209,61 +209,406 @@ def validate_columns(df, rubric):
     return [c for c in required if c not in df.columns]
 
 
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return HTMLResponse("""
+def base_html(content: str, title: str = "Evalia CRB"):
+    return HTMLResponse(f"""
     <!DOCTYPE html>
     <html lang="es">
     <head>
       <meta charset="UTF-8">
-      <title>Evalia CRB</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>{title}</title>
       <style>
-        body {
-          font-family: Arial, sans-serif;
-          margin: 40px;
-          background: #f7f7f8;
-          color: #222;
-        }
-        .card {
-          background: white;
-          padding: 28px;
-          border-radius: 16px;
-          max-width: 760px;
-          box-shadow: 0 4px 18px rgba(0,0,0,.08);
-        }
-        h1 { margin-top: 0; }
-        .muted { color: #666; }
-        input, button { font-size: 16px; margin-top: 12px; }
-        button {
-          padding: 10px 18px;
-          border: none;
-          border-radius: 10px;
-          cursor: pointer;
-          background: #222;
+        :root {{
+          --bg: #f5f6f8;
+          --card: #ffffff;
+          --text: #171717;
+          --muted: #666f7a;
+          --line: #d9dde3;
+          --primary: #111827;
+          --primary-hover: #000000;
+          --soft: #f0f2f5;
+          --success: #137333;
+          --warning: #9a6700;
+        }}
+
+        * {{ box-sizing: border-box; }}
+
+        body {{
+          margin: 0;
+          font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+          background:
+            radial-gradient(circle at top left, rgba(30, 64, 175, 0.08), transparent 28%),
+            var(--bg);
+          color: var(--text);
+        }}
+
+        .page {{
+          min-height: 100vh;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 36px 20px;
+        }}
+
+        .shell {{
+          width: 100%;
+          max-width: 920px;
+        }}
+
+        .brand {{
+          display: flex;
+          align-items: center;
+          gap: 14px;
+          margin-bottom: 18px;
+        }}
+
+        .logo {{
+          width: 44px;
+          height: 44px;
+          border-radius: 14px;
+          background: var(--primary);
           color: white;
-        }
-        code {
-          background:#eee;
-          padding:2px 6px;
-          border-radius:6px;
-        }
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-weight: 800;
+          letter-spacing: -0.04em;
+        }}
+
+        .brand h1 {{
+          margin: 0;
+          font-size: 34px;
+          letter-spacing: -0.04em;
+        }}
+
+        .brand p {{
+          margin: 4px 0 0;
+          color: var(--muted);
+          font-size: 15px;
+        }}
+
+        .card {{
+          background: var(--card);
+          border: 1px solid rgba(0,0,0,0.04);
+          border-radius: 26px;
+          padding: 34px;
+          box-shadow: 0 24px 70px rgba(17, 24, 39, 0.10);
+        }}
+
+        .eyebrow {{
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          color: var(--muted);
+          background: var(--soft);
+          padding: 7px 11px;
+          border-radius: 999px;
+          font-size: 13px;
+          margin-bottom: 18px;
+        }}
+
+        h2 {{
+          margin: 0 0 10px;
+          font-size: 28px;
+          letter-spacing: -0.03em;
+        }}
+
+        .lead {{
+          margin: 0 0 24px;
+          color: var(--muted);
+          line-height: 1.55;
+          max-width: 760px;
+        }}
+
+        .dropzone {{
+          border: 2px dashed var(--line);
+          background: #fbfbfc;
+          border-radius: 22px;
+          padding: 34px;
+          text-align: center;
+          transition: all .2s ease;
+          cursor: pointer;
+        }}
+
+        .dropzone:hover, .dropzone.dragover {{
+          border-color: var(--primary);
+          background: #f8fafc;
+          transform: translateY(-1px);
+        }}
+
+        .drop-icon {{
+          width: 54px;
+          height: 54px;
+          margin: 0 auto 14px;
+          border-radius: 18px;
+          background: var(--soft);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 26px;
+        }}
+
+        .drop-title {{
+          font-weight: 750;
+          font-size: 19px;
+          margin-bottom: 6px;
+        }}
+
+        .drop-subtitle {{
+          color: var(--muted);
+          font-size: 14px;
+        }}
+
+        input[type="file"] {{ display: none; }}
+
+        .file-name {{
+          margin-top: 14px;
+          color: var(--primary);
+          font-size: 14px;
+          font-weight: 650;
+        }}
+
+        .actions {{
+          display: flex;
+          gap: 12px;
+          align-items: center;
+          justify-content: space-between;
+          margin-top: 22px;
+          flex-wrap: wrap;
+        }}
+
+        .btn {{
+          appearance: none;
+          border: none;
+          border-radius: 14px;
+          padding: 13px 22px;
+          font-size: 15px;
+          font-weight: 750;
+          cursor: pointer;
+          text-decoration: none;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+        }}
+
+        .btn-primary {{
+          background: var(--primary);
+          color: white;
+        }}
+
+        .btn-primary:hover {{ background: var(--primary-hover); }}
+
+        .btn-secondary {{
+          background: var(--soft);
+          color: var(--primary);
+        }}
+
+        .hint {{
+          color: var(--muted);
+          font-size: 13px;
+        }}
+
+        .features {{
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 12px;
+          margin-top: 24px;
+        }}
+
+        .feature {{
+          background: #fbfbfc;
+          border: 1px solid #edf0f3;
+          border-radius: 16px;
+          padding: 14px;
+          color: #374151;
+          font-size: 13px;
+          line-height: 1.35;
+        }}
+
+        .loader {{
+          display: none;
+          margin-top: 22px;
+          padding: 18px;
+          background: #fbfbfc;
+          border-radius: 18px;
+          color: var(--muted);
+        }}
+
+        .bar {{
+          height: 8px;
+          background: var(--soft);
+          border-radius: 999px;
+          overflow: hidden;
+          margin-top: 12px;
+        }}
+
+        .bar span {{
+          display: block;
+          height: 100%;
+          width: 45%;
+          background: var(--primary);
+          border-radius: 999px;
+          animation: move 1.3s infinite ease-in-out;
+        }}
+
+        @keyframes move {{
+          0% {{ transform: translateX(-120%); }}
+          100% {{ transform: translateX(240%); }}
+        }}
+
+        .stats {{
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 12px;
+          margin: 24px 0;
+        }}
+
+        .stat {{
+          background: #fbfbfc;
+          border: 1px solid #edf0f3;
+          border-radius: 18px;
+          padding: 18px;
+        }}
+
+        .stat-number {{
+          font-size: 26px;
+          font-weight: 850;
+          letter-spacing: -0.04em;
+        }}
+
+        .stat-label {{
+          color: var(--muted);
+          font-size: 13px;
+          margin-top: 4px;
+        }}
+
+        .success {{ color: var(--success); }}
+        .warning {{ color: var(--warning); }}
+
+        .error-box {{
+          background: #fff8f6;
+          border: 1px solid #ffd7ce;
+          color: #7a271a;
+          border-radius: 18px;
+          padding: 18px;
+          margin-top: 18px;
+          line-height: 1.5;
+        }}
+
+        code {{
+          background: var(--soft);
+          padding: 2px 6px;
+          border-radius: 7px;
+          font-size: 13px;
+        }}
+
+        @media (max-width: 760px) {{
+          .card {{ padding: 24px; }}
+          .features, .stats {{ grid-template-columns: 1fr 1fr; }}
+          .brand h1 {{ font-size: 30px; }}
+        }}
       </style>
     </head>
     <body>
-      <div class="card">
-        <h1>Evalia CRB</h1>
-        <p class="muted">MVP 1 · Corrección automatizada de respuestas breves desde Excel</p>
-
-        <form action="/upload" enctype="multipart/form-data" method="post">
-          <p>Sube un Excel con columnas <code>student_id</code>, <code>nombre</code>, <code>Q1</code> ... <code>Q34</code>.</p>
-          <input name="file" type="file" accept=".xlsx,.xls" required>
-          <br>
-          <button type="submit">Procesar certamen</button>
-        </form>
-      </div>
+      <main class="page">
+        <section class="shell">
+          {content}
+        </section>
+      </main>
     </body>
     </html>
     """)
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    content = """
+      <div class="brand">
+        <div class="logo">Ev</div>
+        <div>
+          <h1>Evalia</h1>
+          <p>Evaluación automatizada inteligente basada en rúbricas</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">MVP 1.5 · Motor CRB operativo</div>
+        <h2>Corrige respuestas breves desde Excel</h2>
+        <p class="lead">
+          Sube un archivo Excel con columnas <code>student_id</code>, <code>nombre</code>, <code>Q1</code> ... <code>Q34</code>.
+          Evalia aplicará la rúbrica configurada, calculará puntajes, confianza, estado de revisión y feedback por ítem.
+        </p>
+
+        <form id="uploadForm" action="/upload" enctype="multipart/form-data" method="post">
+          <label class="dropzone" id="dropzone" for="fileInput">
+            <div class="drop-icon">📄</div>
+            <div class="drop-title">Arrastra tu Excel aquí</div>
+            <div class="drop-subtitle">o haz clic para seleccionar archivo · .xlsx / .xls</div>
+            <div class="file-name" id="fileName">Ningún archivo seleccionado</div>
+          </label>
+
+          <input id="fileInput" name="file" type="file" accept=".xlsx,.xls" required>
+
+          <div class="actions">
+            <button class="btn btn-primary" type="submit">Evaluar respuestas</button>
+            <span class="hint">Rúbrica activa: <code>rubric_psicolinguistica_2026.json</code></span>
+          </div>
+
+          <div class="loader" id="loader">
+            <strong>Procesando evaluación...</strong><br>
+            Analizando respuestas, aplicando criterios y generando reporte Excel.
+            <div class="bar"><span></span></div>
+          </div>
+        </form>
+
+        <div class="features">
+          <div class="feature">✓ Corrección automática por rúbrica</div>
+          <div class="feature">✓ Puntaje y confianza por ítem</div>
+          <div class="feature">✓ Feedback explicativo</div>
+          <div class="feature">✓ Exportación Excel</div>
+        </div>
+      </div>
+
+      <script>
+        const fileInput = document.getElementById('fileInput');
+        const fileName = document.getElementById('fileName');
+        const dropzone = document.getElementById('dropzone');
+        const form = document.getElementById('uploadForm');
+        const loader = document.getElementById('loader');
+
+        fileInput.addEventListener('change', () => {
+          fileName.textContent = fileInput.files.length ? fileInput.files[0].name : 'Ningún archivo seleccionado';
+        });
+
+        ['dragenter', 'dragover'].forEach(eventName => {
+          dropzone.addEventListener(eventName, (e) => {
+            e.preventDefault();
+            dropzone.classList.add('dragover');
+          });
+        });
+
+        ['dragleave', 'drop'].forEach(eventName => {
+          dropzone.addEventListener(eventName, (e) => {
+            e.preventDefault();
+            dropzone.classList.remove('dragover');
+          });
+        });
+
+        dropzone.addEventListener('drop', (e) => {
+          const files = e.dataTransfer.files;
+          if (files.length) {
+            fileInput.files = files;
+            fileName.textContent = files[0].name;
+          }
+        });
+
+        form.addEventListener('submit', () => {
+          loader.style.display = 'block';
+        });
+      </script>
+    """
+    return base_html(content)
 
 
 @app.post("/upload")
@@ -278,11 +623,29 @@ async def upload(file: UploadFile = File(...)):
     missing = validate_columns(df, rubric)
 
     if missing:
-        return HTMLResponse(
-            f"<h2>Error de formato</h2><p>Faltan columnas: {', '.join(missing)}</p>"
-            "<p>El Excel debe incluir: student_id, nombre, Q1...Q34.</p>"
-            "<p><a href='/'>Volver</a></p>"
-        )
+        content = f"""
+          <div class="brand">
+            <div class="logo">Ev</div>
+            <div>
+              <h1>Evalia</h1>
+              <p>Evaluación automatizada inteligente basada en rúbricas</p>
+            </div>
+          </div>
+          <div class="card">
+            <div class="eyebrow">Error de formato</div>
+            <h2>No se pudo procesar el archivo</h2>
+            <div class="error-box">
+              <strong>Faltan columnas requeridas:</strong><br>
+              {', '.join(missing)}
+              <br><br>
+              El Excel debe incluir <code>student_id</code>, <code>nombre</code>, <code>Q1</code> ... <code>Q34</code>.
+            </div>
+            <div class="actions">
+              <a class="btn btn-secondary" href="/">Volver</a>
+            </div>
+          </div>
+        """
+        return base_html(content, title="Evalia · Error")
 
     questions = rubric.get("questions", [])
     score_rows = []
@@ -326,19 +689,72 @@ async def upload(file: UploadFile = File(...)):
     output_name = f"evalia_resultados_{Path(file.filename).stem}.xlsx"
     output_path = OUTPUT_DIR / output_name
 
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        pd.DataFrame(score_rows).to_excel(writer, sheet_name="scores", index=False)
-        pd.DataFrame(conf_rows).to_excel(writer, sheet_name="confidence", index=False)
-        pd.DataFrame(feedback_rows).to_excel(writer, sheet_name="feedback", index=False)
+    scores_df = pd.DataFrame(score_rows)
+    conf_df = pd.DataFrame(conf_rows)
+    feedback_df = pd.DataFrame(feedback_rows)
 
-    return HTMLResponse(
-        f"""
-        <h2>Procesamiento completado</h2>
-        <p>Archivo generado correctamente.</p>
-        <p><a href="/download/{output_name}">Descargar resultados Excel</a></p>
-        <p><a href="/">Volver</a></p>
-        """
-    )
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        scores_df.to_excel(writer, sheet_name="scores", index=False)
+        conf_df.to_excel(writer, sheet_name="confidence", index=False)
+        feedback_df.to_excel(writer, sheet_name="feedback", index=False)
+
+    n_students = len(scores_df)
+    n_questions = len(questions)
+    total_items = len(feedback_df)
+    accepted = int((feedback_df["status"] == "aceptado").sum()) if total_items else 0
+    caution = int((feedback_df["status"] == "aceptado_con_cautela").sum()) if total_items else 0
+    review = int((feedback_df["status"] == "revisar").sum()) if total_items else 0
+    auto_rate = round(((accepted + caution) / total_items) * 100, 1) if total_items else 0
+    review_rate = round((review / total_items) * 100, 1) if total_items else 0
+    avg_score = round(scores_df["porcentaje"].mean(), 1) if "porcentaje" in scores_df else 0
+
+    content = f"""
+      <div class="brand">
+        <div class="logo">Ev</div>
+        <div>
+          <h1>Evalia</h1>
+          <p>Evaluación automatizada inteligente basada en rúbricas</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow success">✓ Procesamiento completado</div>
+        <h2>Reporte generado correctamente</h2>
+        <p class="lead">
+          Evalia evaluó el archivo <strong>{file.filename}</strong> y generó un reporte Excel con puntajes,
+          confianza y feedback detallado por ítem.
+        </p>
+
+        <div class="stats">
+          <div class="stat">
+            <div class="stat-number">{n_students}</div>
+            <div class="stat-label">estudiante(s)</div>
+          </div>
+          <div class="stat">
+            <div class="stat-number">{n_questions}</div>
+            <div class="stat-label">preguntas</div>
+          </div>
+          <div class="stat">
+            <div class="stat-number">{auto_rate}%</div>
+            <div class="stat-label">aceptación automática</div>
+          </div>
+          <div class="stat">
+            <div class="stat-number warning">{review_rate}%</div>
+            <div class="stat-label">requiere revisión</div>
+          </div>
+        </div>
+
+        <p class="lead">
+          Puntaje promedio estimado del archivo: <strong>{avg_score}%</strong>.
+        </p>
+
+        <div class="actions">
+          <a class="btn btn-primary" href="/download/{output_name}">Descargar reporte Excel</a>
+          <a class="btn btn-secondary" href="/">Procesar otro archivo</a>
+        </div>
+      </div>
+    """
+    return base_html(content, title="Evalia · Resultados")
 
 
 @app.get("/download/{filename}")
@@ -349,4 +765,3 @@ def download(filename: str):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=filename
     )
-
