@@ -21,7 +21,7 @@ RUBRICS_DIR.mkdir(exist_ok=True)
 
 LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
-app = FastAPI(title="Evalia CRB", version="2.6")
+app = FastAPI(title="Evalia CRB", version="2.7")
 
 
 # ============================================================
@@ -76,11 +76,15 @@ def normalize_item_type(value):
         "vf": "true_false",
         "v_f": "true_false",
         "verdadero_falso": "true_false",
+        "verdadero/falso": "true_false",
+        "verdaderofalso": "true_false",
         "true_false": "true_false",
         "truefalse": "true_false",
 
         "completacion": "completion",
         "completación": "completion",
+        "completar": "completion",
+        "complete": "completion",
         "completion": "completion",
         "exacta": "short_exact_answer",
         "respuesta_exacta": "short_exact_answer",
@@ -88,6 +92,10 @@ def normalize_item_type(value):
 
         "enumeracion": "enumeration_conceptual",
         "enumeración": "enumeration_conceptual",
+        "enumerar": "enumeration_conceptual",
+        "lista": "enumeration_conceptual",
+        "listado": "enumeration_conceptual",
+        "mencionar": "enumeration_conceptual",
         "enumeration": "enumeration_conceptual",
         "enumeration_conceptual": "enumeration_conceptual",
         "lista": "enumeration_conceptual",
@@ -96,11 +104,20 @@ def normalize_item_type(value):
         "emparejamiento": "classification_matching",
         "relacion": "classification_matching",
         "relación": "classification_matching",
+        "relacionar": "classification_matching",
+        "relaciona": "classification_matching",
+        "pares": "classification_matching",
+        "une": "classification_matching",
         "classification_matching": "classification_matching",
 
         "criterios": "criteria",
         "criterio": "criteria",
         "abierta": "criteria",
+        "pregunta_abierta": "criteria",
+        "preguntaabierta": "criteria",
+        "desarrollo": "criteria",
+        "explicacion": "criteria",
+        "explicación": "criteria",
         "respuesta_abierta": "criteria",
         "desarrollo": "criteria",
         "ensayo": "criteria",
@@ -118,6 +135,51 @@ def normalize_column_name(name):
     n = n.replace("-", "_")
     n = n.replace(".", "_")
     return n
+
+
+
+def display_item_type(item_type):
+    mapping = {
+        "criteria": "Pregunta abierta",
+        "true_false": "Verdadero/Falso",
+        "completion": "Completar",
+        "short_exact_answer": "Respuesta breve",
+        "enumeration_conceptual": "Enumerar",
+        "enumeration_closed": "Enumerar",
+        "enumeration_categorized": "Enumerar",
+        "enumeration": "Enumerar",
+        "classification_matching": "Relacionar"
+    }
+    return mapping.get(item_type, str(item_type or "Pregunta"))
+
+
+def normalize_teacher_headers_for_output(name):
+    mapping = {
+        "pregunta": "Pregunta",
+        "tipo_item": "Tipo de pregunta",
+        "puntaje_maximo": "Puntaje máximo",
+        "promedio_puntaje": "Promedio puntaje",
+        "promedio_porcentaje": "Promedio %",
+        "confianza_promedio": "Confianza promedio",
+        "aceptacion_pct": "Alta confianza %",
+        "cautela_pct": "Parcial/intermedia %",
+        "revision_pct": "Revisión sugerida %",
+        "clasificacion_evalia": "Lectura Evalia",
+        "sugerencia_docente": "Sugerencia docente",
+        "student_id": "ID estudiante",
+        "nombre": "Nombre",
+        "porcentaje": "Porcentaje",
+        "nivel_desempeno": "Nivel de desempeño",
+        "status": "Estado",
+        "confidence": "Confianza",
+        "feedback": "Retroalimentación",
+        "answer": "Respuesta",
+        "prompt": "Enunciado",
+        "score": "Puntaje",
+        "max_score": "Puntaje máximo",
+        "pregunta_id": "Pregunta"
+    }
+    return mapping.get(name, name)
 
 
 def item_number(item_id):
@@ -339,11 +401,11 @@ def load_rubric_from_excel(path):
         nc = normalize_column_name(c)
         if nc in ["pregunta", "id", "item", "item_id"]:
             col_map[c] = "pregunta"
-        elif nc in ["tipo", "item_type", "tipo_item"]:
+        elif nc in ["tipo", "tipodepregunta", "tipo_pregunta", "item_type", "tipo_item"]:
             col_map[c] = "tipo"
         elif nc in ["max_score", "puntaje", "puntajemaximo", "puntaje_maximo", "puntajeitem", "puntos"]:
             col_map[c] = "max_score"
-        elif nc in ["respuestas", "accepted_answers", "respuesta", "respuestascorrectas", "respuesta_correcta", "respuestaesperada", "respuesta_esperada", "esperado", "esperada"]:
+        elif nc in ["respuestas", "accepted_answers", "respuesta", "respuestascorrectas", "respuesta_correcta", "respuestaesperada", "respuesta_esperada", "esperado", "esperada", "ideasesperadas", "ideas_esperadas", "ideasclave", "ideas_clave"]:
             col_map[c] = "respuestas"
         elif nc in ["criterios", "criteria", "conceptos", "concepts", "ideasclave", "ideas_clave", "conceptosclave", "conceptos_clave"]:
             col_map[c] = "criterios"
@@ -622,10 +684,88 @@ def contradictions_lookup(term):
     return bad
 
 
+def explicit_wrong_relation(answer, concept, bad):
+    """
+    Detecta contradicción contextual.
+    Penaliza sobre todo frases del tipo:
+    - X es Y
+    - X son Y
+    - X corresponde a Y
+    - X funciona como Y
+    Evita penalizar frases correctas como: "una estrella no es un planeta".
+    """
+    answer_n = normalize_text(answer)
+    concept_n = normalize_text(concept)
+    bad_n = normalize_text(bad)
+
+    if not answer_n or not concept_n or not bad_n:
+        return False
+
+    # Si está negado explícitamente, no se considera contradicción.
+    negated_patterns = [
+        f"{concept_n} no es {bad_n}",
+        f"{concept_n} no son {bad_n}",
+        f"{concept_n} no corresponde a {bad_n}",
+        f"{concept_n} no funciona como {bad_n}",
+        f"no es {bad_n}",
+        f"no son {bad_n}"
+    ]
+    if any(p in answer_n for p in negated_patterns):
+        return False
+
+    wrong_patterns = [
+        f"{concept_n} es {bad_n}",
+        f"{concept_n} son {bad_n}",
+        f"{concept_n} corresponde a {bad_n}",
+        f"{concept_n} corresponde al {bad_n}",
+        f"{concept_n} funciona como {bad_n}",
+        f"{concept_n} se define como {bad_n}",
+        f"{concept_n} consiste en {bad_n}",
+        f"es un {bad_n}",
+        f"es una {bad_n}",
+        f"son {bad_n}"
+    ]
+
+    if any(p in answer_n for p in wrong_patterns):
+        return True
+
+    # Caso especial: si ambas ideas aparecen muy cerca sin negación y con verbo definicional.
+    tokens = answer_n.split()
+    concept_tokens = concept_n.split()
+    bad_tokens = bad_n.split()
+
+    def find_positions(seq):
+        pos = []
+        first = seq[0] if seq else ""
+        for i, t in enumerate(tokens):
+            if t == first:
+                window = " ".join(tokens[i:i+len(seq)])
+                if window == " ".join(seq):
+                    pos.append(i)
+        return pos
+
+    cpos = find_positions(concept_tokens)
+    bpos = find_positions(bad_tokens)
+    definitional = any(v in answer_n for v in [" es ", " son ", " corresponde ", " funciona como ", " se define "])
+
+    if definitional:
+        for c in cpos:
+            for b in bpos:
+                if abs(c - b) <= 6:
+                    return True
+
+    return False
+
+
 def detect_contradictions(answer, expected_terms):
+    """
+    Detecta incompatibilidades conceptuales evidentes de forma conservadora.
+    No penaliza mera coexistencia de términos; requiere relación incorrecta explícita.
+    """
     answer_n = normalize_text(answer)
     if not answer_n:
         return []
+
     found = []
     all_expected = []
     for term in expected_terms:
@@ -636,13 +776,17 @@ def detect_contradictions(answer, expected_terms):
         t = normalize_text(term)
         if not t:
             continue
-        concept_present = t in answer_n or fuzz.partial_ratio(answer_n, t) >= 72
+
+        concept_present = t in answer_n or fuzz.partial_ratio(answer_n, t) >= 78
         if not concept_present:
             continue
+
         for bad in contradictions_lookup(t):
             bad_n = normalize_text(bad)
-            if bad_n and (bad_n in answer_n or fuzz.partial_ratio(answer_n, bad_n) >= 84):
-                found.append(f"{term} ↔ {bad}")
+            if bad_n and (bad_n in answer_n or fuzz.partial_ratio(answer_n, bad_n) >= 88):
+                if explicit_wrong_relation(answer_n, t, bad_n):
+                    found.append(f"{term} ↔ {bad}")
+
     return sorted(set(found))
 
 
@@ -668,9 +812,9 @@ def relation_score(answer, concepts):
                 relation_hits.append(rel)
                 break
     if relation_hits:
-        return min(0.12, 0.04 * len(set(relation_hits))), sorted(set(relation_hits))
+        return min(0.18, 0.06 * len(set(relation_hits))), sorted(set(relation_hits))
     if len(answer_n.split()) >= 8:
-        return 0.04, ["integración conceptual básica"]
+        return 0.06, ["integración conceptual básica"]
     return 0, []
 
 
@@ -805,14 +949,16 @@ def score_criteria(answer, question):
         method_notes.append("Relaciones detectadas: " + ", ".join(rel_hits))
 
     if contradictions:
-        total *= 0.65
+        # Penalización gradual y conservadora: evita sobrecastigar respuestas parcialmente buenas.
+        contradiction_penalty = min(0.30, 0.12 + 0.06 * (len(contradictions) - 1))
+        total *= (1 - contradiction_penalty)
         method_notes.append("Alerta: posible contradicción conceptual: " + "; ".join(contradictions[:4]))
 
     total = min(total, max_score)
     confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
 
     if contradictions:
-        confidence = min(confidence, 0.55)
+        confidence = min(confidence, 0.62)
 
     feedback = []
     if matched:
@@ -921,7 +1067,7 @@ def score_answer(answer, question):
 
     # Con la capa semántica, una confianza media-alta puede quedar aceptada con cautela
     # y sólo las respuestas realmente débiles quedan para revisión manual.
-    status = "aceptado" if conf >= 0.82 else ("revisar" if conf < 0.50 else "aceptado_con_cautela")
+    status = "aceptado" if conf >= 0.80 else ("revisar" if conf < 0.45 else "aceptado_con_cautela")
     return score, conf, fb, status
 
 
@@ -1002,16 +1148,16 @@ def build_question_insights(question_stats, questions):
         if avg_score_pct >= 80 and review_pct < 20:
             classification = "funcionamiento alto"
         elif review_pct >= 35 or accepted_pct <= 50 or avg_confidence < 0.60:
-            classification = "ítem potencialmente problemático"
+            classification = "requiere revisión docente"
             problematic_questions.append(pid)
         elif caution_pct >= 30:
-            classification = "ítem con cautela interpretativa"
+            classification = "funcionamiento parcial/intermedio"
         else:
-            classification = "funcionamiento medio/estable"
+            classification = "funcionamiento adecuado"
 
         insights_rows.append({
             "pregunta": pid,
-            "tipo_item": question_map.get(pid, {}).get("item_type", ""),
+            "tipo_item": display_item_type(question_map.get(pid, {}).get("item_type", "")),
             "puntaje_maximo": max_score,
             "promedio_puntaje": round(avg_score_raw, 2),
             "promedio_porcentaje": round(avg_score_pct, 1),
@@ -1325,7 +1471,7 @@ def base_css():
     """
 
 
-def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v2.6 conceptual"):
+def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v2.7 docente natural"):
     return f"""
     <div class="topbar">
       <div class="brand">
@@ -1355,27 +1501,27 @@ def save_template_workbook(kind: str):
 
     if kind == "rubric":
         ws.title = "Modelo_Rubrica"
-        headers = ["pregunta", "tipo", "puntaje", "respuesta_esperada", "enunciado"]
+        headers = ["Pregunta", "Tipo de pregunta", "Puntaje", "Ideas esperadas", "Enunciado"]
         ws.append(headers)
         rows = [
-            ["P1", "abierta", 5, "gravedad, órbita, Sol, planetas", "Explique por qué los planetas orbitan alrededor del Sol."],
-            ["P2", "VF", 1, "Verdadero", "La Luna es el satélite natural de la Tierra."],
-            ["P3", "completion", 2, "Vía Láctea", "Complete: El sistema solar pertenece a la ________."],
-            ["P4", "enumeracion", 3, "Mercurio, Venus, Tierra, Marte", "Mencione al menos dos planetas rocosos del sistema solar."],
-            ["P5", "matching", 4, "Júpiter:gigante gaseoso; Marte:planeta rojo; Saturno:anillos; Neptuno:azul", "Relacione planeta y característica."],
-            ["P6", "abierta", 5, "estrella, energía, fusión nuclear, luz, calor", "Explique qué es una estrella y cómo produce energía."]
+            ["P1", "Pregunta abierta", 5, "gravedad, órbita, Sol, planetas", "Explique por qué los planetas orbitan alrededor del Sol."],
+            ["P2", "Verdadero/Falso", 1, "Verdadero", "La Luna es el satélite natural de la Tierra."],
+            ["P3", "Completar", 2, "Vía Láctea", "Complete: El sistema solar pertenece a la ________."],
+            ["P4", "Enumerar", 3, "Mercurio, Venus, Tierra, Marte", "Mencione al menos dos planetas rocosos del sistema solar."],
+            ["P5", "Relacionar", 4, "Júpiter:gigante gaseoso; Marte:planeta rojo; Saturno:anillos; Neptuno:azul", "Relacione planeta y característica."],
+            ["P6", "Pregunta abierta", 5, "estrella, energía, fusión nuclear, luz, calor", "Explique qué es una estrella y cómo produce energía."]
         ]
         for row in rows:
             ws.append(row)
 
         info = wb.create_sheet("Instrucciones")
         info.append(["Evalia", "Cómo completar el Modelo de Rúbrica"])
-        info.append(["pregunta", "Use códigos simples: P1, P2, P3..."])
-        info.append(["tipo", "Use abierta, VF, completion, enumeracion o matching."])
-        info.append(["puntaje", "Puntaje máximo de la pregunta."])
-        info.append(["respuesta_esperada", "Escriba ideas clave o respuesta esperada. Puede usar comas, punto y coma o saltos de línea."])
-        info.append(["enunciado", "Pregunta o instrucción que vio el estudiante."])
-        info.append(["matching", "Para relaciones use: Concepto:Respuesta; Concepto:Respuesta."])
+        info.append(["Pregunta", "Use códigos simples: P1, P2, P3..."])
+        info.append(["Tipo de pregunta", "Use: Pregunta abierta, Verdadero/Falso, Completar, Enumerar o Relacionar."])
+        info.append(["Puntaje", "Puntaje máximo de la pregunta."])
+        info.append(["Ideas esperadas", "Escriba las ideas clave o la respuesta esperada. Puede usar comas, punto y coma o saltos de línea."])
+        info.append(["Enunciado", "Pregunta o instrucción que vio el estudiante."])
+        info.append(["Relacionar", "Para relaciones use: Concepto:Respuesta; Concepto:Respuesta."])
         info.append(["Nota", "No necesita escribir sinónimos técnicos. Evalia intenta reconocer paráfrasis, relaciones y contradicciones."])
         filename = "modelo_rubrica_evalia.xlsx"
 
@@ -1521,7 +1667,7 @@ def home():
                 <div class="template-card">
                   <div>
                     <strong>Modelo de Rúbrica</strong>
-                    <span>Formato simple: pregunta, tipo, puntaje, respuesta esperada y enunciado.</span>
+                    <span>Formato simple para docentes: pregunta, tipo de pregunta, puntaje, ideas esperadas y enunciado.</span>
                   </div>
                   <a class="button outline" href="/download-template/rubric">Descargar</a>
                 </div>
@@ -1575,7 +1721,7 @@ def home():
               <div class="feature"><strong>Modelo de Rúbrica</strong>Define preguntas, puntajes y criterios.</div>
               <div class="feature"><strong>Modelo de Respuestas</strong>Organiza estudiantes y respuestas.</div>
               <div class="feature"><strong>Vista previa</strong>Confirma que el formato calza.</div>
-              <div class="feature"><strong>Capa semántica</strong>Reconoce paráfrasis, relaciones y posibles contradicciones.</div>
+              <div class="feature"><strong>Capa semántica</strong>Reconoce paráfrasis, relaciones y posibles contradicciones conceptuales.</div>
             </div>
           </section>
 
@@ -1839,9 +1985,9 @@ async def upload(
         "accepted": accepted_count,
         "accepted_with_caution": caution_count,
         "review_required": review_count,
-        "accepted_pct": auto_rate,
-        "caution_pct": caution_rate,
-        "review_pct": review_rate
+        "alta_confianza_pct": auto_rate,
+        "parcial_intermedia_pct": caution_rate,
+        "revision_sugerida_pct": review_rate
     }]
 
     teacher_report_rows = build_teacher_report_rows(
@@ -1886,16 +2032,17 @@ async def upload(
         f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultados · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v2.6 conceptual")}
+          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v2.7 docente natural")}
           <section class="result-card">
             <h1>Procesamiento completado</h1>
             <p class="lead">Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong> y generó un reporte Excel explicable.</p>
             <div class="metric-grid">
               <div class="metric"><div class="metric-value">{len(df)}</div><div class="metric-label">estudiante(s)</div></div>
-              <div class="metric"><div class="metric-value">{len(questions)}</div><div class="metric-label">preguntas evaluadas</div></div>
-              <div class="metric"><div class="metric-value">{auto_rate}%</div><div class="metric-label">aceptación automática</div></div>
-              <div class="metric"><div class="metric-value">{review_rate}%</div><div class="metric-label">requiere revisión</div></div>
+              <div class="metric"><div class="metric-value">{auto_rate}%</div><div class="metric-label">alta confianza</div></div>
+              <div class="metric"><div class="metric-value">{caution_rate}%</div><div class="metric-label">parcial/intermedia</div></div>
+              <div class="metric"><div class="metric-value">{review_rate}%</div><div class="metric-label">revisión sugerida</div></div>
             </div>
+            <p class="hint">Los tres estados de respuesta suman 100%: alta confianza, parcial/intermedia y revisión sugerida.</p>
             <p class="lead"><strong>Insight inicial:</strong> {escape(problematic_display)}</p>
             <div class="actions">
               <a class="button" href="/download/{output_name}">Descargar reporte Excel</a>
