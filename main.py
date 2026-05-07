@@ -21,7 +21,7 @@ RUBRICS_DIR.mkdir(exist_ok=True)
 
 LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
-app = FastAPI(title="Evalia CRB", version="2.5")
+app = FastAPI(title="Evalia CRB", version="2.6")
 
 
 # ============================================================
@@ -42,13 +42,31 @@ def normalize_text(text):
 
 
 def split_values(value):
+    """
+    Separador flexible para docentes.
+    Acepta punto y coma, coma, barra, saltos de línea y viñetas simples.
+    """
     if pd.isna(value) or value is None:
         return []
     txt = str(value).strip()
     if not txt:
         return []
-    parts = re.split(r"\s*[|;]\s*", txt)
-    return [p.strip() for p in parts if p.strip()]
+
+    txt = txt.replace("•", "\n").replace("·", "\n")
+    txt = re.sub(r"\s+y\s+", ";", txt, flags=re.IGNORECASE)
+
+    # Matching con ':' conserva pares cuando están separados por ; o saltos.
+    if ":" in txt:
+        parts = re.split(r"\s*(?:;|\n|/|\|)\s*", txt)
+    else:
+        parts = re.split(r"\s*(?:;|\n|/|\||,)\s*", txt)
+
+    cleaned = []
+    for p in parts:
+        p = re.sub(r"^\s*[-–—\d\)\.]+\s*", "", p).strip()
+        if p:
+            cleaned.append(p)
+    return cleaned
 
 
 def normalize_item_type(value):
@@ -84,6 +102,10 @@ def normalize_item_type(value):
         "criterio": "criteria",
         "abierta": "criteria",
         "respuesta_abierta": "criteria",
+        "desarrollo": "criteria",
+        "ensayo": "criteria",
+        "explicacion": "criteria",
+        "explicación": "criteria",
         "criteria": "criteria",
     }
 
@@ -245,9 +267,13 @@ def build_question_from_excel_row(row):
     max_score = float(row.get("max_score", row.get("puntaje", row.get("puntaje_maximo", 1))) or 1)
     prompt = "" if pd.isna(row.get("prompt", "")) else str(row.get("prompt", ""))
 
-    respuestas = split_values(row.get("respuestas", row.get("accepted_answers", "")))
+    respuesta_simple = row.get("respuesta_esperada", row.get("respuestas", row.get("accepted_answers", "")))
+    respuestas = split_values(respuesta_simple)
     criterios = split_values(row.get("criterios", row.get("criteria", "")))
     variantes_semanticas = split_values(row.get("variantes_semanticas", row.get("semantic_variants", "")))
+
+    if item_type == "criteria" and not criterios:
+        criterios = respuestas
 
     question = {
         "id": qid,
@@ -315,17 +341,17 @@ def load_rubric_from_excel(path):
             col_map[c] = "pregunta"
         elif nc in ["tipo", "item_type", "tipo_item"]:
             col_map[c] = "tipo"
-        elif nc in ["max_score", "puntaje", "puntajemaximo", "puntaje_maximo"]:
+        elif nc in ["max_score", "puntaje", "puntajemaximo", "puntaje_maximo", "puntajeitem", "puntos"]:
             col_map[c] = "max_score"
-        elif nc in ["respuestas", "accepted_answers", "respuesta", "respuestascorrectas", "respuesta_correcta"]:
+        elif nc in ["respuestas", "accepted_answers", "respuesta", "respuestascorrectas", "respuesta_correcta", "respuestaesperada", "respuesta_esperada", "esperado", "esperada"]:
             col_map[c] = "respuestas"
-        elif nc in ["criterios", "criteria", "conceptos", "concepts"]:
+        elif nc in ["criterios", "criteria", "conceptos", "concepts", "ideasclave", "ideas_clave", "conceptosclave", "conceptos_clave"]:
             col_map[c] = "criterios"
         elif nc in ["variantes", "variantessemanticas", "variantes_semanticas", "semantic_variants", "sinonimos", "sinónimos"]:
             col_map[c] = "variantes_semanticas"
         elif nc in ["required_items", "required_number_of_items", "numero_requerido", "n_requerido"]:
             col_map[c] = "required_items"
-        elif nc in ["prompt", "enunciado", "pregunta_texto"]:
+        elif nc in ["prompt", "enunciado", "pregunta_texto", "instruccion", "instrucción", "consigna"]:
             col_map[c] = "prompt"
 
     df = df.rename(columns=col_map)
@@ -390,8 +416,9 @@ async def load_uploaded_rubric(rubric_file: UploadFile):
 # ============================================================
 
 
+
 # ============================================================
-# ROBUSTEZ SEMÁNTICA EXPLICABLE
+# ROBUSTEZ SEMÁNTICA CONCEPTUAL v2.6
 # ============================================================
 
 STOPWORDS_ES = {
@@ -400,10 +427,40 @@ STOPWORDS_ES = {
     "esas","ese","eso","esos","esta","estas","este","esto","estos","fue","fueron","ha","han",
     "hay","la","las","le","les","lo","los","mas","más","me","mi","mis","muy","no","nos",
     "o","para","pero","por","porque","que","qué","se","ser","si","sí","sin","sobre","su",
-    "sus","tambien","también","te","tiene","tienen","un","una","unas","uno","unos","y","ya"
+    "sus","tambien","también","te","tiene","tienen","un","una","unas","uno","unos","y","ya",
+    "explica","explique","mencione","nombre","indique","complete","relacione","defina"
 }
 
 NEGATION_TERMS = {"no", "nunca", "jamás", "sin", "tampoco", "niega", "negacion", "negación"}
+
+CONCEPTUAL_CONTRADICTIONS = {
+    "estrella": ["planeta", "satélite natural", "satelite natural"],
+    "planeta": ["estrella"],
+    "luna": ["planeta", "estrella"],
+    "galaxia": ["planeta", "estrella individual"],
+    "via lactea": ["andromeda"],
+    "vía láctea": ["andromeda"],
+    "fusión nuclear": ["combustión", "fuego", "quema carbón", "quema carbon"],
+    "fusion nuclear": ["combustión", "fuego", "quema carbón", "quema carbon"],
+    "gravedad": ["magnetismo solamente", "empuje", "viento"],
+    "orbita": ["caída recta", "caida recta"],
+    "órbita": ["caída recta", "caida recta"],
+    "monarquia": ["democracia plena"],
+    "monarquía": ["democracia plena"],
+    "revolucion francesa": ["independencia de estados unidos"],
+    "revolución francesa": ["independencia de estados unidos"],
+    "independencia": ["dependencia total"],
+}
+
+RELATION_PATTERNS = {
+    "causalidad": ["causa", "provoca", "produce", "genera", "permite", "hace que", "debido a", "gracias a", "por eso", "por lo tanto"],
+    "mantencion": ["mantiene", "sostiene", "conserva", "retiene", "atrae", "mantener"],
+    "pertenencia": ["pertenece", "forma parte", "es parte", "incluye", "contiene"],
+    "definicion": ["es", "son", "se define", "consiste", "corresponde"],
+    "funcion": ["sirve", "funciona", "participa", "cumple", "se encarga"],
+}
+
+CENTRALITY_MARKERS = ["principal", "fundamental", "central", "clave", "importante", "esencial", "causa", "produce", "genera"]
 
 SEMANTIC_SYNONYMS = {
     "lenguaje": ["habla", "comunicación", "comunicacion", "expresión", "expresion", "idioma"],
@@ -421,6 +478,18 @@ SEMANTIC_SYNONYMS = {
     "cohesión": ["cohesion", "conexión textual", "conexion textual", "marcadores", "conectores"],
     "significado": ["sentido", "contenido", "idea"],
     "discurso": ["texto", "enunciado", "producción", "produccion", "mensaje"],
+    "gravedad": ["atracción gravitacional", "atraccion gravitacional", "fuerza gravitatoria", "fuerza de gravedad"],
+    "orbita": ["órbita", "movimiento orbital", "trayectoria orbital", "gira alrededor"],
+    "órbita": ["orbita", "movimiento orbital", "trayectoria orbital", "gira alrededor"],
+    "sol": ["estrella central", "astro central"],
+    "planetas": ["cuerpos celestes", "mundos", "astros"],
+    "estrella": ["astro luminoso", "cuerpo luminoso", "astro que emite luz"],
+    "fusion nuclear": ["fusión nuclear", "reacciones nucleares", "reacción nuclear"],
+    "fusión nuclear": ["fusion nuclear", "reacciones nucleares", "reacción nuclear"],
+    "energia": ["energía", "emisión de energía", "potencia"],
+    "energía": ["energia", "emisión de energía", "potencia"],
+    "luz": ["luminosidad", "brillo", "emite luz"],
+    "calor": ["temperatura", "energía térmica", "energia termica"],
     "revolucion": ["revolución", "cambio político", "cambio politico", "levantamiento", "transformación política"],
     "revolución": ["revolucion", "cambio político", "cambio politico", "levantamiento", "transformación política"],
     "monarquia": ["monarquía", "rey", "corona", "régimen monárquico", "regimen monarquico"],
@@ -434,15 +503,12 @@ SEMANTIC_SYNONYMS = {
     "independencia": ["emancipación", "emancipacion", "liberación", "liberacion", "autonomía", "autonomia"],
     "colonias": ["territorios coloniales", "colonos", "poblaciones coloniales"],
     "estados unidos": ["eeuu", "usa", "norteamérica", "norteamerica"],
-    "produccion": ["producción", "expresión", "expresion", "habla"],
-    "producción": ["produccion", "expresión", "expresion", "habla"]
 }
 
 
 def semantic_tokens(text):
     txt = normalize_text(text)
-    tokens = [t for t in re.split(r"\s+", txt) if t and t not in STOPWORDS_ES and len(t) > 2]
-    return tokens
+    return [t for t in re.split(r"\s+", txt) if t and t not in STOPWORDS_ES and len(t) > 2]
 
 
 def simple_stem(token):
@@ -456,33 +522,25 @@ def simple_stem(token):
 def token_overlap_score(answer, target):
     a_tokens = set(simple_stem(t) for t in semantic_tokens(answer))
     t_tokens = set(simple_stem(t) for t in semantic_tokens(target))
-
     if not a_tokens or not t_tokens:
         return 0
-
     overlap = len(a_tokens.intersection(t_tokens)) / len(t_tokens)
     containment = len(a_tokens.intersection(t_tokens)) / max(min(len(a_tokens), len(t_tokens)), 1)
-
     return int(round((0.75 * overlap + 0.25 * containment) * 100))
 
 
 def synonym_expansions(term):
     norm = normalize_text(term)
     expansions = {term, norm}
-
     if norm in SEMANTIC_SYNONYMS:
         expansions.update(SEMANTIC_SYNONYMS[norm])
-
     for key, values in SEMANTIC_SYNONYMS.items():
         if norm == key or norm in [normalize_text(v) for v in values]:
             expansions.add(key)
             expansions.update(values)
-
-    # Si el criterio tiene varias palabras, expandir cada palabra importante.
     for tok in semantic_tokens(norm):
         if tok in SEMANTIC_SYNONYMS:
             expansions.update(SEMANTIC_SYNONYMS[tok])
-
     return [e for e in expansions if e]
 
 
@@ -491,10 +549,8 @@ def has_negation_near(answer, target, window=4):
     t_tokens = set(simple_stem(t) for t in semantic_tokens(target))
     if not a_tokens or not t_tokens:
         return False
-
     stems = [simple_stem(t) for t in a_tokens]
     neg_positions = [i for i, t in enumerate(stems) if t in NEGATION_TERMS or normalize_text(a_tokens[i]) in NEGATION_TERMS]
-
     for i, stem in enumerate(stems):
         if stem in t_tokens:
             for npos in neg_positions:
@@ -503,50 +559,47 @@ def has_negation_near(answer, target, window=4):
     return False
 
 
-def semantic_match(answer, target, threshold=68, semantic_threshold=62):
-    """
-    Devuelve:
-    ok, score, method
-
-    method permite explicar si la coincidencia fue:
-    - exacta
-    - fuzzy
-    - sinonimia/paráfrasis
-    - solapamiento léxico
-    - negada/contradictoria
-    """
+def semantic_match_basic(answer, target):
     answer_n = normalize_text(answer)
     target_n = normalize_text(target)
-
     if not answer_n or not target_n:
         return False, 0, "vacío"
+    if target_n in answer_n:
+        return True, 100, "coincidencia directa"
+    score = fuzz.partial_ratio(answer_n, target_n)
+    if score >= 78:
+        return True, int(score), "fuzzy"
+    overlap = token_overlap_score(answer_n, target_n)
+    if overlap >= 64:
+        return True, int(overlap), "solapamiento conceptual"
+    return False, int(max(score, overlap)), "sin coincidencia"
 
+
+def semantic_match(answer, target, threshold=68, semantic_threshold=62):
+    answer_n = normalize_text(answer)
+    target_n = normalize_text(target)
+    if not answer_n or not target_n:
+        return False, 0, "vacío"
     if has_negation_near(answer_n, target_n):
         return False, 20, "posible negación o contradicción"
-
     if target_n in answer_n:
         return True, 100, "coincidencia directa"
 
     best_score = fuzz.partial_ratio(answer_n, target_n)
     best_method = "fuzzy"
-
     if best_score >= threshold:
         return True, int(best_score), best_method
 
-    # Sinónimos/paráfrasis configuradas y diccionario interno.
     for expansion in synonym_expansions(target_n):
         exp_n = normalize_text(expansion)
         if not exp_n:
             continue
-
         if exp_n in answer_n:
             return True, 88, "sinónimo/paráfrasis"
-
         s = fuzz.partial_ratio(answer_n, exp_n)
         if s > best_score:
             best_score = s
             best_method = "sinónimo/paráfrasis"
-
         if s >= semantic_threshold + 10:
             return True, int(s), "sinónimo/paráfrasis"
 
@@ -554,11 +607,94 @@ def semantic_match(answer, target, threshold=68, semantic_threshold=62):
     if overlap > best_score:
         best_score = overlap
         best_method = "solapamiento conceptual"
-
     if overlap >= semantic_threshold:
         return True, int(overlap), "solapamiento conceptual"
-
     return False, int(best_score), best_method
+
+
+def contradictions_lookup(term):
+    term_n = normalize_text(term)
+    bad = []
+    for key, values in CONCEPTUAL_CONTRADICTIONS.items():
+        key_n = normalize_text(key)
+        if term_n == key_n or term_n in [normalize_text(v) for v in synonym_expansions(key_n)]:
+            bad.extend(values)
+    return bad
+
+
+def detect_contradictions(answer, expected_terms):
+    answer_n = normalize_text(answer)
+    if not answer_n:
+        return []
+    found = []
+    all_expected = []
+    for term in expected_terms:
+        all_expected.append(term)
+        all_expected.extend(synonym_expansions(term))
+
+    for term in all_expected:
+        t = normalize_text(term)
+        if not t:
+            continue
+        concept_present = t in answer_n or fuzz.partial_ratio(answer_n, t) >= 72
+        if not concept_present:
+            continue
+        for bad in contradictions_lookup(t):
+            bad_n = normalize_text(bad)
+            if bad_n and (bad_n in answer_n or fuzz.partial_ratio(answer_n, bad_n) >= 84):
+                found.append(f"{term} ↔ {bad}")
+    return sorted(set(found))
+
+
+def relation_score(answer, concepts):
+    answer_n = normalize_text(answer)
+    if not answer_n or len(concepts) < 2:
+        return 0, []
+    present = []
+    for c in concepts:
+        for v in [c] + synonym_expansions(c):
+            ok, _, _ = semantic_match_basic(answer_n, v)
+            if ok:
+                present.append(c)
+                break
+    present = sorted(set(present))
+    if len(present) < 2:
+        return 0, []
+
+    relation_hits = []
+    for rel, patterns in RELATION_PATTERNS.items():
+        for pat in patterns:
+            if normalize_text(pat) in answer_n:
+                relation_hits.append(rel)
+                break
+    if relation_hits:
+        return min(0.12, 0.04 * len(set(relation_hits))), sorted(set(relation_hits))
+    if len(answer_n.split()) >= 8:
+        return 0.04, ["integración conceptual básica"]
+    return 0, []
+
+
+def infer_concept_weights(concepts, prompt=""):
+    concepts = [c for c in concepts if str(c).strip()]
+    if not concepts:
+        return {}
+    prompt_n = normalize_text(prompt)
+    raw = []
+    for i, c in enumerate(concepts):
+        c_n = normalize_text(c)
+        w = 1.0
+        if i == 0:
+            w += 0.35
+        if c_n and c_n in prompt_n:
+            w += 0.20
+        if any(m in c_n for m in CENTRALITY_MARKERS):
+            w += 0.25
+        if len(c_n.split()) >= 2:
+            w += 0.10
+        raw.append(w)
+    total = sum(raw) or 1
+    return {concepts[i]: raw[i] / total for i in range(len(concepts))}
+
 
 def fuzzy_contains(answer, target, threshold=78):
     ok, score, _method = semantic_match(answer, target, threshold=threshold, semantic_threshold=max(58, threshold - 10))
@@ -601,23 +737,34 @@ def score_criteria(answer, question):
     if not criteria:
         return score_accepted_answers(answer, question)
 
+    concepts = [c.get("concept", "") for c in criteria if c.get("concept", "")]
+    weight_map = infer_concept_weights(concepts, question.get("prompt", ""))
+
     total = 0.0
     matched = []
     missing = []
     confidence_scores = []
     method_notes = []
 
+    contradictions = detect_contradictions(answer, concepts)
+
     for criterion in criteria:
-        weight = float(criterion.get("weight", 1.0))
-        variants = []
         concept = criterion.get("concept", "")
+        base_weight = float(criterion.get("weight", 1.0))
+        auto_weight = weight_map.get(concept)
+        if auto_weight is not None and len(criteria) > 1:
+            max_score = float(question.get("max_score", 1.0))
+            weight = max_score * auto_weight
+        else:
+            weight = base_weight
+
+        variants = []
         if concept:
             variants.append(concept)
         variants.extend(criterion.get("semantic_variants", []))
         variants.extend(criterion.get("accepted_values", []))
         variants.extend(synonym_expansions(concept))
 
-        # Quitar duplicados manteniendo orden.
         seen = set()
         variants = [v for v in variants if not (normalize_text(v) in seen or seen.add(normalize_text(v)))]
 
@@ -633,6 +780,12 @@ def score_criteria(answer, question):
             if ok:
                 criterion_hit = True
 
+        related_contradiction = any(normalize_text(concept) in normalize_text(c) for c in contradictions)
+        if related_contradiction:
+            criterion_best = min(criterion_best, 45)
+            criterion_hit = False
+            criterion_method = "contradicción conceptual"
+
         confidence_scores.append(criterion_best / 100 if criterion_best else 0)
 
         if criterion_hit:
@@ -641,20 +794,33 @@ def score_criteria(answer, question):
             method_notes.append(f"{concept}: {criterion_method} ({criterion_best}/100)")
         else:
             missing.append(concept)
-            if criterion_best >= 45:
+            if criterion_best >= 40:
                 method_notes.append(f"{concept}: aproximación insuficiente ({criterion_best}/100)")
 
     max_score = float(question.get("max_score", total))
+
+    rel_bonus, rel_hits = relation_score(answer, concepts)
+    if rel_bonus and matched:
+        total += max_score * rel_bonus
+        method_notes.append("Relaciones detectadas: " + ", ".join(rel_hits))
+
+    if contradictions:
+        total *= 0.65
+        method_notes.append("Alerta: posible contradicción conceptual: " + "; ".join(contradictions[:4]))
+
     total = min(total, max_score)
     confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
+
+    if contradictions:
+        confidence = min(confidence, 0.55)
 
     feedback = []
     if matched:
         feedback.append("Criterios detectados: " + "; ".join([m for m in matched if m]))
     if missing:
-        feedback.append("Criterios no detectados: " + "; ".join([m for m in missing if m]))
+        feedback.append("Criterios no detectados o débiles: " + "; ".join([m for m in missing if m]))
     if method_notes:
-        feedback.append("Evidencia semántica: " + "; ".join(method_notes[:8]))
+        feedback.append("Evidencia semántica: " + "; ".join(method_notes[:10]))
 
     return round(total, 2), round(confidence, 2), " | ".join(feedback)
 
@@ -1159,7 +1325,7 @@ def base_css():
     """
 
 
-def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v2.5 semántico"):
+def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v2.6 conceptual"):
     return f"""
     <div class="topbar">
       <div class="brand">
@@ -1189,30 +1355,28 @@ def save_template_workbook(kind: str):
 
     if kind == "rubric":
         ws.title = "Modelo_Rubrica"
-        headers = ["pregunta", "tipo", "max_score", "respuestas", "criterios", "variantes_semanticas", "required_items", "prompt"]
+        headers = ["pregunta", "tipo", "puntaje", "respuesta_esperada", "enunciado"]
         ws.append(headers)
         rows = [
-            ["P1", "criterios", 4, "", "lenguaje; mente; cognición; comprensión", "procesos mentales; pensamiento; entender; interpretar; significado", "", "Explique qué estudia la psicolingüística."],
-            ["P2", "VF", 1, "Verdadero", "", "", "", "La psicolingüística estudia la relación entre lenguaje y cognición."],
-            ["P3", "completion", 2, "memoria de trabajo", "", "memoria operativa", "", "Complete: La __________ participa activamente en la comprensión del lenguaje."],
-            ["P4", "enumeracion", 3, "memoria; atención; comprensión; inferencia", "", "entender; interpretar; deducir; concentración", 3, "Mencione tres procesos cognitivos relacionados con la comprensión."],
-            ["P5", "matching", 3, "Broca:producción; Wernicke:comprensión; Hipocampo:memoria", "", "", "", "Relacione estructura cerebral y función."],
-            ["P6", "criterios", 5, "", "coherencia; cohesión; inferencia; significado; discurso", "sentido global; conexión de ideas; continuidad temática; texto", "", "Explique la importancia de la coherencia en el discurso."]
+            ["P1", "abierta", 5, "gravedad, órbita, Sol, planetas", "Explique por qué los planetas orbitan alrededor del Sol."],
+            ["P2", "VF", 1, "Verdadero", "La Luna es el satélite natural de la Tierra."],
+            ["P3", "completion", 2, "Vía Láctea", "Complete: El sistema solar pertenece a la ________."],
+            ["P4", "enumeracion", 3, "Mercurio, Venus, Tierra, Marte", "Mencione al menos dos planetas rocosos del sistema solar."],
+            ["P5", "matching", 4, "Júpiter:gigante gaseoso; Marte:planeta rojo; Saturno:anillos; Neptuno:azul", "Relacione planeta y característica."],
+            ["P6", "abierta", 5, "estrella, energía, fusión nuclear, luz, calor", "Explique qué es una estrella y cómo produce energía."]
         ]
         for row in rows:
             ws.append(row)
 
         info = wb.create_sheet("Instrucciones")
-        info.append(["Campo", "Qué debe completar el docente"])
-        info.append(["pregunta", "Código de la pregunta. Ejemplo: P1, P2, P3."])
-        info.append(["tipo", "Use: criterios, VF, completion, enumeracion o matching."])
-        info.append(["max_score", "Puntaje máximo de la pregunta."])
-        info.append(["respuestas", "Respuestas correctas separadas por punto y coma. Útil para VF, completion, enumeracion y matching."])
-        info.append(["criterios", "Conceptos esperados separados por punto y coma. Útil para preguntas abiertas tipo criterios."])
-        info.append(["variantes_semanticas", "Sinónimos, paráfrasis o formas alternativas aceptables separadas por punto y coma. Este campo mejora la robustez semántica."])
-        info.append(["required_items", "Número de elementos requeridos. Útil para enumeracion."])
-        info.append(["prompt", "Enunciado visible de la pregunta."])
-        info.append(["matching", "Para matching use formato Concepto:Respuesta; Concepto:Respuesta."])
+        info.append(["Evalia", "Cómo completar el Modelo de Rúbrica"])
+        info.append(["pregunta", "Use códigos simples: P1, P2, P3..."])
+        info.append(["tipo", "Use abierta, VF, completion, enumeracion o matching."])
+        info.append(["puntaje", "Puntaje máximo de la pregunta."])
+        info.append(["respuesta_esperada", "Escriba ideas clave o respuesta esperada. Puede usar comas, punto y coma o saltos de línea."])
+        info.append(["enunciado", "Pregunta o instrucción que vio el estudiante."])
+        info.append(["matching", "Para relaciones use: Concepto:Respuesta; Concepto:Respuesta."])
+        info.append(["Nota", "No necesita escribir sinónimos técnicos. Evalia intenta reconocer paráfrasis, relaciones y contradicciones."])
         filename = "modelo_rubrica_evalia.xlsx"
 
     else:
@@ -1220,23 +1384,24 @@ def save_template_workbook(kind: str):
         headers = ["student_id", "nombre", "P1", "P2", "P3", "P4", "P5", "P6"]
         ws.append(headers)
         rows = [
-            ["A01", "Ana Pérez", "La psicolingüística estudia el lenguaje, la mente, la cognición y la comprensión.", "Verdadero", "memoria de trabajo", "memoria; atención; comprensión", "Broca producción; Wernicke comprensión; Hipocampo memoria", "La coherencia permite mantener significado y cohesión en el discurso mediante inferencias."],
-            ["A02", "Luis Soto", "Estudia el lenguaje y procesos mentales.", "V", "memoria", "memoria; atención", "Broca producción", "La coherencia ayuda a comprender mejor el significado del discurso."],
-            ["A03", "Camila Díaz", "", "Falso", "memoria de trabajo", "comprensión; inferencia; memoria; atención", "Wernicke comprensión; Hipocampo memoria", "La cohesión y coherencia ayudan a construir significado."]
+            ["A01", "Ana Pérez", "Los planetas giran alrededor del Sol por la gravedad y el movimiento orbital.", "Verdadero", "Vía Láctea", "Tierra, Marte", "Júpiter gigante gaseoso; Marte planeta rojo", "Una estrella produce luz y calor mediante fusión nuclear."],
+            ["A02", "Luis Soto", "La atracción del Sol mantiene a los cuerpos celestes en órbita.", "V", "nuestra galaxia", "Mercurio, Venus", "Saturno anillos; Neptuno azul", "Las estrellas emiten energía por reacciones nucleares."],
+            ["A03", "Camila Díaz", "Porque el Sol los atrae.", "Falso", "Andrómeda", "Marte", "Júpiter azul", "Una estrella es un planeta caliente."]
         ]
         for row in rows:
             ws.append(row)
 
         info = wb.create_sheet("Instrucciones")
-        info.append(["Campo", "Qué debe completar el docente"])
-        info.append(["student_id", "Identificador del estudiante. Puede ser código, número o rut interno."])
+        info.append(["Evalia", "Cómo completar el Modelo de Respuestas"])
+        info.append(["student_id", "Identificador del estudiante."])
         info.append(["nombre", "Nombre del estudiante."])
         info.append(["P1, P2, P3...", "Respuesta del estudiante para cada pregunta. Debe coincidir con los códigos de la rúbrica."])
-        info.append(["Nota", "Evalia también reconoce equivalencias como Q1, pregunta1 o item1, pero se recomienda usar P1, P2, P3."])
+        info.append(["Nota", "Se recomienda usar P1, P2, P3... para evitar errores."])
         filename = "modelo_respuestas_evalia.xlsx"
 
     header_fill = PatternFill("solid", fgColor="111827")
     header_font = Font(color="FFFFFF", bold=True)
+    soft_fill = PatternFill("solid", fgColor="F9FAFB")
 
     for sheet in wb.worksheets:
         if sheet.max_row >= 1:
@@ -1245,8 +1410,14 @@ def save_template_workbook(kind: str):
                 cell.font = header_font
                 cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
+        for row in sheet.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                if cell.row % 2 == 0:
+                    cell.fill = soft_fill
+
         for col in range(1, sheet.max_column + 1):
-            sheet.column_dimensions[get_column_letter(col)].width = 30
+            sheet.column_dimensions[get_column_letter(col)].width = 34
 
     path = OUTPUT_DIR / filename
     wb.save(path)
@@ -1350,14 +1521,14 @@ def home():
                 <div class="template-card">
                   <div>
                     <strong>Modelo de Rúbrica</strong>
-                    <span>Formato oficial para definir preguntas, tipo, puntaje, respuestas y criterios.</span>
+                    <span>Formato simple: pregunta, tipo, puntaje, respuesta esperada y enunciado.</span>
                   </div>
                   <a class="button outline" href="/download-template/rubric">Descargar</a>
                 </div>
                 <div class="template-card">
                   <div>
                     <strong>Modelo de Respuestas</strong>
-                    <span>Formato oficial para cargar estudiantes y respuestas por pregunta.</span>
+                    <span>Formato simple para cargar estudiantes y respuestas.</span>
                   </div>
                   <a class="button outline" href="/download-template/responses">Descargar</a>
                 </div>
@@ -1371,7 +1542,7 @@ def home():
                     <input name="rubric_file" id="rubricFileInput" type="file" accept=".xlsx,.xls,.json" required>
                     <div class="drop-icon">🧩</div>
                     <div class="drop-title">Sube el Modelo de Rúbrica</div>
-                    <div class="drop-subtitle">Debe seguir el formato oficial descargable</div>
+                    <div class="drop-subtitle">Usa el modelo simple descargable</div>
                     <div class="file-name" id="rubricFileName"></div>
                   </div>
 
@@ -1380,7 +1551,7 @@ def home():
                     <input name="file" id="fileInput" type="file" accept=".xlsx,.xls" required>
                     <div class="drop-icon">📄</div>
                     <div class="drop-title">Sube el Modelo de Respuestas</div>
-                    <div class="drop-subtitle">Debe seguir el formato oficial descargable</div>
+                    <div class="drop-subtitle">Usa el modelo simple descargable</div>
                     <div class="file-name" id="fileName"></div>
                   </div>
 
@@ -1404,7 +1575,7 @@ def home():
               <div class="feature"><strong>Modelo de Rúbrica</strong>Define preguntas, puntajes y criterios.</div>
               <div class="feature"><strong>Modelo de Respuestas</strong>Organiza estudiantes y respuestas.</div>
               <div class="feature"><strong>Vista previa</strong>Confirma que el formato calza.</div>
-              <div class="feature"><strong>Capa semántica</strong>Reconoce paráfrasis, sinónimos y coincidencias conceptuales.</div>
+              <div class="feature"><strong>Capa semántica</strong>Reconoce paráfrasis, relaciones y posibles contradicciones.</div>
             </div>
           </section>
 
@@ -1715,7 +1886,7 @@ async def upload(
         f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultados · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v2.5 semántico")}
+          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v2.6 conceptual")}
           <section class="result-card">
             <h1>Procesamiento completado</h1>
             <p class="lead">Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong> y generó un reporte Excel explicable.</p>
