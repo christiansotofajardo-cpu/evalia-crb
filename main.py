@@ -21,7 +21,7 @@ RUBRICS_DIR.mkdir(exist_ok=True)
 
 LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
-app = FastAPI(title="Evalia CRB", version="2.9.0")
+app = FastAPI(title="Evalia CRB", version="3.0.0")
 
 
 # ============================================================
@@ -570,6 +570,27 @@ SEMANTIC_SYNONYMS = {
     "estados unidos": ["eeuu", "usa", "norteamérica", "norteamerica"],
 }
 
+# Ampliación semántica v3.0: dominios escolares frecuentes y oceanografía.
+SEMANTIC_SYNONYMS.update({
+    "oceanos": ["océanos", "mares", "mar", "agua marina", "masas de agua"],
+    "océanos": ["oceanos", "mares", "mar", "agua marina", "masas de agua"],
+    "regulacion climatica": ["regulación climática", "regulacion del clima", "regular el clima", "regulación térmica", "temperatura global"],
+    "regulación climática": ["regulacion climatica", "regulacion del clima", "regular el clima", "regulación térmica", "temperatura global"],
+    "corrientes marinas": ["corrientes", "circulación oceánica", "circulacion oceanica", "movimiento del agua"],
+    "absorcion de calor": ["absorción de calor", "almacena calor", "retiene calor", "absorbe energía", "absorbe energia"],
+    "salinidad": ["sales", "cantidad de sal", "concentración de sal", "concentracion de sal"],
+    "densidad": ["masa por volumen", "agua más densa", "agua mas densa"],
+    "fitoplancton": ["plancton vegetal", "microalgas", "base de la cadena trófica", "base de la cadena trofica"],
+    "presion": ["presión", "alta presión", "presion del agua"],
+    "presión": ["presion", "alta presión", "presion del agua"],
+    "profundidad": ["zona profunda", "océano profundo", "oceano profundo", "más profundo", "mas profundo"],
+    "luz solar": ["luz", "luminosidad", "radiación solar", "radiacion solar"],
+    "contaminacion": ["contaminación", "desechos", "basura", "residuos", "microplásticos", "microplasticos", "plásticos", "plasticos"],
+    "contaminación": ["contaminacion", "desechos", "basura", "residuos", "microplásticos", "microplasticos", "plásticos", "plasticos"],
+    "ecosistemas marinos": ["vida marina", "ambientes marinos", "hábitats marinos", "habitats marinos"],
+    "biodiversidad": ["diversidad biológica", "diversidad biologica", "variedad de especies", "especies marinas"],
+})
+
 
 def semantic_tokens(text):
     txt = normalize_text(text)
@@ -869,6 +890,129 @@ def infer_concept_weights(concepts, prompt=""):
 def fuzzy_contains(answer, target, threshold=78):
     ok, score, _method = semantic_match(answer, target, threshold=threshold, semantic_threshold=max(58, threshold - 10))
     return ok, score
+
+
+VAGUE_RESPONSES = {
+    "no se", "no sé", "nose", "porque si", "porque sí", "no entiendo", "no recuerdo",
+    "no tengo idea", "nada", "ninguna", "sin respuesta", "no aplica"
+}
+
+
+def get_question_concepts(question):
+    item_type = question.get("item_type", "")
+    if item_type == "criteria":
+        return [c.get("concept", "") for c in question.get("criteria", []) if c.get("concept", "")]
+    if item_type in ["enumeration", "enumeration_closed", "enumeration_conceptual", "enumeration_categorized"]:
+        return question.get("accepted_concepts", question.get("accepted_answers", []))
+    if item_type in ["completion", "short_exact_answer", "true_false"]:
+        return question.get("accepted_answers", [])
+    if item_type == "classification_matching":
+        concepts = []
+        for pair in question.get("pairs", []):
+            concepts.append(pair.get("prompt_value", ""))
+            concepts.append(pair.get("correct_match", ""))
+        return [c for c in concepts if c]
+    return []
+
+
+def detect_concept_relations(answer, concepts):
+    answer_n = normalize_text(answer)
+    present, _evidence = detect_present_concepts(answer, concepts)
+    relation_hits = []
+    for rel, patterns in RELATION_PATTERNS.items():
+        for pat in patterns:
+            if normalize_text(pat) in answer_n:
+                relation_hits.append(rel)
+                break
+    # Relaciones escolares frecuentes no siempre incluidas en RELATION_PATTERNS.
+    extra = {
+        "consecuencia": ["afecta", "daña", "impacta", "provoca", "produce", "consecuencia", "causa"],
+        "cambio_gradual": ["aumenta", "disminuye", "más", "menos", "mayor", "menor", "cambia"],
+        "regulacion": ["regula", "modera", "mantiene", "estabiliza"],
+    }
+    for rel, patterns in extra.items():
+        for pat in patterns:
+            if normalize_text(pat) in answer_n:
+                relation_hits.append(rel)
+                break
+    return sorted(set(relation_hits)), present
+
+
+def classify_error_type(answer, question, concepts=None, present=None, missing=None, contradictions=None):
+    answer_n = normalize_text(answer)
+    if not answer_n:
+        return "respuesta_vacia", "alta"
+    if answer_n in {normalize_text(x) for x in VAGUE_RESPONSES} or len(semantic_tokens(answer_n)) <= 1:
+        return "respuesta_vaga", "media"
+
+    concepts = concepts if concepts is not None else get_question_concepts(question)
+    present = present if present is not None else detect_present_concepts(answer, concepts)[0]
+    missing = missing if missing is not None else [c for c in concepts if c not in present]
+    contradictions = contradictions if contradictions is not None else detect_contradictions(answer, concepts)
+
+    if contradictions:
+        return "confusion_o_contradiccion_conceptual", "alta"
+    if concepts and not present:
+        return "fuera_de_foco_u_omision_total", "alta"
+    if missing and present:
+        if answer_length_profile(answer) in ["brief", "short"]:
+            return "respuesta_breve_parcial", "baja"
+        return "respuesta_incompleta", "media"
+
+    relations, _ = detect_concept_relations(answer, concepts)
+    if len(concepts) >= 2 and len(present) >= 2 and not relations and answer_length_profile(answer) == "developed":
+        return "relacion_conceptual_debil", "media"
+
+    return "sin_error_conceptual_evidente", "baja"
+
+
+def generate_teacher_feedback_from_diagnosis(error_type, missing, relations, answer_profile):
+    if error_type == "respuesta_vacia":
+        return "Solicitar respuesta; no hay evidencia evaluable."
+    if error_type == "respuesta_vaga":
+        return "Pedir mayor precisión conceptual; la respuesta es demasiado general."
+    if error_type == "confusion_o_contradiccion_conceptual":
+        return "Revisar manualmente: puede existir una confusión conceptual relevante."
+    if error_type == "fuera_de_foco_u_omision_total":
+        return "Reforzar el núcleo conceptual de la pregunta; no se detectan ideas esperadas."
+    if error_type == "respuesta_breve_parcial":
+        return "La respuesta contiene un núcleo válido, pero conviene pedir desarrollo si la rúbrica exige explicación."
+    if error_type == "respuesta_incompleta":
+        return "Retroalimentar conceptos omitidos: " + (", ".join(missing[:4]) if missing else "sin detalle") + "."
+    if error_type == "relacion_conceptual_debil":
+        return "Pedir que conecte explícitamente los conceptos mediante causa, función o consecuencia."
+    if relations:
+        return "Respuesta conceptualmente consistente; se detectan relaciones: " + ", ".join(relations[:4]) + "."
+    if answer_profile in ["brief", "short"]:
+        return "Respuesta aceptable pero breve; revisar si el objetivo era explicación desarrollada."
+    return "Respuesta compatible con los criterios actuales de Evalia."
+
+
+def semantic_diagnosis(answer, question, score=None, confidence=None, status=None):
+    concepts = get_question_concepts(question)
+    present, evidence = detect_present_concepts(answer, concepts)
+    missing = [c for c in concepts if c not in present]
+    contradictions = detect_contradictions(answer, concepts)
+    relations, present_for_relations = detect_concept_relations(answer, concepts)
+    profile = answer_length_profile(answer)
+    error_type, severity = classify_error_type(
+        answer, question, concepts=concepts, present=present, missing=missing, contradictions=contradictions
+    )
+    coverage = len(set(present)) / max(len(set(concepts)), 1) if concepts else 0
+    teacher_suggestion = generate_teacher_feedback_from_diagnosis(error_type, missing, relations, profile)
+    return {
+        "answer_profile": profile,
+        "concepts_expected": "; ".join([str(c) for c in concepts]),
+        "concepts_detected": "; ".join([str(c) for c in present]),
+        "concepts_missing": "; ".join([str(c) for c in missing]),
+        "conceptual_relations": "; ".join(relations),
+        "contradictions": "; ".join(contradictions),
+        "error_type": error_type,
+        "error_severity": severity,
+        "conceptual_coverage": round(coverage, 2),
+        "teacher_suggestion_semantic": teacher_suggestion,
+        "evalia_decision_basis": f"cobertura={coverage:.2f}; relaciones={len(relations)}; contradicciones={len(contradictions)}; perfil={profile}"
+    }
 
 
 def score_accepted_answers(answer, question):
@@ -1522,7 +1666,7 @@ def base_css():
     """
 
 
-def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v2.9 semántica fina"):
+def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v3.0 inteligencia semántica"):
     return f"""
     <div class="topbar">
       <div class="brand">
@@ -1942,6 +2086,7 @@ async def upload(
     score_rows = []
     conf_rows = []
     feedback_rows = []
+    semantic_pattern_rows = []
 
     accepted_count = 0
     caution_count = 0
@@ -1992,6 +2137,19 @@ async def upload(
             else:
                 review_count += 1
                 question_stats[pid]["review"] += 1
+
+            diagnosis = semantic_diagnosis(answer, p, score=score, confidence=conf, status=status)
+            semantic_pattern_rows.append({
+                "student_id": sid,
+                "nombre": nombre,
+                "pregunta_id": pid,
+                "tipo_item": display_item_type(p.get("item_type", "")),
+                "score": score,
+                "max_score": p.get("max_score", ""),
+                "confidence": conf,
+                "status": status,
+                **diagnosis
+            })
 
             feedback_rows.append({
                 "student_id": sid,
@@ -2058,7 +2216,7 @@ async def upload(
     teacher_report_rows.insert(0, {
         "seccion": "Producto",
         "indicador": "Sistema",
-        "valor": "Evalia by Altiora · Inteligencia Evaluativa Automatizada · Capa semántica v2.5"
+        "valor": "Evalia by Altiora · Inteligencia Semántica Docente · v3.0"
     })
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -2066,6 +2224,7 @@ async def upload(
         pd.DataFrame(score_rows).to_excel(writer, sheet_name="Puntajes", index=False)
         pd.DataFrame(conf_rows).to_excel(writer, sheet_name="Confianza", index=False)
         pd.DataFrame(feedback_rows).to_excel(writer, sheet_name="Feedback", index=False)
+        pd.DataFrame(semantic_pattern_rows).to_excel(writer, sheet_name="PATRONES_SEMANTICOS", index=False)
         pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Resumen_Tecnico", index=False)
         pd.DataFrame(insights_rows).to_excel(writer, sheet_name="Analisis_Items", index=False)
         pd.DataFrame(type_insights_rows).to_excel(writer, sheet_name="Analisis_Tipos", index=False)
@@ -2083,7 +2242,7 @@ async def upload(
         f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultados · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v2.9 semántica fina")}
+          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v3.0 inteligencia semántica")}
           <section class="result-card">
             <h1>Procesamiento completado</h1>
             <p class="lead">Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong> y generó un reporte Excel explicable.</p>
@@ -2113,7 +2272,7 @@ def download(filename: str):
         return HTMLResponse(
             f"""
             <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Archivo no encontrado · Evalia</title>{base_css()}</head>
-            <body><div class="page"><main class="shell">{shell_topbar("Archivo no encontrado", "CRB Engine · v2.9 semántica fina")}<div class="result-card">
+            <body><div class="page"><main class="shell">{shell_topbar("Archivo no encontrado", "CRB Engine · v3.0 inteligencia semántica")}<div class="result-card">
               <h1>No se pudo acceder al archivo</h1>
               <div class="error">El reporte solicitado no existe o no fue generado correctamente.</div>
               <p class="lead">Vuelve al inicio y procesa nuevamente la rúbrica y las respuestas.</p>
