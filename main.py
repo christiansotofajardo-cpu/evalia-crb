@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from pathlib import Path
 import pandas as pd
 import json
@@ -8,6 +8,7 @@ import unicodedata
 from rapidfuzz import fuzz
 from html import escape
 from typing import Optional
+from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -20,7 +21,7 @@ RUBRICS_DIR.mkdir(exist_ok=True)
 
 LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
-app = FastAPI(title="Evalia CRB", version="2.3")
+app = FastAPI(title="Evalia CRB", version="2.4")
 
 
 # ============================================================
@@ -807,43 +808,56 @@ def format_workbook(writer):
 # CSS/UI
 # ============================================================
 
+
+# ============================================================
+# CSS/UI
+# ============================================================
+
 def base_css():
     return """
     <style>
       :root {
         --bg: #f5f6f8; --card: #ffffff; --ink: #15171a; --muted: #667085;
         --line: #e5e7eb; --accent: #111827; --soft: #f9fafb; --ok: #067647;
+        --alt-blue:#0ea5e9; --alt-purple:#7c3aed; --alt-orange:#f97316; --alt-green:#10b981;
       }
       * { box-sizing: border-box; }
       body {
         margin: 0; min-height: 100vh;
         font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-        background: radial-gradient(circle at top left, rgba(17,24,39,.08), transparent 28%), var(--bg);
+        background: radial-gradient(circle at top left, rgba(14,165,233,.10), transparent 28%),
+                    radial-gradient(circle at top right, rgba(124,58,237,.08), transparent 26%),
+                    var(--bg);
         color: var(--ink);
       }
-      .page { width: 100%; min-height: 100vh; display: flex; justify-content: center; padding: 42px 20px; }
-      .shell { width: 100%; max-width: 920px; }
+      .page { width: 100%; min-height: 100vh; display: flex; justify-content: center; padding: 42px 20px 24px; }
+      .shell { width: 100%; max-width: 980px; }
       .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 26px; }
       .brand { display: flex; align-items: center; gap: 12px; }
       .logo {
-        width: 42px; height: 42px; border-radius: 14px; background: #111827; color: white;
-        display: grid; place-items: center; font-weight: 800; letter-spacing: -.03em;
+        width: 44px; height: 44px; border-radius: 15px; background: #111827; color: white;
+        display: grid; place-items: center; font-weight: 900; letter-spacing: -.03em;
+        position: relative; overflow: hidden;
       }
-      .brand-title { font-size: 22px; font-weight: 800; letter-spacing: -.04em; }
+      .logo:after {
+        content:""; position:absolute; inset:auto 6px 6px 6px; height:4px; border-radius:999px;
+        background: linear-gradient(90deg,var(--alt-blue),var(--alt-green),var(--alt-orange),var(--alt-purple));
+      }
+      .brand-title { font-size: 22px; font-weight: 900; letter-spacing: -.04em; }
       .brand-subtitle { color: var(--muted); font-size: 13px; margin-top: 2px; }
       .badge {
         padding: 8px 12px; background: white; border: 1px solid var(--line);
         border-radius: 999px; color: var(--muted); font-size: 13px;
       }
       .hero, .result-card {
-        background: rgba(255,255,255,.88); backdrop-filter: blur(12px); border: 1px solid var(--line);
+        background: rgba(255,255,255,.90); backdrop-filter: blur(12px); border: 1px solid var(--line);
         border-radius: 28px; box-shadow: 0 20px 60px rgba(17,24,39,.08); overflow: hidden;
       }
       .hero-inner, .result-card { padding: 34px; }
       h1 { margin: 0; font-size: 42px; line-height: 1.04; letter-spacing: -.06em; }
-      .lead { margin: 14px 0 26px; color: var(--muted); font-size: 17px; line-height: 1.55; max-width: 760px; }
+      .lead { margin: 14px 0 26px; color: var(--muted); font-size: 17px; line-height: 1.55; max-width: 800px; }
       .panel { background: var(--soft); border: 1px solid var(--line); border-radius: 22px; padding: 22px; }
-      .field-label { display: block; font-weight: 700; margin-bottom: 8px; font-size: 14px; }
+      .field-label { display: block; font-weight: 800; margin-bottom: 8px; font-size: 14px; }
       select, input.file-visible {
         width: 100%; padding: 14px; border: 1px solid var(--line); border-radius: 14px;
         background: white; font-size: 15px; color: var(--ink); margin-bottom: 18px;
@@ -855,26 +869,49 @@ def base_css():
       .dropzone:hover { border-color: #111827; transform: translateY(-1px); box-shadow: 0 12px 28px rgba(17,24,39,.08); }
       .dropzone input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
       .drop-icon { font-size: 30px; margin-bottom: 8px; }
-      .drop-title { font-weight: 800; font-size: 17px; }
+      .drop-title { font-weight: 900; font-size: 17px; }
       .drop-subtitle { color: var(--muted); margin-top: 6px; font-size: 14px; }
-      .file-name { margin-top: 10px; font-size: 14px; color: var(--ok); font-weight: 700; min-height: 18px; }
+      .file-name { margin-top: 10px; font-size: 14px; color: var(--ok); font-weight: 800; min-height: 18px; }
       .actions { display: flex; align-items: center; gap: 14px; margin-top: 18px; flex-wrap: wrap; }
       button, .button {
-        border: none; border-radius: 14px; padding: 13px 19px; font-size: 15px; font-weight: 800;
+        border: none; border-radius: 14px; padding: 13px 19px; font-size: 15px; font-weight: 900;
         background: var(--accent); color: white; cursor: pointer; text-decoration: none;
         display: inline-flex; align-items: center; gap: 8px; transition: .18s ease;
       }
       button:hover, .button:hover { transform: translateY(-1px); box-shadow: 0 14px 24px rgba(17,24,39,.18); }
+      button.secondary, .button.secondary { background: #475467; }
+      button.outline, .button.outline { background: white; color: #111827; border: 1px solid var(--line); }
       .hint { color: var(--muted); font-size: 13px; }
+      .templates {
+        display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin: 0 0 18px;
+      }
+      .template-card {
+        background: white; border: 1px solid var(--line); border-radius: 18px; padding: 16px;
+        display: flex; justify-content: space-between; gap: 12px; align-items: center;
+      }
+      .template-card strong { display:block; font-size:14px; }
+      .template-card span { display:block; color:var(--muted); font-size:12px; margin-top:4px; }
       .features { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; padding: 18px 34px 30px; }
       .feature { background: white; border: 1px solid var(--line); border-radius: 18px; padding: 16px; color: var(--muted); font-size: 13px; }
       .feature strong { display: block; color: var(--ink); font-size: 14px; margin-bottom: 5px; }
-      .loader { display: none; align-items: center; gap: 10px; color: var(--muted); font-size: 14px; margin-top: 14px; }
-      .spinner {
-        width: 18px; height: 18px; border: 3px solid #e5e7eb; border-top-color: #111827;
-        border-radius: 50%; animation: spin 1s linear infinite;
+      .loader { display: none; color: var(--muted); font-size: 14px; margin-top: 16px; }
+      .progress-container {
+        width: 100%; height: 14px; background: #e5e7eb; border-radius: 999px;
+        overflow: hidden; margin-top: 10px;
       }
-      @keyframes spin { to { transform: rotate(360deg); } }
+      .progress-bar {
+        width: 0%; height: 100%; border-radius: 999px;
+        background: linear-gradient(90deg,var(--alt-blue),var(--alt-green),var(--alt-orange),var(--alt-purple));
+        transition: width .5s ease;
+      }
+      .progress-status { margin-top: 9px; font-size: 13px; color: var(--muted); }
+      .preview-box {
+        display:none; background:white; border:1px solid var(--line); border-radius:18px;
+        padding:16px; margin-top:16px; color:#344054; font-size:14px; line-height:1.55;
+      }
+      .preview-title { font-weight:900; color:#111827; margin-bottom:6px; }
+      .preview-ok { color:#067647; font-weight:800; }
+      .preview-warn { color:#b54708; font-weight:800; }
       .metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 24px 0; }
       .metric { border: 1px solid var(--line); border-radius: 18px; padding: 16px; background: var(--soft); }
       .metric-value { font-size: 24px; font-weight: 900; }
@@ -883,14 +920,156 @@ def base_css():
         color: #b42318; background: #fff4f2; border: 1px solid #fecdca;
         border-radius: 18px; padding: 18px;
       }
+      .footer-altiora { text-align: center; margin-top: 26px; color: #667085; font-size: 13px; padding-bottom: 18px; }
+      .footer-sub { margin-top: 4px; font-size: 12px; letter-spacing:.02em; }
       code { background: #eef2f7; padding: 2px 6px; border-radius: 6px; }
       @media (max-width: 760px) {
         h1 { font-size: 32px; }
-        .features, .metric-grid { grid-template-columns: 1fr; }
+        .features, .metric-grid, .templates { grid-template-columns: 1fr; }
         .topbar { align-items: flex-start; gap: 14px; flex-direction: column; }
       }
     </style>
     """
+
+
+def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v2.4 docente"):
+    return f"""
+    <div class="topbar">
+      <div class="brand">
+        <div class="logo">E</div>
+        <div>
+          <div class="brand-title">Evalia</div>
+          <div class="brand-subtitle">{escape(subtitle)}</div>
+        </div>
+      </div>
+      <div class="badge">{escape(badge)}</div>
+    </div>
+    """
+
+
+def footer_altiora():
+    return """
+    <footer class="footer-altiora">
+      <div><strong>Evalia by Altiora</strong></div>
+      <div class="footer-sub">Inteligencia que eleva posibilidades</div>
+    </footer>
+    """
+
+
+def save_template_workbook(kind: str):
+    wb = Workbook()
+    ws = wb.active
+
+    if kind == "rubric":
+        ws.title = "Rubrica"
+        headers = ["pregunta", "tipo", "max_score", "respuestas", "criterios", "required_items", "prompt"]
+        ws.append(headers)
+        rows = [
+            ["P1", "criterios", 3, "", "lenguaje; mente; psicolingüística", "", "Explique qué estudia la psicolingüística."],
+            ["P2", "VF", 1, "Verdadero", "", "", "La psicolingüística estudia la relación entre lenguaje y cognición."],
+            ["P3", "enumeracion", 2, "memoria; atención; comprensión", "", 2, "Mencione dos procesos cognitivos relacionados con la comprensión."],
+            ["P4", "matching", 2, "Broca:producción; Wernicke:comprensión", "", "", "Relacione las áreas cerebrales con su función."]
+        ]
+        for row in rows:
+            ws.append(row)
+        filename = "template_rubrica_evalia.xlsx"
+
+    else:
+        ws.title = "Respuestas"
+        headers = ["student_id", "nombre", "P1", "P2", "P3", "P4"]
+        ws.append(headers)
+        rows = [
+            ["A01", "Ana Pérez", "La psicolingüística estudia el lenguaje, la mente y la comprensión.", "Verdadero", "memoria; comprensión", "Broca producción; Wernicke comprensión"],
+            ["A02", "Luis Soto", "Estudia el lenguaje y procesos mentales.", "V", "atención", "Broca producción"],
+            ["A03", "Camila Díaz", "", "Falso", "memoria; atención; comprensión", "Wernicke comprensión; Broca producción"]
+        ]
+        for row in rows:
+            ws.append(row)
+        filename = "template_respuestas_evalia.xlsx"
+
+    header_fill = PatternFill("solid", fgColor="111827")
+    header_font = Font(color="FFFFFF", bold=True)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+
+    for col in range(1, ws.max_column + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 24
+
+    path = OUTPUT_DIR / filename
+    wb.save(path)
+    return path
+
+
+@app.get("/download-template/rubric")
+def download_rubric_template():
+    path = save_template_workbook("rubric")
+    return FileResponse(
+        path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=path.name
+    )
+
+
+@app.get("/download-template/responses")
+def download_response_template():
+    path = save_template_workbook("responses")
+    return FileResponse(
+        path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=path.name
+    )
+
+
+@app.post("/preview")
+async def preview_upload(
+    file: UploadFile = File(...),
+    rubric_selector: str = Form(""),
+    rubric_file: Optional[UploadFile] = File(None)
+):
+    try:
+        if rubric_file is not None and rubric_file.filename:
+            selected_rubric = await load_uploaded_rubric(rubric_file)
+        else:
+            selected_rubric = load_selected_rubric(rubric_selector)
+
+        temp_input_path = OUTPUT_DIR / f"preview_{file.filename}"
+        with open(temp_input_path, "wb") as f:
+            f.write(await file.read())
+
+        df = pd.read_excel(temp_input_path)
+        questions = selected_rubric.get("questions", [])
+        missing = validate_columns_flexible(df, selected_rubric)
+
+        detected = []
+        for q in questions:
+            pid = q.get("id", "")
+            col = find_item_column(df, pid)
+            detected.append({
+                "pregunta": pid,
+                "tipo": q.get("item_type", ""),
+                "columna_detectada": col or "NO DETECTADA"
+            })
+
+        type_counts = {}
+        for q in questions:
+            t = q.get("item_type", "sin_tipo")
+            type_counts[t] = type_counts.get(t, 0) + 1
+
+        return JSONResponse({
+            "ok": len(missing) == 0,
+            "rubric": selected_rubric.get("_rubric_display_name", selected_rubric.get("name", "Rúbrica")),
+            "students": int(len(df)),
+            "questions": int(len(questions)),
+            "columns": [str(c) for c in df.columns],
+            "types": type_counts,
+            "detected": detected,
+            "missing": missing
+        })
+
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -911,30 +1090,38 @@ def home():
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Evalia · Inteligencia Evaluativa Automatizada</title>
+      <title>Evalia by Altiora · Inteligencia Evaluativa Automatizada</title>
       {base_css()}
     </head>
     <body>
       <div class="page">
         <main class="shell">
-          <div class="topbar">
-            <div class="brand">
-              <div class="logo">E</div>
-              <div>
-                <div class="brand-title">Evalia</div>
-                <div class="brand-subtitle">Inteligencia Evaluativa Automatizada</div>
-              </div>
-            </div>
-            <div class="badge">CRB Engine · v2.3 docente</div>
-          </div>
+          {shell_topbar()}
 
           <section class="hero">
             <div class="hero-inner">
               <h1>Evalúa respuestas. Detecta patrones. Mejora evaluaciones.</h1>
               <p class="lead">
                 Evalia permite usar rúbricas predefinidas o subir una rúbrica simple en Excel.
-                Acepta columnas P1, Q1, pregunta1 o item1 para acercarse al uso real docente.
+                Descarga los modelos, completa tus datos y sube ambos archivos para generar un reporte docente explicable.
               </p>
+
+              <div class="templates">
+                <div class="template-card">
+                  <div>
+                    <strong>Modelo de rúbrica</strong>
+                    <span>Columnas: pregunta, tipo, max_score, respuestas, criterios.</span>
+                  </div>
+                  <a class="button outline" href="/download-template/rubric">Descargar</a>
+                </div>
+                <div class="template-card">
+                  <div>
+                    <strong>Modelo de respuestas</strong>
+                    <span>Columnas: student_id, nombre y P1/P2/P3...</span>
+                  </div>
+                  <a class="button outline" href="/download-template/responses">Descargar</a>
+                </div>
+              </div>
 
               <form action="/upload" enctype="multipart/form-data" method="post" id="uploadForm">
                 <div class="panel">
@@ -963,25 +1150,30 @@ def home():
                   </div>
 
                   <div class="actions">
+                    <button type="button" class="secondary" id="previewBtn">Previsualizar</button>
                     <button type="submit" id="submitBtn">Evaluar respuestas</button>
                     <span class="hint">Si subes rúbrica propia, Evalia la usará por sobre la predefinida.</span>
                   </div>
 
+                  <div class="preview-box" id="previewBox"></div>
+
                   <div class="loader" id="loader">
-                    <div class="spinner"></div>
-                    <span>Analizando respuestas · aplicando rúbrica · generando insights...</span>
+                    <div class="progress-container"><div class="progress-bar" id="progressBar"></div></div>
+                    <div class="progress-status" id="progressStatus">Preparando análisis...</div>
                   </div>
                 </div>
               </form>
             </div>
 
             <div class="features">
-              <div class="feature"><strong>Rúbrica Excel</strong>Pensada para profesores.</div>
-              <div class="feature"><strong>Formato flexible</strong>P1, Q1, pregunta1 o item1.</div>
-              <div class="feature"><strong>Detección de patrones</strong>Identifica ítems críticos.</div>
-              <div class="feature"><strong>Reporte explicable</strong>Scores, confianza, feedback e insights.</div>
+              <div class="feature"><strong>Modelos descargables</strong>Rúbrica y respuestas listas para completar.</div>
+              <div class="feature"><strong>Preview inteligente</strong>Detecta estudiantes, preguntas y columnas.</div>
+              <div class="feature"><strong>Progreso visual</strong>Muestra etapas del procesamiento.</div>
+              <div class="feature"><strong>Evalia by Altiora</strong>Reporte explicable para uso docente.</div>
             </div>
           </section>
+
+          {footer_altiora()}
         </main>
       </div>
 
@@ -1004,10 +1196,78 @@ def home():
         const form = document.getElementById("uploadForm");
         const loader = document.getElementById("loader");
         const submitBtn = document.getElementById("submitBtn");
+        const previewBtn = document.getElementById("previewBtn");
+        const previewBox = document.getElementById("previewBox");
+
+        const steps = [
+          [18, "Leyendo Excel..."],
+          [38, "Detectando preguntas y columnas..."],
+          [62, "Evaluando respuestas..."],
+          [82, "Generando insights..."],
+          [100, "Construyendo reporte docente..."]
+        ];
+        let idx = 0;
+
+        function simulateProgress() {{
+          if (idx >= steps.length) return;
+          const [pct, txt] = steps[idx];
+          const bar = document.getElementById("progressBar");
+          const status = document.getElementById("progressStatus");
+          if (bar) bar.style.width = pct + "%";
+          if (status) status.innerText = txt;
+          idx++;
+          setTimeout(simulateProgress, 700);
+        }}
+
+        if (previewBtn) {{
+          previewBtn.addEventListener("click", async () => {{
+            const fileInput = document.getElementById("fileInput");
+            if (!fileInput.files.length) {{
+              previewBox.style.display = "block";
+              previewBox.innerHTML = '<span class="preview-warn">Primero sube el archivo de respuestas.</span>';
+              return;
+            }}
+
+            const data = new FormData(form);
+            previewBtn.disabled = true;
+            previewBtn.textContent = "Previsualizando...";
+
+            try {{
+              const res = await fetch("/preview", {{ method: "POST", body: data }});
+              const json = await res.json();
+
+              previewBox.style.display = "block";
+
+              if (!json.ok) {{
+                const msg = json.error ? json.error : ("Faltan columnas: " + (json.missing || []).join(", "));
+                previewBox.innerHTML = '<div class="preview-title">Vista previa con observaciones</div><span class="preview-warn">' + msg + '</span>';
+              }} else {{
+                const types = Object.entries(json.types || {{}}).map(([k,v]) => k + ": " + v).join(" · ");
+                const detected = (json.detected || []).map(x => x.pregunta + " → " + x.columna_detectada).join(" · ");
+                previewBox.innerHTML =
+                  '<div class="preview-title">Vista previa detectada</div>' +
+                  '<span class="preview-ok">Formato compatible.</span><br>' +
+                  '<strong>Rúbrica:</strong> ' + json.rubric + '<br>' +
+                  '<strong>Estudiantes:</strong> ' + json.students + '<br>' +
+                  '<strong>Preguntas:</strong> ' + json.questions + '<br>' +
+                  '<strong>Tipos:</strong> ' + types + '<br>' +
+                  '<strong>Columnas detectadas:</strong> ' + detected;
+              }}
+            }} catch (err) {{
+              previewBox.style.display = "block";
+              previewBox.innerHTML = '<span class="preview-warn">No fue posible generar la vista previa.</span>';
+            }}
+
+            previewBtn.disabled = false;
+            previewBtn.textContent = "Previsualizar";
+          }});
+        }}
 
         if (form) {{
           form.addEventListener("submit", () => {{
-            if (loader) loader.style.display = "flex";
+            if (loader) loader.style.display = "block";
+            idx = 0;
+            simulateProgress();
             if (submitBtn) {{
               submitBtn.disabled = true;
               submitBtn.textContent = "Procesando...";
@@ -1036,10 +1296,10 @@ async def upload(
         return HTMLResponse(
             f"""
             <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Error · Evalia</title>{base_css()}</head>
-            <body><div class="page"><main class="shell"><div class="result-card">
+            <body><div class="page"><main class="shell">{shell_topbar("Error de carga", "v2.4 docente")}<div class="result-card">
               <div class="error"><strong>Error al cargar la rúbrica.</strong><br>{escape(str(e))}</div>
               <br><a class="button" href="/">Volver</a>
-            </div></main></div></body></html>
+            </div>{footer_altiora()}</main></div></body></html>
             """
         )
 
@@ -1053,10 +1313,10 @@ async def upload(
         return HTMLResponse(
             f"""
             <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Error · Evalia</title>{base_css()}</head>
-            <body><div class="page"><main class="shell"><div class="result-card">
+            <body><div class="page"><main class="shell">{shell_topbar("Error de lectura", "v2.4 docente")}<div class="result-card">
               <div class="error"><strong>No se pudo leer el Excel.</strong><br>{escape(str(e))}</div>
               <br><a class="button" href="/">Volver</a>
-            </div></main></div></body></html>
+            </div>{footer_altiora()}</main></div></body></html>
             """
         )
 
@@ -1066,12 +1326,12 @@ async def upload(
         return HTMLResponse(
             f"""
             <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Error de formato · Evalia</title>{base_css()}</head>
-            <body><div class="page"><main class="shell"><div class="result-card">
+            <body><div class="page"><main class="shell">{shell_topbar("Error de formato", "v2.4 docente")}<div class="result-card">
               <h1>Error de formato</h1>
               <div class="error"><strong>Faltan columnas requeridas o equivalentes:</strong><br>{escape(", ".join(missing))}</div>
               <p class="lead">Evalia acepta equivalencias como <code>P1/Q1/pregunta1/item1</code>, pero no encontró columnas suficientes.</p>
               <a class="button" href="/">Volver</a>
-            </div></main></div></body></html>
+            </div>{footer_altiora()}</main></div></body></html>
             """
         )
 
@@ -1191,6 +1451,13 @@ async def upload(
         review_rate=review_rate
     )
 
+    # Se agrega una fila de identidad de producto al reporte docente.
+    teacher_report_rows.insert(0, {
+        "seccion": "Producto",
+        "indicador": "Sistema",
+        "valor": "Evalia by Altiora · Inteligencia Evaluativa Automatizada"
+    })
+
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         pd.DataFrame(teacher_report_rows).to_excel(writer, sheet_name="REPORTE_DOCENTE", index=False)
         pd.DataFrame(score_rows).to_excel(writer, sheet_name="Puntajes", index=False)
@@ -1213,10 +1480,7 @@ async def upload(
         f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultados · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          <div class="topbar">
-            <div class="brand"><div class="logo">E</div><div><div class="brand-title">Evalia</div><div class="brand-subtitle">Reporte generado</div></div></div>
-            <div class="badge">CRB Engine · v2.3 docente</div>
-          </div>
+          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v2.4 docente")}
           <section class="result-card">
             <h1>Procesamiento completado</h1>
             <p class="lead">Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong> y generó un reporte Excel explicable.</p>
@@ -1229,9 +1493,10 @@ async def upload(
             <p class="lead"><strong>Insight inicial:</strong> {escape(problematic_display)}</p>
             <div class="actions">
               <a class="button" href="/download/{output_name}">Descargar reporte Excel</a>
-              <a class="button" style="background:#475467;" href="/">Evaluar otro archivo</a>
+              <a class="button secondary" href="/">Evaluar otro archivo</a>
             </div>
           </section>
+          {footer_altiora()}
         </main></div></body></html>
         """
     )
