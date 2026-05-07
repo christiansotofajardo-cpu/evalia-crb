@@ -21,7 +21,7 @@ RUBRICS_DIR.mkdir(exist_ok=True)
 
 LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
-app = FastAPI(title="Evalia CRB", version="2.4.1")
+app = FastAPI(title="Evalia CRB", version="2.4.2")
 
 
 # ============================================================
@@ -221,7 +221,7 @@ def load_selected_rubric(selected_filename=None):
     if selected_filename:
         path = safe_rubric_path(selected_filename)
         if path is None:
-            raise FileNotFoundError("La rúbrica seleccionada no existe o no está permitida.")
+            raise FileNotFoundError("El Modelo de Rúbrica no existe o no está permitido.")
     else:
         path = available[0]["path"]
 
@@ -932,7 +932,7 @@ def base_css():
     """
 
 
-def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v2.4.1 foco docente"):
+def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v2.4.2 limpio"):
     return f"""
     <div class="topbar">
       <div class="brand">
@@ -1054,7 +1054,7 @@ async def preview_upload(
         if rubric_file is not None and rubric_file.filename:
             selected_rubric = await load_uploaded_rubric(rubric_file)
         else:
-            selected_rubric = load_selected_rubric(rubric_selector)
+            raise ValueError("Debes subir el Modelo de Rúbrica para previsualizar.")
 
         temp_input_path = OUTPUT_DIR / f"preview_{file.filename}"
         with open(temp_input_path, "wb") as f:
@@ -1096,16 +1096,6 @@ async def preview_upload(
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    rubrics = get_available_rubrics()
-
-    if rubrics:
-        rubric_options = "\n".join(
-            f'<option value="{escape(r["filename"])}">{escape(r["name"])} · {escape(r["filename"])}</option>'
-            for r in rubrics
-        )
-    else:
-        rubric_options = '<option value="">Sin rúbricas predefinidas</option>'
-
     html = f"""
     <!DOCTYPE html>
     <html lang="es">
@@ -1124,8 +1114,8 @@ def home():
             <div class="hero-inner">
               <h1>Evalúa respuestas. Detecta patrones. Mejora evaluaciones.</h1>
               <p class="lead">
-                Evalia trabaja con dos modelos oficiales: Modelo de Rúbrica y Modelo de Respuestas.
-                Descárgalos, complétalos y sube ambos archivos para generar un reporte docente explicable.
+                Evalia trabaja de forma simple: descarga el Modelo de Rúbrica y el Modelo de Respuestas,
+                complétalos y sube ambos archivos para generar un reporte docente explicable.
               </p>
 
               <div class="templates">
@@ -1148,21 +1138,16 @@ def home():
               <form action="/upload" enctype="multipart/form-data" method="post" id="uploadForm">
                 <div class="panel">
 
-                  <label class="field-label" for="rubric_selector">Rúbrica predefinida de prueba</label>
-                  <select name="rubric_selector" id="rubric_selector">
-                    {rubric_options}
-                  </select>
-
-                  <label class="field-label">Sube tu Modelo de Rúbrica completo</label>
+                  <label class="field-label">1. Sube tu Modelo de Rúbrica completo</label>
                   <div class="dropzone">
-                    <input name="rubric_file" id="rubricFileInput" type="file" accept=".xlsx,.xls,.json">
+                    <input name="rubric_file" id="rubricFileInput" type="file" accept=".xlsx,.xls,.json" required>
                     <div class="drop-icon">🧩</div>
                     <div class="drop-title">Sube el Modelo de Rúbrica</div>
                     <div class="drop-subtitle">Debe seguir el formato oficial descargable</div>
                     <div class="file-name" id="rubricFileName"></div>
                   </div>
 
-                  <label class="field-label">Sube tu Modelo de Respuestas completo</label>
+                  <label class="field-label">2. Sube tu Modelo de Respuestas completo</label>
                   <div class="dropzone">
                     <input name="file" id="fileInput" type="file" accept=".xlsx,.xls" required>
                     <div class="drop-icon">📄</div>
@@ -1174,7 +1159,7 @@ def home():
                   <div class="actions">
                     <button type="button" class="secondary" id="previewBtn">Previsualizar</button>
                     <button type="submit" id="submitBtn">Evaluar respuestas</button>
-                    <span class="hint">Usa preferentemente los modelos oficiales descargables para evitar errores de formato.</span>
+                    <span class="hint">Evalia usará exactamente los dos modelos que subas: rúbrica y respuestas.</span>
                   </div>
 
                   <div class="preview-box" id="previewBox"></div>
@@ -1313,13 +1298,13 @@ async def upload(
         if rubric_file is not None and rubric_file.filename:
             selected_rubric = await load_uploaded_rubric(rubric_file)
         else:
-            selected_rubric = load_selected_rubric(rubric_selector)
+            raise ValueError("Debes subir el Modelo de Rúbrica para previsualizar.")
     except Exception as e:
         return HTMLResponse(
             f"""
             <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Error · Evalia</title>{base_css()}</head>
             <body><div class="page"><main class="shell">{shell_topbar("Error de carga", "v2.4 docente")}<div class="result-card">
-              <div class="error"><strong>Error al cargar la rúbrica.</strong><br>{escape(str(e))}</div>
+              <div class="error"><strong>Error al cargar el Modelo de Rúbrica.</strong><br>{escape(str(e))}</div>
               <br><a class="button" href="/">Volver</a>
             </div>{footer_altiora()}</main></div></body></html>
             """
@@ -1502,7 +1487,7 @@ async def upload(
         f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultados · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v2.4.1 foco docente")}
+          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v2.4.2 limpio")}
           <section class="result-card">
             <h1>Procesamiento completado</h1>
             <p class="lead">Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong> y generó un reporte Excel explicable.</p>
