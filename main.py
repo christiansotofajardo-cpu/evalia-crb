@@ -1105,6 +1105,20 @@ def score_answer(answer, question):
     return score, conf, fb, status
 
 
+def performance_level(pct):
+    """Clasificación docente simple del porcentaje total o por ítem."""
+    try:
+        pct = float(pct)
+    except Exception:
+        return "Sin información"
+    if pct >= 80:
+        return "Alto"
+    if pct >= 60:
+        return "Medio"
+    return "Bajo"
+
+
+
 # ============================================================
 # VALIDACIÓN FLEXIBLE
 # ============================================================
@@ -1136,6 +1150,28 @@ def validate_columns_flexible(df, rubric):
 # ============================================================
 # INSIGHTS
 # ============================================================
+
+
+def pedagogical_item_suggestion(classification, review_pct, avg_score_pct, avg_confidence):
+    """Sugerencia docente simple y explicable por ítem."""
+    classification = str(classification or "").lower()
+    try:
+        review_pct = float(review_pct)
+        avg_score_pct = float(avg_score_pct)
+        avg_confidence = float(avg_confidence)
+    except Exception:
+        return "Revisar manualmente una muestra de respuestas para confirmar el funcionamiento del ítem."
+
+    if "revisión" in classification or "revision" in classification or "problem" in classification:
+        return "Revisar el enunciado, la rúbrica o los criterios de corrección; varios estudiantes podrían haber interpretado la pregunta de manera distinta a lo esperado."
+    if review_pct >= 30:
+        return "Conviene revisar manualmente una muestra de respuestas antes de cerrar la calificación."
+    if avg_score_pct < 60:
+        return "La pregunta parece difícil para el grupo; puede requerir retroalimentación o refuerzo de contenidos."
+    if avg_confidence < 0.70:
+        return "La respuesta esperada podría necesitar criterios más explícitos o ejemplos adicionales."
+    return "El ítem muestra funcionamiento estable bajo los criterios actuales de Evalia."
+
 
 def build_question_insights(question_stats, questions):
     question_map = {q.get("id"): q for q in questions}
