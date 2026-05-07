@@ -21,7 +21,7 @@ RUBRICS_DIR.mkdir(exist_ok=True)
 
 LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
-app = FastAPI(title="Evalia CRB", version="2.8")
+app = FastAPI(title="Evalia CRB", version="2.8.2")
 
 
 # ============================================================
@@ -876,83 +876,6 @@ def score_true_false(answer, question):
     return 0, 0.9 if a else 0.2, "Respuesta cerrada incorrecta o vacía."
 
 
-
-def conceptual_response_profile(answer, concepts, matched, contradictions, relation_hits=None):
-    """
-    Clasifica la respuesta abierta de forma pedagógica:
-    - vacía
-    - error conceptual
-    - muy superficial
-    - parcial
-    - adecuada
-    - elaborada
-
-    Esto permite separar pobreza/desarrollo limitado de error conceptual real.
-    """
-    relation_hits = relation_hits or []
-    answer_n = normalize_text(answer)
-    tokens = semantic_tokens(answer_n)
-    concept_count = len(concepts) or 1
-    matched_count = len(set([m for m in matched if m]))
-    coverage = matched_count / concept_count
-
-    if not answer_n:
-        return "vacía", "Respuesta vacía o sin contenido evaluable.", 0.10
-
-    if contradictions:
-        return "error conceptual", "La respuesta contiene una posible contradicción conceptual que conviene revisar.", 0.45
-
-    if matched_count == 0:
-        # Si no detecta conceptos, revisar sólo si además es muy breve o sin relación evidente.
-        if len(tokens) <= 4:
-            return "muy débil", "Respuesta muy breve y con baja evidencia conceptual.", 0.35
-        return "baja evidencia", "La respuesta desarrolla algo, pero no coincide claramente con las ideas esperadas.", 0.45
-
-    if coverage < 0.35:
-        if len(tokens) <= 5:
-            return "muy superficial", "La respuesta contiene una idea relacionada, pero está poco desarrollada.", 0.50
-        return "parcial inicial", "La respuesta menciona ideas relacionadas, pero todavía cubre pocos criterios.", 0.56
-
-    if coverage < 0.65:
-        if relation_hits or len(tokens) >= 10:
-            return "parcial", "La respuesta es parcialmente correcta y muestra cierta elaboración.", 0.66
-        return "parcial breve", "La respuesta es parcialmente correcta, aunque requiere mayor desarrollo.", 0.60
-
-    if coverage < 0.90:
-        if relation_hits:
-            return "adecuada", "La respuesta cubre varias ideas esperadas y establece relaciones conceptuales.", 0.78
-        return "adecuada breve", "La respuesta cubre varias ideas esperadas, aunque podría desarrollar más relaciones.", 0.74
-
-    if relation_hits or len(tokens) >= 14:
-        return "elaborada", "La respuesta integra las ideas principales con buen nivel de elaboración.", 0.88
-
-    return "adecuada", "La respuesta cubre las ideas principales.", 0.82
-
-
-def humanize_status(status):
-    mapping = {
-        "aceptado": "Alta confianza",
-        "aceptado_con_cautela": "Parcial/intermedia",
-        "revisar": "Revisión sugerida"
-    }
-    return mapping.get(status, status)
-
-
-def human_feedback_sentence(profile, score, max_score):
-    pct = (float(score) / float(max_score)) * 100 if max_score else 0
-    if profile in ["elaborada", "adecuada"]:
-        return "Lectura docente: respuesta suficientemente consistente."
-    if profile.startswith("parcial"):
-        return "Lectura docente: respuesta parcialmente lograda; conviene retroalimentar lo que falta."
-    if profile in ["muy superficial", "muy débil", "baja evidencia"]:
-        return "Lectura docente: respuesta limitada; puede requerir revisión o retroalimentación."
-    if profile == "error conceptual":
-        return "Lectura docente: posible error conceptual; se recomienda revisión humana."
-    if pct >= 70:
-        return "Lectura docente: desempeño aceptable bajo los criterios actuales."
-    return "Lectura docente: desempeño bajo o incompleto."
-
-
 def score_criteria(answer, question):
     criteria = question.get("criteria", [])
     if not criteria:
@@ -974,8 +897,8 @@ def score_criteria(answer, question):
         base_weight = float(criterion.get("weight", 1.0))
         auto_weight = weight_map.get(concept)
         if auto_weight is not None and len(criteria) > 1:
-            max_score_for_weight = float(question.get("max_score", 1.0))
-            weight = max_score_for_weight * auto_weight
+            max_score = float(question.get("max_score", 1.0))
+            weight = max_score * auto_weight
         else:
             weight = base_weight
 
@@ -994,7 +917,7 @@ def score_criteria(answer, question):
         criterion_hit = False
 
         for v in variants:
-            ok, score, method = semantic_match(answer, v, threshold=66, semantic_threshold=55)
+            ok, score, method = semantic_match(answer, v, threshold=68, semantic_threshold=58)
             if score > criterion_best:
                 criterion_best = score
                 criterion_method = method
@@ -1015,7 +938,7 @@ def score_criteria(answer, question):
             method_notes.append(f"{concept}: {criterion_method} ({criterion_best}/100)")
         else:
             missing.append(concept)
-            if criterion_best >= 38:
+            if criterion_best >= 40:
                 method_notes.append(f"{concept}: aproximación insuficiente ({criterion_best}/100)")
 
     max_score = float(question.get("max_score", total))
@@ -1025,43 +948,25 @@ def score_criteria(answer, question):
         total += max_score * rel_bonus
         method_notes.append("Relaciones detectadas: " + ", ".join(rel_hits))
 
-    profile, profile_msg, profile_conf_floor = conceptual_response_profile(
-        answer=answer,
-        concepts=concepts,
-        matched=matched,
-        contradictions=contradictions,
-        relation_hits=rel_hits
-    )
-
     if contradictions:
-        # Penalización gradual y contextual: castiga error conceptual, pero no borra todo lo correcto.
-        contradiction_penalty = min(0.24, 0.10 + 0.05 * (len(contradictions) - 1))
+        # Penalización gradual y conservadora: evita sobrecastigar respuestas parcialmente buenas.
+        contradiction_penalty = min(0.30, 0.12 + 0.06 * (len(contradictions) - 1))
         total *= (1 - contradiction_penalty)
         method_notes.append("Alerta: posible contradicción conceptual: " + "; ".join(contradictions[:4]))
 
-    # Si la respuesta es breve pero contiene una idea válida, evitar castigarla como error.
-    if profile in ["muy superficial", "parcial inicial"] and matched:
-        total = max(total, max_score * 0.25)
-
     total = min(total, max_score)
-
     confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
 
-    # Ajuste de confianza pedagógica: separa "respuesta pobre" de "respuesta equivocada".
     if contradictions:
-        confidence = min(confidence, 0.58)
-    else:
-        confidence = max(confidence, profile_conf_floor if matched else min(profile_conf_floor, 0.45))
+        confidence = min(confidence, 0.62)
 
     feedback = []
     if matched:
-        feedback.append("Ideas detectadas: " + "; ".join([m for m in matched if m]))
+        feedback.append("Criterios detectados: " + "; ".join([m for m in matched if m]))
     if missing:
-        feedback.append("Ideas no detectadas o poco desarrolladas: " + "; ".join([m for m in missing if m]))
-    feedback.append("Lectura conceptual: " + profile_msg)
+        feedback.append("Criterios no detectados o débiles: " + "; ".join([m for m in missing if m]))
     if method_notes:
         feedback.append("Evidencia semántica: " + "; ".join(method_notes[:10]))
-    feedback.append(human_feedback_sentence(profile, total, max_score))
 
     return round(total, 2), round(confidence, 2), " | ".join(feedback)
 
@@ -1160,28 +1065,9 @@ def score_answer(answer, question):
     else:
         score, conf, fb = score_criteria(answer, question)
 
-    # Tres estados pedagógicos:
-    # - Alta confianza: el sistema puede aceptar automáticamente.
-    # - Parcial/intermedia: hay evidencia suficiente, pero no plena.
-    # - Revisión sugerida: vacío, contradicción clara o evidencia muy baja.
-    max_score = float(question.get("max_score", 1.0)) or 1.0
-    pct_score = float(score) / max_score if max_score else 0.0
-    fb_n = normalize_text(fb)
-
-    has_contradiction = "contradiccion conceptual" in fb_n or "contradicción conceptual" in fb_n
-    is_empty = "respuesta vacia" in fb_n or "respuesta vacía" in fb_n
-
-    if is_empty:
-        status = "revisar"
-    elif has_contradiction and conf < 0.60:
-        status = "revisar"
-    elif conf >= 0.78 or pct_score >= 0.78:
-        status = "aceptado"
-    elif conf >= 0.36 or pct_score >= 0.22:
-        status = "aceptado_con_cautela"
-    else:
-        status = "revisar"
-
+    # Con la capa semántica, una confianza media-alta puede quedar aceptada con cautela
+    # y sólo las respuestas realmente débiles quedan para revisión manual.
+    status = "aceptado" if conf >= 0.80 else ("revisar" if conf < 0.45 else "aceptado_con_cautela")
     return score, conf, fb, status
 
 
@@ -1199,18 +1085,263 @@ def performance_level(pct):
 
 def pedagogical_item_suggestion(classification, review_pct, avg_score_pct, avg_confidence):
     classification = str(classification or "")
-    if "revisión" in classification or "problemático" in classification:
-        return "Revise una muestra de respuestas: puede haber ambigüedad en el enunciado, criterios poco explícitos o errores conceptuales frecuentes."
-    if review_pct >= 25:
-        return "Conviene revisar manualmente algunas respuestas antes de cerrar la calificación, especialmente las de baja confianza."
-    if avg_score_pct < 50:
+    if "problemático" in classification:
+        return "Revisar el enunciado, la rúbrica o los criterios de corrección; varios estudiantes podrían haber interpretado la pregunta de manera distinta a lo esperado."
+    if review_pct >= 30:
+        return "Conviene revisar manualmente una muestra de respuestas antes de cerrar la calificación."
+    if avg_score_pct < 60:
         return "La pregunta parece difícil para el grupo; puede requerir retroalimentación o refuerzo de contenidos."
-    if avg_confidence < 0.62:
-        return "Las respuestas muestran variación; puede ser útil aclarar mejor las ideas esperadas."
-    if avg_score_pct >= 80 and review_pct < 15:
-        return "El ítem muestra buen funcionamiento: las respuestas son consistentes con los criterios esperados."
-    return "El ítem muestra funcionamiento adecuado; puede usarse como apoyo para retroalimentación docente."
+    if avg_confidence < 0.70:
+        return "La respuesta esperada podría necesitar criterios más explícitos o ejemplos adicionales."
+    return "El ítem muestra funcionamiento estable bajo los criterios actuales de Evalia."
 
+
+# ============================================================
+# VALIDACIÓN FLEXIBLE
+# ============================================================
+
+def validate_columns_flexible(df, rubric):
+    """
+    Valida con flexibilidad:
+    - student_id puede ser id, alumno_id, rut, codigo...
+    - nombre puede ser name, estudiante, alumno...
+    - P1 puede calzar con Q1, pregunta1, item1...
+    """
+    missing = []
+
+    if not find_column(df, "student_id", ["id", "alumno_id", "estudiante_id", "rut", "codigo", "código"]):
+        missing.append("student_id/id")
+
+    if not find_column(df, "nombre", ["name", "student_name", "alumno", "estudiante", "nombre_estudiante"]):
+        missing.append("nombre/name")
+
+    for q in rubric.get("questions", []):
+        pid = q.get("id")
+        if not find_item_column(df, pid):
+            aliases = sorted(item_aliases(pid))
+            missing.append(f"{pid} ({' / '.join(list(aliases)[:5])}...)")
+
+    return missing
+
+
+# ============================================================
+# INSIGHTS
+# ============================================================
+
+def build_question_insights(question_stats, questions):
+    question_map = {q.get("id"): q for q in questions}
+    insights_rows = []
+    problematic_questions = []
+
+    for pid, stats in question_stats.items():
+        total = stats["total"] or 1
+        max_score = float(question_map.get(pid, {}).get("max_score", 1)) or 1
+
+        avg_score_raw = sum(stats["scores"]) / total if stats["scores"] else 0
+        avg_score_pct = (avg_score_raw / max_score) * 100 if max_score else 0
+        avg_confidence = sum(stats["confidences"]) / total if stats["confidences"] else 0
+
+        accepted_pct = (stats["accepted"] / total) * 100
+        caution_pct = (stats["caution"] / total) * 100
+        review_pct = (stats["review"] / total) * 100
+
+        if avg_score_pct >= 80 and review_pct < 20:
+            classification = "funcionamiento alto"
+        elif review_pct >= 35 or accepted_pct <= 50 or avg_confidence < 0.60:
+            classification = "requiere revisión docente"
+            problematic_questions.append(pid)
+        elif caution_pct >= 30:
+            classification = "funcionamiento parcial/intermedio"
+        else:
+            classification = "funcionamiento adecuado"
+
+        insights_rows.append({
+            "pregunta": pid,
+            "tipo_item": display_item_type(question_map.get(pid, {}).get("item_type", "")),
+            "puntaje_maximo": max_score,
+            "promedio_puntaje": round(avg_score_raw, 2),
+            "promedio_porcentaje": round(avg_score_pct, 1),
+            "nivel_item": performance_level(avg_score_pct),
+            "confianza_promedio": round(avg_confidence, 2),
+            "aceptacion_pct": round(accepted_pct, 1),
+            "cautela_pct": round(caution_pct, 1),
+            "revision_pct": round(review_pct, 1),
+            "clasificacion_evalia": classification,
+            "sugerencia_docente": pedagogical_item_suggestion(classification, review_pct, avg_score_pct, avg_confidence)
+        })
+
+    return insights_rows, problematic_questions
+
+
+def build_type_insights(insights_rows):
+    if not insights_rows:
+        return []
+
+    df = pd.DataFrame(insights_rows)
+    grouped = (
+        df.groupby("tipo_item", dropna=False)
+        .agg(
+            preguntas=("pregunta", "count"),
+            promedio_porcentaje=("promedio_porcentaje", "mean"),
+            confianza_promedio=("confianza_promedio", "mean"),
+            revision_pct=("revision_pct", "mean"),
+            aceptacion_pct=("aceptacion_pct", "mean")
+        )
+        .reset_index()
+    )
+
+    rows = []
+    for _, row in grouped.iterrows():
+        rows.append({
+            "tipo_item": row["tipo_item"] if row["tipo_item"] else "sin_tipo",
+            "numero_preguntas": int(row["preguntas"]),
+            "promedio_porcentaje": round(float(row["promedio_porcentaje"]), 1),
+            "confianza_promedio": round(float(row["confianza_promedio"]), 2),
+            "revision_promedio_pct": round(float(row["revision_pct"]), 1),
+            "aceptacion_promedio_pct": round(float(row["aceptacion_pct"]), 1)
+        })
+    return rows
+
+
+def build_interpretation(insights_rows, problematic_questions, total_students, rubric_name):
+    if not insights_rows:
+        return "No fue posible generar interpretación porque no se registraron métricas por pregunta."
+
+    df = pd.DataFrame(insights_rows)
+    avg_eval = float(df["promedio_porcentaje"].mean()) if "promedio_porcentaje" in df else 0
+    avg_review = float(df["revision_pct"].mean()) if "revision_pct" in df else 0
+    avg_conf = float(df["confianza_promedio"].mean()) if "confianza_promedio" in df else 0
+
+    if avg_eval >= 80:
+        level = "alto"
+    elif avg_eval >= 60:
+        level = "medio"
+    else:
+        level = "bajo"
+
+    if problematic_questions:
+        problem_text = (
+            "Se identifican posibles focos de revisión en las preguntas "
+            + ", ".join(problematic_questions)
+            + ", debido a baja aceptación, baja confianza o alta proporción de respuestas marcadas para revisión."
+        )
+    else:
+        problem_text = "No se detectan preguntas críticamente problemáticas bajo los criterios actuales de Evalia."
+
+    return (
+        f"La evaluación procesada con la rúbrica '{rubric_name}' incluyó {total_students} estudiante(s). "
+        f"El desempeño global estimado por pregunta se ubica en un nivel {level}, "
+        f"con un promedio general de {avg_eval:.1f}% del puntaje esperado. "
+        f"La confianza promedio del sistema fue {avg_conf:.2f} y la tasa promedio de revisión manual fue {avg_review:.1f}%. "
+        f"{problem_text} "
+        "Estos resultados constituyen una primera capa de inteligencia evaluativa: permiten orientar la revisión docente, "
+        "detectar ítems que podrían requerir ajuste y mejorar progresivamente la calidad de la evaluación."
+    )
+
+
+
+# ============================================================
+# REPORTE EXCEL PREMIUM / DOCENTE
+# ============================================================
+
+def build_teacher_report_rows(score_rows, insights_rows, interpretation, problematic_questions, rubric_name, total_students, total_questions, auto_rate, caution_rate, review_rate):
+    avg_pct = 0.0
+    if score_rows:
+        vals = [float(r.get("porcentaje", 0) or 0) for r in score_rows]
+        avg_pct = sum(vals) / len(vals)
+
+    if insights_rows:
+        sorted_items = sorted(insights_rows, key=lambda x: float(x.get("promedio_porcentaje", 0) or 0))
+        hardest = ", ".join([str(x.get("pregunta")) for x in sorted_items[:3]])
+        best = ", ".join([str(x.get("pregunta")) for x in sorted_items[-3:][::-1]])
+    else:
+        hardest = "Sin información"
+        best = "Sin información"
+
+    return [
+        {"seccion": "Síntesis", "indicador": "Rúbrica aplicada", "valor": rubric_name},
+        {"seccion": "Síntesis", "indicador": "Estudiantes procesados", "valor": total_students},
+        {"seccion": "Síntesis", "indicador": "Preguntas evaluadas", "valor": total_questions},
+        {"seccion": "Resultados", "indicador": "Promedio general estimado", "valor": f"{avg_pct:.1f}%"},
+        {"seccion": "Resultados", "indicador": "Nivel global", "valor": performance_level(avg_pct)},
+        {"seccion": "Trazabilidad", "indicador": "Aceptación automática", "valor": f"{auto_rate}%"},
+        {"seccion": "Trazabilidad", "indicador": "Aceptado con cautela", "valor": f"{caution_rate}%"},
+        {"seccion": "Trazabilidad", "indicador": "Requiere revisión manual", "valor": f"{review_rate}%"},
+        {"seccion": "Ítems", "indicador": "Preguntas con mayor dificultad", "valor": hardest},
+        {"seccion": "Ítems", "indicador": "Preguntas con mejor funcionamiento", "valor": best},
+        {"seccion": "Ítems", "indicador": "Preguntas potencialmente problemáticas", "valor": ", ".join(problematic_questions) if problematic_questions else "Sin preguntas críticas"},
+        {"seccion": "Interpretación", "indicador": "Lectura automática", "valor": interpretation},
+        {"seccion": "Sugerencia", "indicador": "Uso docente recomendado", "valor": "Usar este reporte como primera capa de revisión: confirmar manualmente los casos marcados como revisar y ajustar preguntas o criterios si un ítem aparece como problemático."},
+    ]
+
+
+def format_workbook(writer):
+    wb = writer.book
+    header_fill = PatternFill("solid", fgColor="111827")
+    header_font = Font(color="FFFFFF", bold=True)
+    soft_fill = PatternFill("solid", fgColor="F3F4F6")
+    green_fill = PatternFill("solid", fgColor="DCFCE7")
+    yellow_fill = PatternFill("solid", fgColor="FEF9C3")
+    red_fill = PatternFill("solid", fgColor="FEE2E2")
+    line = Side(style="thin", color="E5E7EB")
+    border = Border(left=line, right=line, top=line, bottom=line)
+
+    for ws in wb.worksheets:
+        ws.freeze_panes = "A2"
+        ws.sheet_view.showGridLines = False
+
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = border
+
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                cell.border = border
+                if cell.row % 2 == 0:
+                    cell.fill = soft_fill
+
+        headers = {cell.value: idx + 1 for idx, cell in enumerate(ws[1])}
+
+        def color_by_column(col_name):
+            col_idx = headers.get(col_name)
+            if not col_idx:
+                return
+            for r in range(2, ws.max_row + 1):
+                value = ws.cell(r, col_idx).value
+                txt = str(value).lower() if value is not None else ""
+                fill = None
+                if any(x in txt for x in ["alto", "aceptado", "funcionamiento alto", "estable"]):
+                    fill = green_fill
+                if any(x in txt for x in ["medio", "cautela"]):
+                    fill = yellow_fill
+                if any(x in txt for x in ["bajo", "revisar", "problemático", "problemat"]):
+                    fill = red_fill
+                if fill:
+                    ws.cell(r, col_idx).fill = fill
+
+        for cn in ["nivel_desempeno", "nivel_item", "status", "clasificacion_evalia"]:
+            color_by_column(cn)
+
+        for col in range(1, ws.max_column + 1):
+            letter = get_column_letter(col)
+            max_len = 0
+            for cell in ws[letter]:
+                value = "" if cell.value is None else str(cell.value)
+                max_len = max(max_len, min(len(value), 70))
+            ws.column_dimensions[letter].width = max(13, min(max_len + 2, 58))
+
+        ws.auto_filter.ref = ws.dimensions
+
+    if "REPORTE_DOCENTE" in wb.sheetnames:
+        wb.move_sheet(wb["REPORTE_DOCENTE"], offset=-len(wb.sheetnames))
+        ws = wb["REPORTE_DOCENTE"]
+        ws.freeze_panes = "A2"
+        for row in range(2, ws.max_row + 1):
+            ws.cell(row, 1).font = Font(bold=True)
+            ws.cell(row, 2).font = Font(bold=True)
 
 # ============================================================
 # CSS/UI
@@ -1226,16 +1357,17 @@ def base_css():
     <style>
       :root {
         --bg: #f5f6f8; --card: #ffffff; --ink: #15171a; --muted: #667085;
-        --line: #e5e7eb; --accent: #111827; --soft: #f9fafb; --ok: #067647;
+        --line: #dbe4f0; --accent: #111827; --soft: #f8fbff; --ok: #067647;
         --alt-blue:#0ea5e9; --alt-purple:#7c3aed; --alt-orange:#f97316; --alt-green:#10b981;
+        --evalia-soft:#eef7ff; --evalia-border:#b9ddff;
       }
       * { box-sizing: border-box; }
       body {
         margin: 0; min-height: 100vh;
         font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-        background: radial-gradient(circle at top left, rgba(14,165,233,.10), transparent 28%),
-                    radial-gradient(circle at top right, rgba(124,58,237,.08), transparent 26%),
-                    var(--bg);
+        background: radial-gradient(circle at top left, rgba(14,165,233,.16), transparent 30%),
+                    radial-gradient(circle at top right, rgba(124,58,237,.12), transparent 28%),
+                    linear-gradient(180deg, #f7fbff 0%, #f5f6f8 55%, #f8fbff 100%);
         color: var(--ink);
       }
       .page { width: 100%; min-height: 100vh; display: flex; justify-content: center; padding: 42px 20px 24px; }
@@ -1264,14 +1396,14 @@ def base_css():
       .hero-inner, .result-card { padding: 34px; }
       h1 { margin: 0; font-size: 42px; line-height: 1.04; letter-spacing: -.06em; }
       .lead { margin: 14px 0 26px; color: var(--muted); font-size: 17px; line-height: 1.55; max-width: 800px; }
-      .panel { background: var(--soft); border: 1px solid var(--line); border-radius: 22px; padding: 22px; }
+      .panel { background: linear-gradient(180deg,#ffffff 0%, var(--evalia-soft) 100%); border: 1px solid var(--evalia-border); border-radius: 22px; padding: 22px; }
       .field-label { display: block; font-weight: 800; margin-bottom: 8px; font-size: 14px; }
       select, input.file-visible {
         width: 100%; padding: 14px; border: 1px solid var(--line); border-radius: 14px;
         background: white; font-size: 15px; color: var(--ink); margin-bottom: 18px;
       }
       .dropzone {
-        position: relative; border: 2px dashed #cbd5e1; background: white; border-radius: 20px;
+        position: relative; border: 2px dashed #9ecdfb; background: linear-gradient(180deg,#ffffff 0%,#f8fbff 100%); border-radius: 20px;
         padding: 28px 20px; text-align: center; transition: .18s ease; cursor: pointer; margin-bottom: 18px;
       }
       .dropzone:hover { border-color: #111827; transform: translateY(-1px); box-shadow: 0 12px 28px rgba(17,24,39,.08); }
@@ -1300,7 +1432,7 @@ def base_css():
       .template-card strong { display:block; font-size:14px; }
       .template-card span { display:block; color:var(--muted); font-size:12px; margin-top:4px; }
       .features { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; padding: 18px 34px 30px; }
-      .feature { background: white; border: 1px solid var(--line); border-radius: 18px; padding: 16px; color: var(--muted); font-size: 13px; }
+      .feature { background: white; border: 1px solid var(--evalia-border); border-radius: 18px; padding: 16px; color: var(--muted); font-size: 13px; box-shadow: 0 8px 24px rgba(14,165,233,.06); }
       .feature strong { display: block; color: var(--ink); font-size: 14px; margin-bottom: 5px; }
       .loader { display: none; color: var(--muted); font-size: 14px; margin-top: 16px; }
       .progress-container {
@@ -1321,7 +1453,7 @@ def base_css():
       .preview-ok { color:#067647; font-weight:800; }
       .preview-warn { color:#b54708; font-weight:800; }
       .metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 24px 0; }
-      .metric { border: 1px solid var(--line); border-radius: 18px; padding: 16px; background: var(--soft); }
+      .metric { border: 1px solid var(--evalia-border); border-radius: 18px; padding: 16px; background: linear-gradient(180deg,#ffffff 0%,#f3f9ff 100%); }
       .metric-value { font-size: 24px; font-weight: 900; }
       .metric-label { color: var(--muted); font-size: 13px; margin-top: 4px; }
       .error {
@@ -1330,6 +1462,11 @@ def base_css():
       }
       .footer-altiora { text-align: center; margin-top: 26px; color: #667085; font-size: 13px; padding-bottom: 18px; }
       .footer-sub { margin-top: 4px; font-size: 12px; letter-spacing:.02em; }
+      .hero, .result-card { position: relative; }
+      .hero:before, .result-card:before {
+        content:""; position:absolute; left:0; top:0; right:0; height:4px;
+        background: linear-gradient(90deg,var(--alt-blue),var(--alt-green),var(--alt-orange),var(--alt-purple));
+      }
       code { background: #eef2f7; padding: 2px 6px; border-radius: 6px; }
       @media (max-width: 760px) {
         h1 { font-size: 32px; }
@@ -1340,7 +1477,7 @@ def base_css():
     """
 
 
-def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v2.8 hacia 9/10"):
+def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v2.8.2 estable"):
     return f"""
     <div class="topbar">
       <div class="brand">
@@ -1526,7 +1663,7 @@ def home():
 
           <section class="hero">
             <div class="hero-inner">
-              <h1>Evalúa respuestas. Lee patrones. Mejora evaluaciones.</h1>
+              <h1>Evalúa respuestas. Detecta patrones. Mejora evaluaciones.</h1>
               <p class="lead">
                 Evalia trabaja de forma simple: descarga el Modelo de Rúbrica y el Modelo de Respuestas,
                 complétalos y sube ambos archivos para generar un reporte docente explicable.
@@ -1552,28 +1689,28 @@ def home():
               <form action="/upload" enctype="multipart/form-data" method="post" id="uploadForm">
                 <div class="panel">
 
-                  <label class="field-label">1. Sube tu Modelo de Rúbrica completo</label>
+                  <label class="field-label">1. Sube tu rúbrica</label>
                   <div class="dropzone">
                     <input name="rubric_file" id="rubricFileInput" type="file" accept=".xlsx,.xls,.json" required>
                     <div class="drop-icon">🧩</div>
-                    <div class="drop-title">Sube el Modelo de Rúbrica</div>
-                    <div class="drop-subtitle">Usa el modelo simple descargable</div>
+                    <div class="drop-title">Sube tu rúbrica</div>
+                    <div class="drop-subtitle">Usa el formato simple descargable</div>
                     <div class="file-name" id="rubricFileName"></div>
                   </div>
 
-                  <label class="field-label">2. Sube tu Modelo de Respuestas completo</label>
+                  <label class="field-label">2. Sube las respuestas</label>
                   <div class="dropzone">
                     <input name="file" id="fileInput" type="file" accept=".xlsx,.xls" required>
                     <div class="drop-icon">📄</div>
-                    <div class="drop-title">Sube el Modelo de Respuestas</div>
-                    <div class="drop-subtitle">Usa el modelo simple descargable</div>
+                    <div class="drop-title">Sube las respuestas</div>
+                    <div class="drop-subtitle">Usa el formato simple descargable</div>
                     <div class="file-name" id="fileName"></div>
                   </div>
 
                   <div class="actions">
                     <button type="button" class="secondary" id="previewBtn">Previsualizar</button>
-                    <button type="submit" id="submitBtn">Analizar respuestas</button>
-                    <span class="hint">Evalia usará exactamente los dos modelos que subas: rúbrica y respuestas.</span>
+                    <button type="submit" id="submitBtn">Evaluar respuestas</button>
+                    <span class="hint">Evalia analizará la rúbrica y las respuestas que subas.</span>
                   </div>
 
                   <div class="preview-box" id="previewBox"></div>
@@ -1823,7 +1960,6 @@ async def upload(
                 "max_score": p.get("max_score", ""),
                 "confidence": conf,
                 "status": status,
-                "estado_docente": humanize_status(status),
                 "feedback": fb
             })
 
@@ -1902,17 +2038,17 @@ async def upload(
         f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultados · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v2.8 hacia 9/10")}
+          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v2.8.2 estable")}
           <section class="result-card">
-            <h1>Análisis completado</h1>
-            <p class="lead">Evalia analizó las respuestas con la rúbrica <strong>{escape(rubric_name)}</strong> y generó un reporte Excel explicable.</p>
+            <h1>Procesamiento completado</h1>
+            <p class="lead">Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong> y generó un reporte Excel explicable.</p>
             <div class="metric-grid">
               <div class="metric"><div class="metric-value">{len(df)}</div><div class="metric-label">estudiante(s)</div></div>
               <div class="metric"><div class="metric-value">{auto_rate}%</div><div class="metric-label">alta confianza</div></div>
               <div class="metric"><div class="metric-value">{caution_rate}%</div><div class="metric-label">parcial/intermedia</div></div>
               <div class="metric"><div class="metric-value">{review_rate}%</div><div class="metric-label">revisión sugerida</div></div>
             </div>
-            <p class="hint">Lectura de estados: alta confianza + parcial/intermedia + revisión sugerida = 100%.</p>
+            <p class="hint">Los tres estados de respuesta suman 100%: alta confianza, parcial/intermedia y revisión sugerida.</p>
             <p class="lead"><strong>Insight inicial:</strong> {escape(problematic_display)}</p>
             <div class="actions">
               <a class="button" href="/download/{output_name}">Descargar reporte Excel</a>
@@ -1928,8 +2064,25 @@ async def upload(
 @app.get("/download/{filename}")
 def download(filename: str):
     path = OUTPUT_DIR / filename
+    if not path.exists():
+        return HTMLResponse(
+            f"""
+            <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Archivo no encontrado · Evalia</title>{base_css()}</head>
+            <body><div class="page"><main class="shell">{shell_topbar("Archivo no encontrado", "CRB Engine · v2.8.2 estable")}<div class="result-card">
+              <h1>No se pudo acceder al archivo</h1>
+              <div class="error">El reporte solicitado no existe o no fue generado correctamente.</div>
+              <p class="lead">Vuelve al inicio y procesa nuevamente la rúbrica y las respuestas.</p>
+              <br><a class="button" href="/">Volver</a>
+            </div>{footer_altiora()}</main></div></body></html>
+            """
+        )
+
+    media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if filename.lower().endswith(".html"):
+        media_type = "text/html"
+
     return FileResponse(
         path,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type=media_type,
         filename=filename
     )
