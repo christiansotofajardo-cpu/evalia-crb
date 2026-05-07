@@ -21,7 +21,7 @@ RUBRICS_DIR.mkdir(exist_ok=True)
 
 LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
-app = FastAPI(title="Evalia CRB", version="2.8.2")
+app = FastAPI(title="Evalia CRB", version="2.9.0")
 
 
 # ============================================================
@@ -480,7 +480,7 @@ async def load_uploaded_rubric(rubric_file: UploadFile):
 
 
 # ============================================================
-# ROBUSTEZ SEMÁNTICA CONCEPTUAL v2.6
+# MOTOR SEMÁNTICO FINO v2.9
 # ============================================================
 
 STOPWORDS_ES = {
@@ -490,14 +490,16 @@ STOPWORDS_ES = {
     "hay","la","las","le","les","lo","los","mas","más","me","mi","mis","muy","no","nos",
     "o","para","pero","por","porque","que","qué","se","ser","si","sí","sin","sobre","su",
     "sus","tambien","también","te","tiene","tienen","un","una","unas","uno","unos","y","ya",
-    "explica","explique","mencione","nombre","indique","complete","relacione","defina"
+    "explica","explique","mencione","nombre","indique","complete","relacione","defina","respuesta",
+    "pregunta","segun","según","respecto","acerca","sobre"
 }
 
-NEGATION_TERMS = {"no", "nunca", "jamás", "sin", "tampoco", "niega", "negacion", "negación"}
+NEGATION_TERMS = {"no", "nunca", "jamás", "jamas", "sin", "tampoco", "niega", "negacion", "negación"}
 
+# Banco conservador: no pretende cubrir todo el currículum; sirve para detectar errores fuertes.
 CONCEPTUAL_CONTRADICTIONS = {
-    "estrella": ["planeta", "satélite natural", "satelite natural"],
-    "planeta": ["estrella"],
+    "estrella": ["planeta", "satélite natural", "satelite natural", "luna"],
+    "planeta": ["estrella", "galaxia"],
     "luna": ["planeta", "estrella"],
     "galaxia": ["planeta", "estrella individual"],
     "via lactea": ["andromeda"],
@@ -505,8 +507,8 @@ CONCEPTUAL_CONTRADICTIONS = {
     "fusión nuclear": ["combustión", "fuego", "quema carbón", "quema carbon"],
     "fusion nuclear": ["combustión", "fuego", "quema carbón", "quema carbon"],
     "gravedad": ["magnetismo solamente", "empuje", "viento"],
-    "orbita": ["caída recta", "caida recta"],
-    "órbita": ["caída recta", "caida recta"],
+    "orbita": ["caída recta", "caida recta", "reposo"],
+    "órbita": ["caída recta", "caida recta", "reposo"],
     "monarquia": ["democracia plena"],
     "monarquía": ["democracia plena"],
     "revolucion francesa": ["independencia de estados unidos"],
@@ -515,11 +517,12 @@ CONCEPTUAL_CONTRADICTIONS = {
 }
 
 RELATION_PATTERNS = {
-    "causalidad": ["causa", "provoca", "produce", "genera", "permite", "hace que", "debido a", "gracias a", "por eso", "por lo tanto"],
-    "mantencion": ["mantiene", "sostiene", "conserva", "retiene", "atrae", "mantener"],
-    "pertenencia": ["pertenece", "forma parte", "es parte", "incluye", "contiene"],
-    "definicion": ["es", "son", "se define", "consiste", "corresponde"],
-    "funcion": ["sirve", "funciona", "participa", "cumple", "se encarga"],
+    "causalidad": ["causa", "provoca", "produce", "genera", "permite", "hace que", "debido a", "gracias a", "por eso", "por lo tanto", "por ello"],
+    "mantencion": ["mantiene", "sostiene", "conserva", "retiene", "atrae", "mantener", "manteni"],
+    "pertenencia": ["pertenece", "forma parte", "es parte", "incluye", "contiene", "compone"],
+    "definicion": ["es", "son", "se define", "consiste", "corresponde", "se trata"],
+    "funcion": ["sirve", "funciona", "participa", "cumple", "se encarga", "permite"],
+    "comparacion": ["a diferencia", "similar", "distinto", "en cambio", "mientras que"]
 }
 
 CENTRALITY_MARKERS = ["principal", "fundamental", "central", "clave", "importante", "esencial", "causa", "produce", "genera"]
@@ -540,17 +543,17 @@ SEMANTIC_SYNONYMS = {
     "cohesión": ["cohesion", "conexión textual", "conexion textual", "marcadores", "conectores"],
     "significado": ["sentido", "contenido", "idea"],
     "discurso": ["texto", "enunciado", "producción", "produccion", "mensaje"],
-    "gravedad": ["atracción gravitacional", "atraccion gravitacional", "fuerza gravitatoria", "fuerza de gravedad"],
-    "orbita": ["órbita", "movimiento orbital", "trayectoria orbital", "gira alrededor"],
-    "órbita": ["orbita", "movimiento orbital", "trayectoria orbital", "gira alrededor"],
+    "gravedad": ["atracción gravitacional", "atraccion gravitacional", "fuerza gravitatoria", "fuerza de gravedad", "atracción", "atraccion"],
+    "orbita": ["órbita", "movimiento orbital", "trayectoria orbital", "gira alrededor", "giran alrededor", "orbitar"],
+    "órbita": ["orbita", "movimiento orbital", "trayectoria orbital", "gira alrededor", "giran alrededor", "orbitar"],
     "sol": ["estrella central", "astro central"],
     "planetas": ["cuerpos celestes", "mundos", "astros"],
-    "estrella": ["astro luminoso", "cuerpo luminoso", "astro que emite luz"],
+    "estrella": ["astro luminoso", "cuerpo luminoso", "astro que emite luz", "cuerpo celeste luminoso"],
     "fusion nuclear": ["fusión nuclear", "reacciones nucleares", "reacción nuclear"],
     "fusión nuclear": ["fusion nuclear", "reacciones nucleares", "reacción nuclear"],
     "energia": ["energía", "emisión de energía", "potencia"],
     "energía": ["energia", "emisión de energía", "potencia"],
-    "luz": ["luminosidad", "brillo", "emite luz"],
+    "luz": ["luminosidad", "brillo", "emite luz", "ilumina"],
     "calor": ["temperatura", "energía térmica", "energia termica"],
     "revolucion": ["revolución", "cambio político", "cambio politico", "levantamiento", "transformación política"],
     "revolución": ["revolucion", "cambio político", "cambio politico", "levantamiento", "transformación política"],
@@ -588,7 +591,18 @@ def token_overlap_score(answer, target):
         return 0
     overlap = len(a_tokens.intersection(t_tokens)) / len(t_tokens)
     containment = len(a_tokens.intersection(t_tokens)) / max(min(len(a_tokens), len(t_tokens)), 1)
-    return int(round((0.75 * overlap + 0.25 * containment) * 100))
+    return int(round((0.70 * overlap + 0.30 * containment) * 100))
+
+
+def answer_length_profile(answer):
+    n = len(semantic_tokens(answer))
+    if n <= 0:
+        return "empty"
+    if n <= 3:
+        return "brief"
+    if n <= 8:
+        return "short"
+    return "developed"
 
 
 def synonym_expansions(term):
@@ -597,7 +611,8 @@ def synonym_expansions(term):
     if norm in SEMANTIC_SYNONYMS:
         expansions.update(SEMANTIC_SYNONYMS[norm])
     for key, values in SEMANTIC_SYNONYMS.items():
-        if norm == key or norm in [normalize_text(v) for v in values]:
+        norm_values = [normalize_text(v) for v in values]
+        if norm == normalize_text(key) or norm in norm_values:
             expansions.add(key)
             expansions.update(values)
     for tok in semantic_tokens(norm):
@@ -607,14 +622,14 @@ def synonym_expansions(term):
 
 
 def has_negation_near(answer, target, window=4):
-    a_tokens = semantic_tokens(answer)
-    t_tokens = set(simple_stem(t) for t in semantic_tokens(target))
-    if not a_tokens or not t_tokens:
+    a_tokens = normalize_text(answer).split()
+    target_stems = set(simple_stem(t) for t in semantic_tokens(target))
+    if not a_tokens or not target_stems:
         return False
     stems = [simple_stem(t) for t in a_tokens]
     neg_positions = [i for i, t in enumerate(stems) if t in NEGATION_TERMS or normalize_text(a_tokens[i]) in NEGATION_TERMS]
     for i, stem in enumerate(stems):
-        if stem in t_tokens:
+        if stem in target_stems:
             for npos in neg_positions:
                 if 0 <= i - npos <= window:
                     return True
@@ -642,10 +657,15 @@ def semantic_match(answer, target, threshold=68, semantic_threshold=62):
     target_n = normalize_text(target)
     if not answer_n or not target_n:
         return False, 0, "vacío"
+
     if has_negation_near(answer_n, target_n):
         return False, 20, "posible negación o contradicción"
-    if target_n in answer_n:
-        return True, 100, "coincidencia directa"
+
+    # Caso breve válido: si la respuesta del estudiante contiene exactamente el núcleo conceptual,
+    # no se le exige desarrollo textual adicional.
+    if target_n in answer_n or answer_n in target_n:
+        score = 100 if target_n in answer_n else 86
+        return True, score, "núcleo conceptual breve"
 
     best_score = fuzz.partial_ratio(answer_n, target_n)
     best_method = "fuzzy"
@@ -656,8 +676,8 @@ def semantic_match(answer, target, threshold=68, semantic_threshold=62):
         exp_n = normalize_text(expansion)
         if not exp_n:
             continue
-        if exp_n in answer_n:
-            return True, 88, "sinónimo/paráfrasis"
+        if exp_n in answer_n or answer_n in exp_n:
+            return True, 88, "sinónimo/paráfrasis breve"
         s = fuzz.partial_ratio(answer_n, exp_n)
         if s > best_score:
             best_score = s
@@ -671,6 +691,7 @@ def semantic_match(answer, target, threshold=68, semantic_threshold=62):
         best_method = "solapamiento conceptual"
     if overlap >= semantic_threshold:
         return True, int(overlap), "solapamiento conceptual"
+
     return False, int(best_score), best_method
 
 
@@ -686,13 +707,8 @@ def contradictions_lookup(term):
 
 def explicit_wrong_relation(answer, concept, bad):
     """
-    Detecta contradicción contextual.
-    Penaliza sobre todo frases del tipo:
-    - X es Y
-    - X son Y
-    - X corresponde a Y
-    - X funciona como Y
-    Evita penalizar frases correctas como: "una estrella no es un planeta".
+    Detecta error conceptual contextual.
+    Penaliza definiciones o equivalencias incorrectas; evita penalizar negaciones correctas.
     """
     answer_n = normalize_text(answer)
     concept_n = normalize_text(concept)
@@ -701,14 +717,13 @@ def explicit_wrong_relation(answer, concept, bad):
     if not answer_n or not concept_n or not bad_n:
         return False
 
-    # Si está negado explícitamente, no se considera contradicción.
     negated_patterns = [
         f"{concept_n} no es {bad_n}",
         f"{concept_n} no son {bad_n}",
         f"{concept_n} no corresponde a {bad_n}",
         f"{concept_n} no funciona como {bad_n}",
         f"no es {bad_n}",
-        f"no son {bad_n}"
+        f"no son {bad_n}",
     ]
     if any(p in answer_n for p in negated_patterns):
         return False
@@ -723,45 +738,37 @@ def explicit_wrong_relation(answer, concept, bad):
         f"{concept_n} consiste en {bad_n}",
         f"es un {bad_n}",
         f"es una {bad_n}",
-        f"son {bad_n}"
+        f"son {bad_n}",
     ]
-
     if any(p in answer_n for p in wrong_patterns):
         return True
 
-    # Caso especial: si ambas ideas aparecen muy cerca sin negación y con verbo definicional.
     tokens = answer_n.split()
     concept_tokens = concept_n.split()
     bad_tokens = bad_n.split()
 
     def find_positions(seq):
         pos = []
-        first = seq[0] if seq else ""
-        for i, t in enumerate(tokens):
-            if t == first:
-                window = " ".join(tokens[i:i+len(seq)])
-                if window == " ".join(seq):
-                    pos.append(i)
+        if not seq:
+            return pos
+        for i in range(len(tokens)):
+            if " ".join(tokens[i:i+len(seq)]) == " ".join(seq):
+                pos.append(i)
         return pos
 
     cpos = find_positions(concept_tokens)
     bpos = find_positions(bad_tokens)
-    definitional = any(v in answer_n for v in [" es ", " son ", " corresponde ", " funciona como ", " se define "])
+    definitional = any(v in f" {answer_n} " for v in [" es ", " son ", " corresponde ", " funciona como ", " se define ", " consiste "])
 
     if definitional:
         for c in cpos:
             for b in bpos:
-                if abs(c - b) <= 6:
+                if abs(c - b) <= 7:
                     return True
-
     return False
 
 
 def detect_contradictions(answer, expected_terms):
-    """
-    Detecta incompatibilidades conceptuales evidentes de forma conservadora.
-    No penaliza mera coexistencia de términos; requiere relación incorrecta explícita.
-    """
     answer_n = normalize_text(answer)
     if not answer_n:
         return []
@@ -776,46 +783,65 @@ def detect_contradictions(answer, expected_terms):
         t = normalize_text(term)
         if not t:
             continue
-
         concept_present = t in answer_n or fuzz.partial_ratio(answer_n, t) >= 78
         if not concept_present:
             continue
-
         for bad in contradictions_lookup(t):
             bad_n = normalize_text(bad)
             if bad_n and (bad_n in answer_n or fuzz.partial_ratio(answer_n, bad_n) >= 88):
                 if explicit_wrong_relation(answer_n, t, bad_n):
                     found.append(f"{term} ↔ {bad}")
-
     return sorted(set(found))
+
+
+def detect_present_concepts(answer, concepts):
+    present = []
+    evidence = {}
+    for c in concepts:
+        best_score = 0
+        best_method = "sin coincidencia"
+        hit = False
+        variants = [c] + synonym_expansions(c)
+        seen = set()
+        variants = [v for v in variants if not (normalize_text(v) in seen or seen.add(normalize_text(v)))]
+        for v in variants:
+            ok, score, method = semantic_match(answer, v, threshold=68, semantic_threshold=58)
+            if score > best_score:
+                best_score = score
+                best_method = method
+            if ok:
+                hit = True
+        if hit:
+            present.append(c)
+        evidence[c] = {"hit": hit, "score": best_score, "method": best_method}
+    return sorted(set(present)), evidence
 
 
 def relation_score(answer, concepts):
     answer_n = normalize_text(answer)
     if not answer_n or len(concepts) < 2:
-        return 0, []
-    present = []
-    for c in concepts:
-        for v in [c] + synonym_expansions(c):
-            ok, _, _ = semantic_match_basic(answer_n, v)
-            if ok:
-                present.append(c)
-                break
-    present = sorted(set(present))
+        return 0, [], []
+
+    present, _evidence = detect_present_concepts(answer_n, concepts)
     if len(present) < 2:
-        return 0, []
+        return 0, [], present
 
     relation_hits = []
     for rel, patterns in RELATION_PATTERNS.items():
         for pat in patterns:
-            if normalize_text(pat) in answer_n:
+            pat_n = normalize_text(pat)
+            if pat_n and pat_n in answer_n:
                 relation_hits.append(rel)
                 break
+
     if relation_hits:
-        return min(0.18, 0.06 * len(set(relation_hits))), sorted(set(relation_hits))
+        return min(0.20, 0.07 * len(set(relation_hits))), sorted(set(relation_hits)), present
+
+    # Si hay dos o más conceptos centrales en una respuesta desarrollada, se reconoce integración mínima,
+    # pero con bono menor que una relación explícita.
     if len(answer_n.split()) >= 8:
-        return 0.06, ["integración conceptual básica"]
-    return 0, []
+        return 0.05, ["integración conceptual básica"], present
+    return 0, [], present
 
 
 def infer_concept_weights(concepts, prompt=""):
@@ -828,13 +854,13 @@ def infer_concept_weights(concepts, prompt=""):
         c_n = normalize_text(c)
         w = 1.0
         if i == 0:
-            w += 0.35
+            w += 0.25
         if c_n and c_n in prompt_n:
-            w += 0.20
+            w += 0.18
         if any(m in c_n for m in CENTRALITY_MARKERS):
             w += 0.25
         if len(c_n.split()) >= 2:
-            w += 0.10
+            w += 0.08
         raw.append(w)
     total = sum(raw) or 1
     return {concepts[i]: raw[i] / total for i in range(len(concepts))}
@@ -853,7 +879,6 @@ def score_accepted_answers(answer, question):
     best = 0
     best_method = "sin coincidencia"
     best_target = ""
-
     for target in accepted:
         ok, score, method = semantic_match(answer, target, threshold=80, semantic_threshold=66)
         if score > best:
@@ -862,7 +887,6 @@ def score_accepted_answers(answer, question):
             best_target = target
         if ok:
             return question["max_score"], min(score / 100, 1.0), f"Respuesta compatible con: {target} ({method})."
-
     return 0, best / 100, f"No coincide suficientemente con las respuestas aceptadas. Mejor aproximación: {best_target} ({best_method}, {best}/100)."
 
 
@@ -881,6 +905,7 @@ def score_criteria(answer, question):
     if not criteria:
         return score_accepted_answers(answer, question)
 
+    max_score = float(question.get("max_score", 1.0))
     concepts = [c.get("concept", "") for c in criteria if c.get("concept", "")]
     weight_map = infer_concept_weights(concepts, question.get("prompt", ""))
 
@@ -891,31 +916,28 @@ def score_criteria(answer, question):
     method_notes = []
 
     contradictions = detect_contradictions(answer, concepts)
+    profile = answer_length_profile(answer)
 
     for criterion in criteria:
         concept = criterion.get("concept", "")
+        if not concept:
+            continue
+
         base_weight = float(criterion.get("weight", 1.0))
         auto_weight = weight_map.get(concept)
-        if auto_weight is not None and len(criteria) > 1:
-            max_score = float(question.get("max_score", 1.0))
-            weight = max_score * auto_weight
-        else:
-            weight = base_weight
+        weight = max_score * auto_weight if auto_weight is not None and len(criteria) > 1 else base_weight
 
-        variants = []
-        if concept:
-            variants.append(concept)
+        variants = [concept]
         variants.extend(criterion.get("semantic_variants", []))
         variants.extend(criterion.get("accepted_values", []))
         variants.extend(synonym_expansions(concept))
 
         seen = set()
-        variants = [v for v in variants if not (normalize_text(v) in seen or seen.add(normalize_text(v)))]
+        variants = [v for v in variants if v and not (normalize_text(v) in seen or seen.add(normalize_text(v)))]
 
         criterion_best = 0
         criterion_method = "sin coincidencia"
         criterion_hit = False
-
         for v in variants:
             ok, score, method = semantic_match(answer, v, threshold=68, semantic_threshold=58)
             if score > criterion_best:
@@ -926,11 +948,15 @@ def score_criteria(answer, question):
 
         related_contradiction = any(normalize_text(concept) in normalize_text(c) for c in contradictions)
         if related_contradiction:
-            criterion_best = min(criterion_best, 45)
+            criterion_best = min(criterion_best, 42)
             criterion_hit = False
-            criterion_method = "contradicción conceptual"
+            criterion_method = "error conceptual probable"
 
-        confidence_scores.append(criterion_best / 100 if criterion_best else 0)
+        # Respuesta breve válida: reconoce el núcleo conceptual sin exigir desarrollo cuando el ítem tiene varios criterios.
+        if criterion_hit and profile in ["brief", "short"]:
+            confidence_scores.append(max(0.72, criterion_best / 100))
+        else:
+            confidence_scores.append(criterion_best / 100 if criterion_best else 0)
 
         if criterion_hit:
             total += weight
@@ -941,32 +967,44 @@ def score_criteria(answer, question):
             if criterion_best >= 40:
                 method_notes.append(f"{concept}: aproximación insuficiente ({criterion_best}/100)")
 
-    max_score = float(question.get("max_score", total))
-
-    rel_bonus, rel_hits = relation_score(answer, concepts)
+    rel_bonus, rel_hits, present_for_relation = relation_score(answer, concepts)
     if rel_bonus and matched:
         total += max_score * rel_bonus
         method_notes.append("Relaciones detectadas: " + ", ".join(rel_hits))
 
+    coverage = len(set(matched)) / max(len(set(concepts)), 1)
+
+    # Ajuste epistemológico: una respuesta breve puede ser correcta, pero no siempre completa.
+    # Si hay un solo criterio y coincide, puede recibir el total. Si hay varios criterios, recibe lo que cubre.
+    if profile == "brief" and matched and not contradictions:
+        method_notes.append("Respuesta breve válida: se detecta núcleo conceptual, aunque con desarrollo limitado.")
+
     if contradictions:
-        # Penalización gradual y conservadora: evita sobrecastigar respuestas parcialmente buenas.
-        contradiction_penalty = min(0.30, 0.12 + 0.06 * (len(contradictions) - 1))
+        contradiction_penalty = min(0.38, 0.16 + 0.08 * (len(contradictions) - 1))
         total *= (1 - contradiction_penalty)
-        method_notes.append("Alerta: posible contradicción conceptual: " + "; ".join(contradictions[:4]))
+        method_notes.append("Alerta: posible error conceptual: " + "; ".join(contradictions[:4]))
 
-    total = min(total, max_score)
-    confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
+    total = min(max(total, 0), max_score)
+
+    avg_evidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
+    confidence = (0.55 * avg_evidence) + (0.30 * coverage) + (0.15 * (1 if not contradictions else 0.35))
+
+    # Si hay respuesta breve correcta, subir confianza operacional, pero no fabricar completitud.
+    if profile in ["brief", "short"] and matched and not contradictions:
+        confidence = max(confidence, 0.68 if coverage < 0.80 else 0.82)
 
     if contradictions:
-        confidence = min(confidence, 0.62)
+        confidence = min(confidence, 0.58)
 
     feedback = []
     if matched:
         feedback.append("Criterios detectados: " + "; ".join([m for m in matched if m]))
     if missing:
         feedback.append("Criterios no detectados o débiles: " + "; ".join([m for m in missing if m]))
+    if profile in ["brief", "short"] and matched:
+        feedback.append("Observación: respuesta breve; Evalia reconoce el núcleo, pero sugiere revisar si el docente esperaba desarrollo argumentativo.")
     if method_notes:
-        feedback.append("Evidencia semántica: " + "; ".join(method_notes[:10]))
+        feedback.append("Evidencia semántica: " + "; ".join(method_notes[:12]))
 
     return round(total, 2), round(confidence, 2), " | ".join(feedback)
 
@@ -996,11 +1034,9 @@ def score_enumeration(answer, question):
 
     if required is None:
         required = len(accepted) if accepted else 1
-
     counted = min(len(set(hits)), required)
     score = max_score * (counted / required) if required else 0
     confidence = counted / required if required else 0
-
     detail = f"Elementos válidos detectados: {counted}/{required}. {', '.join(sorted(set(hits)))}"
     if notes:
         detail += " | Evidencia semántica: " + "; ".join(notes[:8])
@@ -1017,33 +1053,27 @@ def score_matching(answer, question):
         left = pair.get("prompt_value", "")
         right = pair.get("correct_match", "")
         weight = float(pair.get("weight", 1.0))
-
         left_variants = [left] + synonym_expansions(left)
         right_variants = [right] + synonym_expansions(right)
-
         ok_left = False
         ok_right = False
         method_left = ""
         method_right = ""
-
         for v in left_variants:
             ok, score, method = semantic_match(answer, v, threshold=65, semantic_threshold=58)
             if ok:
                 ok_left = True
                 method_left = method
                 break
-
         for v in right_variants:
             ok, score, method = semantic_match(answer, v, threshold=65, semantic_threshold=58)
             if ok:
                 ok_right = True
                 method_right = method
                 break
-
         if ok_left and ok_right:
             total += weight
             found.append(f"{left} -> {right} ({method_left}/{method_right})")
-
     confidence = total / max_score if max_score else 0
     return round(min(total, max_score), 2), round(confidence, 2), "Relaciones detectadas: " + "; ".join(found)
 
@@ -1065,35 +1095,14 @@ def score_answer(answer, question):
     else:
         score, conf, fb = score_criteria(answer, question)
 
-    # Con la capa semántica, una confianza media-alta puede quedar aceptada con cautela
-    # y sólo las respuestas realmente débiles quedan para revisión manual.
-    status = "aceptado" if conf >= 0.80 else ("revisar" if conf < 0.45 else "aceptado_con_cautela")
+    # Tres estados estables para docentes: alta confianza, parcial/intermedia y revisión sugerida.
+    if conf >= 0.82:
+        status = "aceptado"
+    elif conf < 0.48:
+        status = "revisar"
+    else:
+        status = "aceptado_con_cautela"
     return score, conf, fb, status
-
-
-def performance_level(pct):
-    try:
-        pct = float(pct)
-    except Exception:
-        return "Sin información"
-    if pct >= 80:
-        return "Alto"
-    if pct >= 60:
-        return "Medio"
-    return "Bajo"
-
-
-def pedagogical_item_suggestion(classification, review_pct, avg_score_pct, avg_confidence):
-    classification = str(classification or "")
-    if "problemático" in classification:
-        return "Revisar el enunciado, la rúbrica o los criterios de corrección; varios estudiantes podrían haber interpretado la pregunta de manera distinta a lo esperado."
-    if review_pct >= 30:
-        return "Conviene revisar manualmente una muestra de respuestas antes de cerrar la calificación."
-    if avg_score_pct < 60:
-        return "La pregunta parece difícil para el grupo; puede requerir retroalimentación o refuerzo de contenidos."
-    if avg_confidence < 0.70:
-        return "La respuesta esperada podría necesitar criterios más explícitos o ejemplos adicionales."
-    return "El ítem muestra funcionamiento estable bajo los criterios actuales de Evalia."
 
 
 # ============================================================
@@ -1477,7 +1486,7 @@ def base_css():
     """
 
 
-def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v2.8.2 estable"):
+def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v2.9 semántica fina"):
     return f"""
     <div class="topbar">
       <div class="brand">
@@ -2038,7 +2047,7 @@ async def upload(
         f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultados · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v2.8.2 estable")}
+          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v2.9 semántica fina")}
           <section class="result-card">
             <h1>Procesamiento completado</h1>
             <p class="lead">Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong> y generó un reporte Excel explicable.</p>
@@ -2068,7 +2077,7 @@ def download(filename: str):
         return HTMLResponse(
             f"""
             <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Archivo no encontrado · Evalia</title>{base_css()}</head>
-            <body><div class="page"><main class="shell">{shell_topbar("Archivo no encontrado", "CRB Engine · v2.8.2 estable")}<div class="result-card">
+            <body><div class="page"><main class="shell">{shell_topbar("Archivo no encontrado", "CRB Engine · v2.9 semántica fina")}<div class="result-card">
               <h1>No se pudo acceder al archivo</h1>
               <div class="error">El reporte solicitado no existe o no fue generado correctamente.</div>
               <p class="lead">Vuelve al inicio y procesa nuevamente la rúbrica y las respuestas.</p>
