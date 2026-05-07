@@ -21,7 +21,7 @@ RUBRICS_DIR.mkdir(exist_ok=True)
 
 LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
-app = FastAPI(title="Evalia CRB", version="2.4.2")
+app = FastAPI(title="Evalia CRB", version="2.5")
 
 
 # ============================================================
@@ -247,6 +247,7 @@ def build_question_from_excel_row(row):
 
     respuestas = split_values(row.get("respuestas", row.get("accepted_answers", "")))
     criterios = split_values(row.get("criterios", row.get("criteria", "")))
+    variantes_semanticas = split_values(row.get("variantes_semanticas", row.get("semantic_variants", "")))
 
     question = {
         "id": qid,
@@ -289,10 +290,11 @@ def build_question_from_excel_row(row):
         criteria = []
         weight = max_score / max(len(concepts), 1)
         for c in concepts:
+            expanded_variants = [c] + variantes_semanticas
             criteria.append({
                 "concept": c,
                 "weight": weight,
-                "semantic_variants": [c],
+                "semantic_variants": expanded_variants,
                 "accepted_values": []
             })
         question["item_type"] = "criteria"
@@ -319,6 +321,8 @@ def load_rubric_from_excel(path):
             col_map[c] = "respuestas"
         elif nc in ["criterios", "criteria", "conceptos", "concepts"]:
             col_map[c] = "criterios"
+        elif nc in ["variantes", "variantessemanticas", "variantes_semanticas", "semantic_variants", "sinonimos", "sinónimos"]:
+            col_map[c] = "variantes_semanticas"
         elif nc in ["required_items", "required_number_of_items", "numero_requerido", "n_requerido"]:
             col_map[c] = "required_items"
         elif nc in ["prompt", "enunciado", "pregunta_texto"]:
@@ -385,15 +389,180 @@ async def load_uploaded_rubric(rubric_file: UploadFile):
 # MOTOR CRB
 # ============================================================
 
-def fuzzy_contains(answer, target, threshold=78):
+
+# ============================================================
+# ROBUSTEZ SEMÁNTICA EXPLICABLE
+# ============================================================
+
+STOPWORDS_ES = {
+    "a","al","algo","ante","antes","como","con","contra","cual","cuando","de","del","desde",
+    "donde","durante","e","el","ella","ellas","ellos","en","entre","era","eran","es","esa",
+    "esas","ese","eso","esos","esta","estas","este","esto","estos","fue","fueron","ha","han",
+    "hay","la","las","le","les","lo","los","mas","más","me","mi","mis","muy","no","nos",
+    "o","para","pero","por","porque","que","qué","se","ser","si","sí","sin","sobre","su",
+    "sus","tambien","también","te","tiene","tienen","un","una","unas","uno","unos","y","ya"
+}
+
+NEGATION_TERMS = {"no", "nunca", "jamás", "sin", "tampoco", "niega", "negacion", "negación"}
+
+SEMANTIC_SYNONYMS = {
+    "lenguaje": ["habla", "comunicación", "comunicacion", "expresión", "expresion", "idioma"],
+    "mente": ["procesos mentales", "cognición", "cognicion", "pensamiento", "actividad mental"],
+    "cognicion": ["cognición", "mente", "pensamiento", "procesos mentales"],
+    "cognición": ["cognicion", "mente", "pensamiento", "procesos mentales"],
+    "comprension": ["comprensión", "entendimiento", "interpretación", "interpretacion", "entender", "comprender"],
+    "comprensión": ["comprension", "entendimiento", "interpretación", "interpretacion", "entender", "comprender"],
+    "memoria": ["recuerdo", "almacenamiento", "retención", "retencion"],
+    "atencion": ["atención", "concentración", "concentracion", "foco"],
+    "atención": ["atencion", "concentración", "concentracion", "foco"],
+    "inferencia": ["deducción", "deduccion", "interpretación", "interpretacion", "concluir", "conclusión"],
+    "coherencia": ["sentido global", "continuidad", "organización de ideas", "organizacion de ideas", "relación entre ideas", "relacion entre ideas"],
+    "cohesion": ["cohesión", "conexión textual", "conexion textual", "marcadores", "conectores"],
+    "cohesión": ["cohesion", "conexión textual", "conexion textual", "marcadores", "conectores"],
+    "significado": ["sentido", "contenido", "idea"],
+    "discurso": ["texto", "enunciado", "producción", "produccion", "mensaje"],
+    "revolucion": ["revolución", "cambio político", "cambio politico", "levantamiento", "transformación política"],
+    "revolución": ["revolucion", "cambio político", "cambio politico", "levantamiento", "transformación política"],
+    "monarquia": ["monarquía", "rey", "corona", "régimen monárquico", "regimen monarquico"],
+    "monarquía": ["monarquia", "rey", "corona", "régimen monárquico", "regimen monarquico"],
+    "igualdad": ["equidad", "mismos derechos", "derechos iguales"],
+    "libertad": ["autonomía", "autonomia", "independencia", "derechos"],
+    "fraternidad": ["hermandad", "solidaridad"],
+    "ilustracion": ["ilustración", "ideas ilustradas", "razón", "razon", "pensamiento ilustrado"],
+    "ilustración": ["ilustracion", "ideas ilustradas", "razón", "razon", "pensamiento ilustrado"],
+    "pueblo": ["ciudadanía", "ciudadania", "personas", "clases populares", "sociedad"],
+    "independencia": ["emancipación", "emancipacion", "liberación", "liberacion", "autonomía", "autonomia"],
+    "colonias": ["territorios coloniales", "colonos", "poblaciones coloniales"],
+    "estados unidos": ["eeuu", "usa", "norteamérica", "norteamerica"],
+    "produccion": ["producción", "expresión", "expresion", "habla"],
+    "producción": ["produccion", "expresión", "expresion", "habla"]
+}
+
+
+def semantic_tokens(text):
+    txt = normalize_text(text)
+    tokens = [t for t in re.split(r"\s+", txt) if t and t not in STOPWORDS_ES and len(t) > 2]
+    return tokens
+
+
+def simple_stem(token):
+    t = normalize_text(token)
+    for suffix in ["aciones", "iciones", "mente", "ación", "acion", "idades", "idad", "amiento", "imiento", "ismos", "istas", "icos", "icas", "ados", "adas", "ido", "ida", "ción", "sión", "cion", "sion", "es", "s"]:
+        if len(t) > len(suffix) + 4 and t.endswith(suffix):
+            return t[:-len(suffix)]
+    return t
+
+
+def token_overlap_score(answer, target):
+    a_tokens = set(simple_stem(t) for t in semantic_tokens(answer))
+    t_tokens = set(simple_stem(t) for t in semantic_tokens(target))
+
+    if not a_tokens or not t_tokens:
+        return 0
+
+    overlap = len(a_tokens.intersection(t_tokens)) / len(t_tokens)
+    containment = len(a_tokens.intersection(t_tokens)) / max(min(len(a_tokens), len(t_tokens)), 1)
+
+    return int(round((0.75 * overlap + 0.25 * containment) * 100))
+
+
+def synonym_expansions(term):
+    norm = normalize_text(term)
+    expansions = {term, norm}
+
+    if norm in SEMANTIC_SYNONYMS:
+        expansions.update(SEMANTIC_SYNONYMS[norm])
+
+    for key, values in SEMANTIC_SYNONYMS.items():
+        if norm == key or norm in [normalize_text(v) for v in values]:
+            expansions.add(key)
+            expansions.update(values)
+
+    # Si el criterio tiene varias palabras, expandir cada palabra importante.
+    for tok in semantic_tokens(norm):
+        if tok in SEMANTIC_SYNONYMS:
+            expansions.update(SEMANTIC_SYNONYMS[tok])
+
+    return [e for e in expansions if e]
+
+
+def has_negation_near(answer, target, window=4):
+    a_tokens = semantic_tokens(answer)
+    t_tokens = set(simple_stem(t) for t in semantic_tokens(target))
+    if not a_tokens or not t_tokens:
+        return False
+
+    stems = [simple_stem(t) for t in a_tokens]
+    neg_positions = [i for i, t in enumerate(stems) if t in NEGATION_TERMS or normalize_text(a_tokens[i]) in NEGATION_TERMS]
+
+    for i, stem in enumerate(stems):
+        if stem in t_tokens:
+            for npos in neg_positions:
+                if 0 <= i - npos <= window:
+                    return True
+    return False
+
+
+def semantic_match(answer, target, threshold=68, semantic_threshold=62):
+    """
+    Devuelve:
+    ok, score, method
+
+    method permite explicar si la coincidencia fue:
+    - exacta
+    - fuzzy
+    - sinonimia/paráfrasis
+    - solapamiento léxico
+    - negada/contradictoria
+    """
     answer_n = normalize_text(answer)
     target_n = normalize_text(target)
+
     if not answer_n or not target_n:
-        return False, 0
+        return False, 0, "vacío"
+
+    if has_negation_near(answer_n, target_n):
+        return False, 20, "posible negación o contradicción"
+
     if target_n in answer_n:
-        return True, 100
-    score = fuzz.partial_ratio(answer_n, target_n)
-    return score >= threshold, score
+        return True, 100, "coincidencia directa"
+
+    best_score = fuzz.partial_ratio(answer_n, target_n)
+    best_method = "fuzzy"
+
+    if best_score >= threshold:
+        return True, int(best_score), best_method
+
+    # Sinónimos/paráfrasis configuradas y diccionario interno.
+    for expansion in synonym_expansions(target_n):
+        exp_n = normalize_text(expansion)
+        if not exp_n:
+            continue
+
+        if exp_n in answer_n:
+            return True, 88, "sinónimo/paráfrasis"
+
+        s = fuzz.partial_ratio(answer_n, exp_n)
+        if s > best_score:
+            best_score = s
+            best_method = "sinónimo/paráfrasis"
+
+        if s >= semantic_threshold + 10:
+            return True, int(s), "sinónimo/paráfrasis"
+
+    overlap = token_overlap_score(answer_n, target_n)
+    if overlap > best_score:
+        best_score = overlap
+        best_method = "solapamiento conceptual"
+
+    if overlap >= semantic_threshold:
+        return True, int(overlap), "solapamiento conceptual"
+
+    return False, int(best_score), best_method
+
+def fuzzy_contains(answer, target, threshold=78):
+    ok, score, _method = semantic_match(answer, target, threshold=threshold, semantic_threshold=max(58, threshold - 10))
+    return ok, score
 
 
 def score_accepted_answers(answer, question):
@@ -402,12 +571,19 @@ def score_accepted_answers(answer, question):
         return 0, 0.0, "Sin respuestas aceptadas configuradas."
 
     best = 0
+    best_method = "sin coincidencia"
+    best_target = ""
+
     for target in accepted:
-        ok, score = fuzzy_contains(answer, target, threshold=80)
-        best = max(best, score)
+        ok, score, method = semantic_match(answer, target, threshold=80, semantic_threshold=66)
+        if score > best:
+            best = score
+            best_method = method
+            best_target = target
         if ok:
-            return question["max_score"], min(score / 100, 1.0), f"Respuesta coincide con: {target}."
-    return 0, best / 100, "No coincide suficientemente con las respuestas aceptadas."
+            return question["max_score"], min(score / 100, 1.0), f"Respuesta compatible con: {target} ({method})."
+
+    return 0, best / 100, f"No coincide suficientemente con las respuestas aceptadas. Mejor aproximación: {best_target} ({best_method}, {best}/100)."
 
 
 def score_true_false(answer, question):
@@ -429,6 +605,7 @@ def score_criteria(answer, question):
     matched = []
     missing = []
     confidence_scores = []
+    method_notes = []
 
     for criterion in criteria:
         weight = float(criterion.get("weight", 1.0))
@@ -438,13 +615,21 @@ def score_criteria(answer, question):
             variants.append(concept)
         variants.extend(criterion.get("semantic_variants", []))
         variants.extend(criterion.get("accepted_values", []))
+        variants.extend(synonym_expansions(concept))
+
+        # Quitar duplicados manteniendo orden.
+        seen = set()
+        variants = [v for v in variants if not (normalize_text(v) in seen or seen.add(normalize_text(v)))]
 
         criterion_best = 0
+        criterion_method = "sin coincidencia"
         criterion_hit = False
 
         for v in variants:
-            ok, score = fuzzy_contains(answer, v, threshold=68)
-            criterion_best = max(criterion_best, score)
+            ok, score, method = semantic_match(answer, v, threshold=68, semantic_threshold=58)
+            if score > criterion_best:
+                criterion_best = score
+                criterion_method = method
             if ok:
                 criterion_hit = True
 
@@ -453,8 +638,11 @@ def score_criteria(answer, question):
         if criterion_hit:
             total += weight
             matched.append(concept)
+            method_notes.append(f"{concept}: {criterion_method} ({criterion_best}/100)")
         else:
             missing.append(concept)
+            if criterion_best >= 45:
+                method_notes.append(f"{concept}: aproximación insuficiente ({criterion_best}/100)")
 
     max_score = float(question.get("max_score", total))
     total = min(total, max_score)
@@ -465,6 +653,8 @@ def score_criteria(answer, question):
         feedback.append("Criterios detectados: " + "; ".join([m for m in matched if m]))
     if missing:
         feedback.append("Criterios no detectados: " + "; ".join([m for m in missing if m]))
+    if method_notes:
+        feedback.append("Evidencia semántica: " + "; ".join(method_notes[:8]))
 
     return round(total, 2), round(confidence, 2), " | ".join(feedback)
 
@@ -475,10 +665,22 @@ def score_enumeration(answer, question):
     accepted = question.get("accepted_concepts", question.get("accepted_answers", []))
 
     hits = []
+    notes = []
     for concept in accepted:
-        ok, _ = fuzzy_contains(answer, concept, threshold=68)
-        if ok:
+        variants = [concept] + synonym_expansions(concept)
+        best_score = 0
+        best_method = "sin coincidencia"
+        hit = False
+        for v in variants:
+            ok, score, method = semantic_match(answer, v, threshold=68, semantic_threshold=58)
+            if score > best_score:
+                best_score = score
+                best_method = method
+            if ok:
+                hit = True
+        if hit:
             hits.append(concept)
+            notes.append(f"{concept}: {best_method}")
 
     if required is None:
         required = len(accepted) if accepted else 1
@@ -487,7 +689,10 @@ def score_enumeration(answer, question):
     score = max_score * (counted / required) if required else 0
     confidence = counted / required if required else 0
 
-    return round(score, 2), round(confidence, 2), f"Elementos válidos detectados: {counted}/{required}. {', '.join(sorted(set(hits)))}"
+    detail = f"Elementos válidos detectados: {counted}/{required}. {', '.join(sorted(set(hits)))}"
+    if notes:
+        detail += " | Evidencia semántica: " + "; ".join(notes[:8])
+    return round(score, 2), round(confidence, 2), detail
 
 
 def score_matching(answer, question):
@@ -500,12 +705,32 @@ def score_matching(answer, question):
         left = pair.get("prompt_value", "")
         right = pair.get("correct_match", "")
         weight = float(pair.get("weight", 1.0))
-        ok_left, _ = fuzzy_contains(answer, left, threshold=65)
-        ok_right, _ = fuzzy_contains(answer, right, threshold=65)
+
+        left_variants = [left] + synonym_expansions(left)
+        right_variants = [right] + synonym_expansions(right)
+
+        ok_left = False
+        ok_right = False
+        method_left = ""
+        method_right = ""
+
+        for v in left_variants:
+            ok, score, method = semantic_match(answer, v, threshold=65, semantic_threshold=58)
+            if ok:
+                ok_left = True
+                method_left = method
+                break
+
+        for v in right_variants:
+            ok, score, method = semantic_match(answer, v, threshold=65, semantic_threshold=58)
+            if ok:
+                ok_right = True
+                method_right = method
+                break
 
         if ok_left and ok_right:
             total += weight
-            found.append(f"{left} -> {right}")
+            found.append(f"{left} -> {right} ({method_left}/{method_right})")
 
     confidence = total / max_score if max_score else 0
     return round(min(total, max_score), 2), round(confidence, 2), "Relaciones detectadas: " + "; ".join(found)
@@ -528,7 +753,9 @@ def score_answer(answer, question):
     else:
         score, conf, fb = score_criteria(answer, question)
 
-    status = "aceptado" if conf >= 0.85 else ("revisar" if conf < 0.60 else "aceptado_con_cautela")
+    # Con la capa semántica, una confianza media-alta puede quedar aceptada con cautela
+    # y sólo las respuestas realmente débiles quedan para revisión manual.
+    status = "aceptado" if conf >= 0.82 else ("revisar" if conf < 0.50 else "aceptado_con_cautela")
     return score, conf, fb, status
 
 
@@ -932,7 +1159,7 @@ def base_css():
     """
 
 
-def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v2.4.2 limpio"):
+def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v2.5 semántico"):
     return f"""
     <div class="topbar">
       <div class="brand">
@@ -962,15 +1189,15 @@ def save_template_workbook(kind: str):
 
     if kind == "rubric":
         ws.title = "Modelo_Rubrica"
-        headers = ["pregunta", "tipo", "max_score", "respuestas", "criterios", "required_items", "prompt"]
+        headers = ["pregunta", "tipo", "max_score", "respuestas", "criterios", "variantes_semanticas", "required_items", "prompt"]
         ws.append(headers)
         rows = [
-            ["P1", "criterios", 4, "", "lenguaje; mente; cognición; comprensión", "", "Explique qué estudia la psicolingüística."],
-            ["P2", "VF", 1, "Verdadero", "", "", "La psicolingüística estudia la relación entre lenguaje y cognición."],
-            ["P3", "completion", 2, "memoria de trabajo", "", "", "Complete: La __________ participa activamente en la comprensión del lenguaje."],
-            ["P4", "enumeracion", 3, "memoria; atención; comprensión; inferencia", "", 3, "Mencione tres procesos cognitivos relacionados con la comprensión."],
-            ["P5", "matching", 3, "Broca:producción; Wernicke:comprensión; Hipocampo:memoria", "", "", "Relacione estructura cerebral y función."],
-            ["P6", "criterios", 5, "", "coherencia; cohesión; inferencia; significado; discurso", "", "Explique la importancia de la coherencia en el discurso."]
+            ["P1", "criterios", 4, "", "lenguaje; mente; cognición; comprensión", "procesos mentales; pensamiento; entender; interpretar; significado", "", "Explique qué estudia la psicolingüística."],
+            ["P2", "VF", 1, "Verdadero", "", "", "", "La psicolingüística estudia la relación entre lenguaje y cognición."],
+            ["P3", "completion", 2, "memoria de trabajo", "", "memoria operativa", "", "Complete: La __________ participa activamente en la comprensión del lenguaje."],
+            ["P4", "enumeracion", 3, "memoria; atención; comprensión; inferencia", "", "entender; interpretar; deducir; concentración", 3, "Mencione tres procesos cognitivos relacionados con la comprensión."],
+            ["P5", "matching", 3, "Broca:producción; Wernicke:comprensión; Hipocampo:memoria", "", "", "", "Relacione estructura cerebral y función."],
+            ["P6", "criterios", 5, "", "coherencia; cohesión; inferencia; significado; discurso", "sentido global; conexión de ideas; continuidad temática; texto", "", "Explique la importancia de la coherencia en el discurso."]
         ]
         for row in rows:
             ws.append(row)
@@ -982,6 +1209,7 @@ def save_template_workbook(kind: str):
         info.append(["max_score", "Puntaje máximo de la pregunta."])
         info.append(["respuestas", "Respuestas correctas separadas por punto y coma. Útil para VF, completion, enumeracion y matching."])
         info.append(["criterios", "Conceptos esperados separados por punto y coma. Útil para preguntas abiertas tipo criterios."])
+        info.append(["variantes_semanticas", "Sinónimos, paráfrasis o formas alternativas aceptables separadas por punto y coma. Este campo mejora la robustez semántica."])
         info.append(["required_items", "Número de elementos requeridos. Útil para enumeracion."])
         info.append(["prompt", "Enunciado visible de la pregunta."])
         info.append(["matching", "Para matching use formato Concepto:Respuesta; Concepto:Respuesta."])
@@ -1176,7 +1404,7 @@ def home():
               <div class="feature"><strong>Modelo de Rúbrica</strong>Define preguntas, puntajes y criterios.</div>
               <div class="feature"><strong>Modelo de Respuestas</strong>Organiza estudiantes y respuestas.</div>
               <div class="feature"><strong>Vista previa</strong>Confirma que el formato calza.</div>
-              <div class="feature"><strong>Reporte docente</strong>Entrega puntajes, feedback e insights.</div>
+              <div class="feature"><strong>Capa semántica</strong>Reconoce paráfrasis, sinónimos y coincidencias conceptuales.</div>
             </div>
           </section>
 
@@ -1462,7 +1690,7 @@ async def upload(
     teacher_report_rows.insert(0, {
         "seccion": "Producto",
         "indicador": "Sistema",
-        "valor": "Evalia by Altiora · Inteligencia Evaluativa Automatizada"
+        "valor": "Evalia by Altiora · Inteligencia Evaluativa Automatizada · Capa semántica v2.5"
     })
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -1487,7 +1715,7 @@ async def upload(
         f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultados · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v2.4.2 limpio")}
+          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v2.5 semántico")}
           <section class="result-card">
             <h1>Procesamiento completado</h1>
             <p class="lead">Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong> y generó un reporte Excel explicable.</p>
