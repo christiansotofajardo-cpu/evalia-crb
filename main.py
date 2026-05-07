@@ -11,7 +11,6 @@ from typing import Optional
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.chart import BarChart, PieChart, Reference
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "outputs"
@@ -22,7 +21,7 @@ RUBRICS_DIR.mkdir(exist_ok=True)
 
 LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
-app = FastAPI(title="Evalia CRB", version="2.5")
+app = FastAPI(title="Evalia CRB", version="2.4.1")
 
 
 # ============================================================
@@ -805,271 +804,6 @@ def format_workbook(writer):
             ws.cell(row, 1).font = Font(bold=True)
             ws.cell(row, 2).font = Font(bold=True)
 
-
-# ============================================================
-# PERFILES, DASHBOARD VISUAL Y REPORTE IMPRIMIBLE
-# ============================================================
-
-def profile_config(profile):
-    profiles = {
-        "general": {
-            "label": "General docente",
-            "description": "Evaluación general de respuestas, pruebas y controles.",
-            "high": 80,
-            "medium": 60,
-            "language": "docente"
-        },
-        "escolar": {
-            "label": "Escolar",
-            "description": "Lenguaje simple para uso escolar y apoyo pedagógico.",
-            "high": 75,
-            "medium": 55,
-            "language": "pedagogico"
-        },
-        "universitario": {
-            "label": "Universitario",
-            "description": "Evaluación académica con énfasis en criterios y desempeño conceptual.",
-            "high": 80,
-            "medium": 60,
-            "language": "academico"
-        },
-        "investigacion": {
-            "label": "Investigación",
-            "description": "Reporte más técnico para análisis de instrumentos e ítems.",
-            "high": 80,
-            "medium": 60,
-            "language": "tecnico"
-        },
-        "psicolaboral": {
-            "label": "Psicolaboral",
-            "description": "Evaluación orientada a respuestas abiertas, desempeño y criterios observables.",
-            "high": 85,
-            "medium": 65,
-            "language": "organizacional"
-        }
-    }
-    return profiles.get(profile or "general", profiles["general"])
-
-
-def performance_level_by_profile(percentage, profile):
-    cfg = profile_config(profile)
-    try:
-        pct = float(percentage)
-    except Exception:
-        pct = 0
-    if pct >= cfg["high"]:
-        return "Alto"
-    if pct >= cfg["medium"]:
-        return "Medio"
-    return "Bajo"
-
-
-def profile_teacher_suggestion(profile, problematic_questions):
-    cfg = profile_config(profile)
-    label = cfg["label"]
-
-    if problematic_questions:
-        focus = "Revisar especialmente las preguntas " + ", ".join(problematic_questions) + "."
-    else:
-        focus = "No se detectan preguntas críticas bajo los criterios actuales."
-
-    if profile == "escolar":
-        return f"Perfil {label}: usar los resultados para retroalimentar aprendizajes, identificar contenidos que requieren refuerzo y ajustar instrucciones. {focus}"
-    if profile == "universitario":
-        return f"Perfil {label}: usar el reporte para revisar consistencia de criterios, dificultad de ítems y desempeño conceptual por estudiante. {focus}"
-    if profile == "investigacion":
-        return f"Perfil {label}: usar las métricas de confianza, aceptación y revisión como primera aproximación al comportamiento del instrumento. {focus}"
-    if profile == "psicolaboral":
-        return f"Perfil {label}: interpretar los resultados como apoyo preliminar, manteniendo revisión humana en respuestas críticas o de baja confianza. {focus}"
-    return f"Perfil {label}: usar este reporte como primera capa de inteligencia evaluativa y confirmar manualmente los casos marcados para revisión. {focus}"
-
-
-def add_excel_visual_dashboard(writer, score_rows, insights_rows, profile_name):
-    wb = writer.book
-
-    if "Dashboard_Visual" in wb.sheetnames:
-        del wb["Dashboard_Visual"]
-
-    ws = wb.create_sheet("Dashboard_Visual", 1)
-    ws.sheet_view.showGridLines = False
-
-    title_fill = PatternFill("solid", fgColor="111827")
-    title_font = Font(color="FFFFFF", bold=True, size=13)
-
-    ws["A1"] = "Evalia by Altiora · Dashboard visual"
-    ws["A1"].fill = title_fill
-    ws["A1"].font = title_font
-    ws.merge_cells("A1:F1")
-
-    ws["A3"] = "Perfil de evaluación"
-    ws["B3"] = profile_name
-
-    # Distribución por nivel
-    level_counts = {"Alto": 0, "Medio": 0, "Bajo": 0}
-    for row in score_rows:
-        level = row.get("nivel_desempeno", "Bajo")
-        level_counts[level] = level_counts.get(level, 0) + 1
-
-    ws["A5"] = "Distribución de desempeño"
-    ws["A5"].font = Font(bold=True)
-
-    ws.append(["Nivel", "Estudiantes"])
-    start_dist = 7
-    for level, count in level_counts.items():
-        ws.append([level, count])
-
-    pie = PieChart()
-    labels = Reference(ws, min_col=1, min_row=start_dist, max_row=start_dist + len(level_counts) - 1)
-    data = Reference(ws, min_col=2, min_row=start_dist - 1, max_row=start_dist + len(level_counts) - 1)
-    pie.add_data(data, titles_from_data=True)
-    pie.set_categories(labels)
-    pie.title = "Distribución por nivel"
-    pie.height = 7
-    pie.width = 9
-    ws.add_chart(pie, "D5")
-
-    # Promedio por pregunta
-    q_start = start_dist + len(level_counts) + 4
-    ws.cell(q_start, 1, "Promedio por pregunta")
-    ws.cell(q_start, 1).font = Font(bold=True)
-    ws.cell(q_start + 1, 1, "Pregunta")
-    ws.cell(q_start + 1, 2, "Promedio %")
-
-    for i, item in enumerate(insights_rows, start=q_start + 2):
-        ws.cell(i, 1, item.get("pregunta", ""))
-        ws.cell(i, 2, item.get("promedio_porcentaje", 0))
-
-    if insights_rows:
-        bar = BarChart()
-        data = Reference(ws, min_col=2, min_row=q_start + 1, max_row=q_start + 1 + len(insights_rows))
-        cats = Reference(ws, min_col=1, min_row=q_start + 2, max_row=q_start + 1 + len(insights_rows))
-        bar.add_data(data, titles_from_data=True)
-        bar.set_categories(cats)
-        bar.title = "Promedio por pregunta"
-        bar.y_axis.title = "%"
-        bar.x_axis.title = "Pregunta"
-        bar.height = 7
-        bar.width = 12
-        ws.add_chart(bar, "D18")
-
-    for col in range(1, 7):
-        ws.column_dimensions[get_column_letter(col)].width = 22
-
-    for row in ws.iter_rows():
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-
-
-def build_printable_report_html(
-    output_html_path,
-    rubric_name,
-    profile_name,
-    score_rows,
-    insights_rows,
-    interpretation,
-    problematic_questions,
-    auto_rate,
-    review_rate,
-    caution_rate
-):
-    total_students = len(score_rows)
-    avg_pct = 0
-    if score_rows:
-        avg_pct = sum(float(r.get("porcentaje", 0)) for r in score_rows) / len(score_rows)
-
-    level_counts = {"Alto": 0, "Medio": 0, "Bajo": 0}
-    for row in score_rows:
-        level_counts[row.get("nivel_desempeno", "Bajo")] = level_counts.get(row.get("nivel_desempeno", "Bajo"), 0) + 1
-
-    difficult = ", ".join(problematic_questions) if problematic_questions else "Sin preguntas críticas"
-
-    item_rows = ""
-    for item in insights_rows:
-        item_rows += f"""
-        <tr>
-          <td>{escape(str(item.get('pregunta', '')))}</td>
-          <td>{escape(str(item.get('tipo_item', '')))}</td>
-          <td>{escape(str(item.get('promedio_porcentaje', '')))}%</td>
-          <td>{escape(str(item.get('revision_pct', '')))}%</td>
-          <td>{escape(str(item.get('clasificacion_evalia', '')))}</td>
-        </tr>
-        """
-
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="es">
-    <head>
-      <meta charset="UTF-8">
-      <title>Reporte Docente · Evalia by Altiora</title>
-      <style>
-        body {{ font-family: Arial, sans-serif; color:#111827; margin: 36px; }}
-        .top {{ display:flex; justify-content:space-between; align-items:flex-start; border-bottom:4px solid #111827; padding-bottom:14px; }}
-        h1 {{ margin:0; font-size:30px; }}
-        .muted {{ color:#667085; }}
-        .grid {{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:24px 0; }}
-        .card {{ border:1px solid #e5e7eb; border-radius:14px; padding:14px; }}
-        .value {{ font-size:24px; font-weight:800; }}
-        .section {{ margin-top:24px; }}
-        table {{ width:100%; border-collapse:collapse; margin-top:10px; }}
-        th {{ background:#111827; color:white; text-align:left; padding:8px; }}
-        td {{ border:1px solid #e5e7eb; padding:8px; vertical-align:top; }}
-        .print {{ margin-top:20px; }}
-        button {{ background:#111827; color:white; border:0; border-radius:10px; padding:10px 14px; font-weight:700; }}
-        @media print {{ .print {{ display:none; }} body {{ margin:18px; }} }}
-      </style>
-    </head>
-    <body>
-      <div class="top">
-        <div>
-          <h1>Reporte docente</h1>
-          <div class="muted">Evalia by Altiora · Inteligencia que eleva posibilidades</div>
-        </div>
-        <div class="muted">Perfil: <strong>{escape(profile_name)}</strong></div>
-      </div>
-
-      <div class="grid">
-        <div class="card"><div class="value">{total_students}</div><div class="muted">estudiantes</div></div>
-        <div class="card"><div class="value">{avg_pct:.1f}%</div><div class="muted">promedio general</div></div>
-        <div class="card"><div class="value">{auto_rate}%</div><div class="muted">aceptación automática</div></div>
-        <div class="card"><div class="value">{review_rate}%</div><div class="muted">requiere revisión</div></div>
-      </div>
-
-      <div class="section">
-        <h2>Síntesis</h2>
-        <p><strong>Rúbrica:</strong> {escape(rubric_name)}</p>
-        <p><strong>Preguntas críticas:</strong> {escape(difficult)}</p>
-        <p>{escape(interpretation)}</p>
-      </div>
-
-      <div class="section">
-        <h2>Distribución de desempeño</h2>
-        <table>
-          <tr><th>Nivel</th><th>Estudiantes</th></tr>
-          <tr><td>Alto</td><td>{level_counts.get("Alto",0)}</td></tr>
-          <tr><td>Medio</td><td>{level_counts.get("Medio",0)}</td></tr>
-          <tr><td>Bajo</td><td>{level_counts.get("Bajo",0)}</td></tr>
-        </table>
-      </div>
-
-      <div class="section">
-        <h2>Análisis por pregunta</h2>
-        <table>
-          <tr>
-            <th>Pregunta</th><th>Tipo</th><th>Promedio</th><th>Revisión</th><th>Clasificación</th>
-          </tr>
-          {item_rows}
-        </table>
-      </div>
-
-      <div class="print">
-        <button onclick="window.print()">Imprimir o guardar como PDF</button>
-      </div>
-    </body>
-    </html>
-    """
-    output_html_path.write_text(html, encoding="utf-8")
-    return output_html_path
-
 # ============================================================
 # CSS/UI
 # ============================================================
@@ -1198,7 +932,7 @@ def base_css():
     """
 
 
-def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v2.5 visual"):
+def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v2.4.1 foco docente"):
     return f"""
     <div class="topbar">
       <div class="brand">
@@ -1227,46 +961,68 @@ def save_template_workbook(kind: str):
     ws = wb.active
 
     if kind == "rubric":
-        ws.title = "Rubrica"
+        ws.title = "Modelo_Rubrica"
         headers = ["pregunta", "tipo", "max_score", "respuestas", "criterios", "required_items", "prompt"]
         ws.append(headers)
         rows = [
-            ["P1", "criterios", 3, "", "lenguaje; mente; psicolingüística", "", "Explique qué estudia la psicolingüística."],
+            ["P1", "criterios", 4, "", "lenguaje; mente; cognición; comprensión", "", "Explique qué estudia la psicolingüística."],
             ["P2", "VF", 1, "Verdadero", "", "", "La psicolingüística estudia la relación entre lenguaje y cognición."],
-            ["P3", "enumeracion", 2, "memoria; atención; comprensión", "", 2, "Mencione dos procesos cognitivos relacionados con la comprensión."],
-            ["P4", "matching", 2, "Broca:producción; Wernicke:comprensión", "", "", "Relacione las áreas cerebrales con su función."]
+            ["P3", "completion", 2, "memoria de trabajo", "", "", "Complete: La __________ participa activamente en la comprensión del lenguaje."],
+            ["P4", "enumeracion", 3, "memoria; atención; comprensión; inferencia", "", 3, "Mencione tres procesos cognitivos relacionados con la comprensión."],
+            ["P5", "matching", 3, "Broca:producción; Wernicke:comprensión; Hipocampo:memoria", "", "", "Relacione estructura cerebral y función."],
+            ["P6", "criterios", 5, "", "coherencia; cohesión; inferencia; significado; discurso", "", "Explique la importancia de la coherencia en el discurso."]
         ]
         for row in rows:
             ws.append(row)
-        filename = "template_rubrica_evalia.xlsx"
+
+        info = wb.create_sheet("Instrucciones")
+        info.append(["Campo", "Qué debe completar el docente"])
+        info.append(["pregunta", "Código de la pregunta. Ejemplo: P1, P2, P3."])
+        info.append(["tipo", "Use: criterios, VF, completion, enumeracion o matching."])
+        info.append(["max_score", "Puntaje máximo de la pregunta."])
+        info.append(["respuestas", "Respuestas correctas separadas por punto y coma. Útil para VF, completion, enumeracion y matching."])
+        info.append(["criterios", "Conceptos esperados separados por punto y coma. Útil para preguntas abiertas tipo criterios."])
+        info.append(["required_items", "Número de elementos requeridos. Útil para enumeracion."])
+        info.append(["prompt", "Enunciado visible de la pregunta."])
+        info.append(["matching", "Para matching use formato Concepto:Respuesta; Concepto:Respuesta."])
+        filename = "modelo_rubrica_evalia.xlsx"
 
     else:
-        ws.title = "Respuestas"
-        headers = ["student_id", "nombre", "P1", "P2", "P3", "P4"]
+        ws.title = "Modelo_Respuestas"
+        headers = ["student_id", "nombre", "P1", "P2", "P3", "P4", "P5", "P6"]
         ws.append(headers)
         rows = [
-            ["A01", "Ana Pérez", "La psicolingüística estudia el lenguaje, la mente y la comprensión.", "Verdadero", "memoria; comprensión", "Broca producción; Wernicke comprensión"],
-            ["A02", "Luis Soto", "Estudia el lenguaje y procesos mentales.", "V", "atención", "Broca producción"],
-            ["A03", "Camila Díaz", "", "Falso", "memoria; atención; comprensión", "Wernicke comprensión; Broca producción"]
+            ["A01", "Ana Pérez", "La psicolingüística estudia el lenguaje, la mente, la cognición y la comprensión.", "Verdadero", "memoria de trabajo", "memoria; atención; comprensión", "Broca producción; Wernicke comprensión; Hipocampo memoria", "La coherencia permite mantener significado y cohesión en el discurso mediante inferencias."],
+            ["A02", "Luis Soto", "Estudia el lenguaje y procesos mentales.", "V", "memoria", "memoria; atención", "Broca producción", "La coherencia ayuda a comprender mejor el significado del discurso."],
+            ["A03", "Camila Díaz", "", "Falso", "memoria de trabajo", "comprensión; inferencia; memoria; atención", "Wernicke comprensión; Hipocampo memoria", "La cohesión y coherencia ayudan a construir significado."]
         ]
         for row in rows:
             ws.append(row)
-        filename = "template_respuestas_evalia.xlsx"
+
+        info = wb.create_sheet("Instrucciones")
+        info.append(["Campo", "Qué debe completar el docente"])
+        info.append(["student_id", "Identificador del estudiante. Puede ser código, número o rut interno."])
+        info.append(["nombre", "Nombre del estudiante."])
+        info.append(["P1, P2, P3...", "Respuesta del estudiante para cada pregunta. Debe coincidir con los códigos de la rúbrica."])
+        info.append(["Nota", "Evalia también reconoce equivalencias como Q1, pregunta1 o item1, pero se recomienda usar P1, P2, P3."])
+        filename = "modelo_respuestas_evalia.xlsx"
 
     header_fill = PatternFill("solid", fgColor="111827")
     header_font = Font(color="FFFFFF", bold=True)
-    for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center")
 
-    for col in range(1, ws.max_column + 1):
-        ws.column_dimensions[get_column_letter(col)].width = 24
+    for sheet in wb.worksheets:
+        if sheet.max_row >= 1:
+            for cell in sheet[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        for col in range(1, sheet.max_column + 1):
+            sheet.column_dimensions[get_column_letter(col)].width = 30
 
     path = OUTPUT_DIR / filename
     wb.save(path)
     return path
-
 
 @app.get("/download-template/rubric")
 def download_rubric_template():
@@ -1292,7 +1048,6 @@ def download_response_template():
 async def preview_upload(
     file: UploadFile = File(...),
     rubric_selector: str = Form(""),
-    evaluation_profile: str = Form("general"),
     rubric_file: Optional[UploadFile] = File(None)
 ):
     try:
@@ -1331,7 +1086,6 @@ async def preview_upload(
             "questions": int(len(questions)),
             "columns": [str(c) for c in df.columns],
             "types": type_counts,
-            "profile": profile_config(evaluation_profile)["label"],
             "detected": detected,
             "missing": missing
         })
@@ -1370,22 +1124,22 @@ def home():
             <div class="hero-inner">
               <h1>Evalúa respuestas. Detecta patrones. Mejora evaluaciones.</h1>
               <p class="lead">
-                Evalia permite usar rúbricas predefinidas o subir una rúbrica simple en Excel.
-                Descarga los modelos, completa tus datos y sube ambos archivos para generar un reporte docente explicable.
+                Evalia trabaja con dos modelos oficiales: Modelo de Rúbrica y Modelo de Respuestas.
+                Descárgalos, complétalos y sube ambos archivos para generar un reporte docente explicable.
               </p>
 
               <div class="templates">
                 <div class="template-card">
                   <div>
-                    <strong>Modelo de rúbrica</strong>
-                    <span>Columnas: pregunta, tipo, max_score, respuestas, criterios.</span>
+                    <strong>Modelo de Rúbrica</strong>
+                    <span>Formato oficial para definir preguntas, tipo, puntaje, respuestas y criterios.</span>
                   </div>
                   <a class="button outline" href="/download-template/rubric">Descargar</a>
                 </div>
                 <div class="template-card">
                   <div>
-                    <strong>Modelo de respuestas</strong>
-                    <span>Columnas: student_id, nombre y P1/P2/P3...</span>
+                    <strong>Modelo de Respuestas</strong>
+                    <span>Formato oficial para cargar estudiantes y respuestas por pregunta.</span>
                   </div>
                   <a class="button outline" href="/download-template/responses">Descargar</a>
                 </div>
@@ -1394,43 +1148,33 @@ def home():
               <form action="/upload" enctype="multipart/form-data" method="post" id="uploadForm">
                 <div class="panel">
 
-
-                  <label class="field-label" for="evaluation_profile">Perfil de evaluación</label>
-                  <select name="evaluation_profile" id="evaluation_profile">
-                    <option value="general">General docente</option>
-                    <option value="escolar">Escolar</option>
-                    <option value="universitario">Universitario</option>
-                    <option value="investigacion">Investigación</option>
-                    <option value="psicolaboral">Psicolaboral</option>
-                  </select>
-
-                  <label class="field-label" for="rubric_selector">Rúbrica predefinida</label>
+                  <label class="field-label" for="rubric_selector">Rúbrica predefinida de prueba</label>
                   <select name="rubric_selector" id="rubric_selector">
                     {rubric_options}
                   </select>
 
-                  <label class="field-label">O sube una rúbrica propia en Excel/JSON</label>
+                  <label class="field-label">Sube tu Modelo de Rúbrica completo</label>
                   <div class="dropzone">
                     <input name="rubric_file" id="rubricFileInput" type="file" accept=".xlsx,.xls,.json">
                     <div class="drop-icon">🧩</div>
-                    <div class="drop-title">Sube rúbrica simple</div>
-                    <div class="drop-subtitle">Excel con columnas: pregunta, tipo, max_score, respuestas, criterios</div>
+                    <div class="drop-title">Sube el Modelo de Rúbrica</div>
+                    <div class="drop-subtitle">Debe seguir el formato oficial descargable</div>
                     <div class="file-name" id="rubricFileName"></div>
                   </div>
 
-                  <label class="field-label">Archivo de respuestas</label>
+                  <label class="field-label">Sube tu Modelo de Respuestas completo</label>
                   <div class="dropzone">
                     <input name="file" id="fileInput" type="file" accept=".xlsx,.xls" required>
                     <div class="drop-icon">📄</div>
-                    <div class="drop-title">Arrastra tu Excel aquí</div>
-                    <div class="drop-subtitle">Formatos .xlsx / .xls · acepta P1, Q1, pregunta1 o item1</div>
+                    <div class="drop-title">Sube el Modelo de Respuestas</div>
+                    <div class="drop-subtitle">Debe seguir el formato oficial descargable</div>
                     <div class="file-name" id="fileName"></div>
                   </div>
 
                   <div class="actions">
                     <button type="button" class="secondary" id="previewBtn">Previsualizar</button>
                     <button type="submit" id="submitBtn">Evaluar respuestas</button>
-                    <span class="hint">Si subes rúbrica propia, Evalia la usará por sobre la predefinida.</span>
+                    <span class="hint">Usa preferentemente los modelos oficiales descargables para evitar errores de formato.</span>
                   </div>
 
                   <div class="preview-box" id="previewBox"></div>
@@ -1444,10 +1188,10 @@ def home():
             </div>
 
             <div class="features">
-              <div class="feature"><strong>Modelos descargables</strong>Rúbrica y respuestas listas para completar.</div>
-              <div class="feature"><strong>Preview inteligente</strong>Detecta estudiantes, preguntas y columnas.</div>
-              <div class="feature"><strong>Progreso visual</strong>Muestra etapas del procesamiento.</div>
-              <div class="feature"><strong>Evalia by Altiora</strong>Reporte explicable para uso docente.</div>
+              <div class="feature"><strong>Modelo de Rúbrica</strong>Define preguntas, puntajes y criterios.</div>
+              <div class="feature"><strong>Modelo de Respuestas</strong>Organiza estudiantes y respuestas.</div>
+              <div class="feature"><strong>Vista previa</strong>Confirma que el formato calza.</div>
+              <div class="feature"><strong>Reporte docente</strong>Entrega puntajes, feedback e insights.</div>
             </div>
           </section>
 
@@ -1526,7 +1270,6 @@ def home():
                   '<div class="preview-title">Vista previa detectada</div>' +
                   '<span class="preview-ok">Formato compatible.</span><br>' +
                   '<strong>Rúbrica:</strong> ' + json.rubric + '<br>' +
-                  '<strong>Perfil:</strong> ' + json.profile + '<br>' +
                   '<strong>Estudiantes:</strong> ' + json.students + '<br>' +
                   '<strong>Preguntas:</strong> ' + json.questions + '<br>' +
                   '<strong>Tipos:</strong> ' + types + '<br>' +
@@ -1564,7 +1307,6 @@ def home():
 async def upload(
     file: UploadFile = File(...),
     rubric_selector: str = Form(""),
-    evaluation_profile: str = Form("general"),
     rubric_file: Optional[UploadFile] = File(None)
 ):
     try:
@@ -1576,7 +1318,7 @@ async def upload(
         return HTMLResponse(
             f"""
             <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Error · Evalia</title>{base_css()}</head>
-            <body><div class="page"><main class="shell">{shell_topbar("Error de carga", "v2.5 visual")}<div class="result-card">
+            <body><div class="page"><main class="shell">{shell_topbar("Error de carga", "v2.4 docente")}<div class="result-card">
               <div class="error"><strong>Error al cargar la rúbrica.</strong><br>{escape(str(e))}</div>
               <br><a class="button" href="/">Volver</a>
             </div>{footer_altiora()}</main></div></body></html>
@@ -1593,7 +1335,7 @@ async def upload(
         return HTMLResponse(
             f"""
             <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Error · Evalia</title>{base_css()}</head>
-            <body><div class="page"><main class="shell">{shell_topbar("Error de lectura", "v2.5 visual")}<div class="result-card">
+            <body><div class="page"><main class="shell">{shell_topbar("Error de lectura", "v2.4 docente")}<div class="result-card">
               <div class="error"><strong>No se pudo leer el Excel.</strong><br>{escape(str(e))}</div>
               <br><a class="button" href="/">Volver</a>
             </div>{footer_altiora()}</main></div></body></html>
@@ -1606,7 +1348,7 @@ async def upload(
         return HTMLResponse(
             f"""
             <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Error de formato · Evalia</title>{base_css()}</head>
-            <body><div class="page"><main class="shell">{shell_topbar("Error de formato", "v2.5 visual")}<div class="result-card">
+            <body><div class="page"><main class="shell">{shell_topbar("Error de formato", "v2.4 docente")}<div class="result-card">
               <h1>Error de formato</h1>
               <div class="error"><strong>Faltan columnas requeridas o equivalentes:</strong><br>{escape(", ".join(missing))}</div>
               <p class="lead">Evalia acepta equivalencias como <code>P1/Q1/pregunta1/item1</code>, pero no encontró columnas suficientes.</p>
@@ -1688,12 +1430,11 @@ async def upload(
         total_score = float(selected_rubric.get("total_score", 0)) or sum(float(p.get("max_score", 0)) for p in questions) or 1
         score_row["total"] = round(total, 2)
         score_row["porcentaje"] = round((total / total_score) * 100, 2)
-        score_row["nivel_desempeno"] = performance_level_by_profile(score_row["porcentaje"], evaluation_profile)
+        score_row["nivel_desempeno"] = performance_level(score_row["porcentaje"])
         score_rows.append(score_row)
         conf_rows.append(conf_row)
 
     rubric_name = selected_rubric.get("_rubric_display_name", selected_rubric.get("name", "Rúbrica"))
-    profile_name = profile_config(evaluation_profile)["label"]
     insights_rows, problematic_questions = build_question_insights(question_stats, questions)
     type_insights_rows = build_type_insights(insights_rows)
     interpretation = build_interpretation(insights_rows, problematic_questions, len(df), rubric_name)
@@ -1738,16 +1479,6 @@ async def upload(
         "indicador": "Sistema",
         "valor": "Evalia by Altiora · Inteligencia Evaluativa Automatizada"
     })
-    teacher_report_rows.insert(1, {
-        "seccion": "Perfil",
-        "indicador": "Tipo de evaluación",
-        "valor": profile_name
-    })
-    teacher_report_rows.append({
-        "seccion": "Sugerencia",
-        "indicador": "Lectura según perfil",
-        "valor": profile_teacher_suggestion(evaluation_profile, problematic_questions)
-    })
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         pd.DataFrame(teacher_report_rows).to_excel(writer, sheet_name="REPORTE_DOCENTE", index=False)
@@ -1764,21 +1495,6 @@ async def upload(
         }]).to_excel(writer, sheet_name="Interpretacion", index=False)
 
         format_workbook(writer)
-        add_excel_visual_dashboard(writer, score_rows, insights_rows, profile_name)
-
-    html_report_name = output_path.with_suffix(".html").name
-    build_printable_report_html(
-        output_html_path=OUTPUT_DIR / html_report_name,
-        rubric_name=rubric_name,
-        profile_name=profile_name,
-        score_rows=score_rows,
-        insights_rows=insights_rows,
-        interpretation=interpretation,
-        problematic_questions=problematic_questions,
-        auto_rate=auto_rate,
-        review_rate=review_rate,
-        caution_rate=caution_rate
-    )
 
     problematic_display = ", ".join(problematic_questions) if problematic_questions else "Sin preguntas críticas"
 
@@ -1786,10 +1502,10 @@ async def upload(
         f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultados · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v2.5 visual")}
+          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v2.4.1 foco docente")}
           <section class="result-card">
             <h1>Procesamiento completado</h1>
-            <p class="lead">Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong> con perfil <strong>{escape(profile_name)}</strong> y generó un reporte Excel explicable.</p>
+            <p class="lead">Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong> y generó un reporte Excel explicable.</p>
             <div class="metric-grid">
               <div class="metric"><div class="metric-value">{len(df)}</div><div class="metric-label">estudiante(s)</div></div>
               <div class="metric"><div class="metric-value">{len(questions)}</div><div class="metric-label">preguntas evaluadas</div></div>
@@ -1799,7 +1515,6 @@ async def upload(
             <p class="lead"><strong>Insight inicial:</strong> {escape(problematic_display)}</p>
             <div class="actions">
               <a class="button" href="/download/{output_name}">Descargar reporte Excel</a>
-              <a class="button secondary" href="/download/{html_report_name}">Ver reporte imprimible/PDF</a>
               <a class="button secondary" href="/">Evaluar otro archivo</a>
             </div>
           </section>
