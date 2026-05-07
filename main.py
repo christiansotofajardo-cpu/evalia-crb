@@ -7,31 +7,158 @@ import re
 import unicodedata
 from rapidfuzz import fuzz
 from html import escape
+from typing import Optional
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# Evalia v2.1: multi-rúbrica + insights evaluativos
 RUBRICS_DIR = BASE_DIR / "rubrics"
 RUBRICS_DIR.mkdir(exist_ok=True)
 
-# Compatibilidad con la versión anterior.
 LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
-app = FastAPI(title="Evalia CRB", version="2.1")
+app = FastAPI(title="Evalia CRB", version="2.2")
 
 
 # ============================================================
-# UTILIDADES DE RÚBRICAS
+# NORMALIZACIÓN GENERAL
+# ============================================================
+
+def normalize_text(text):
+    if pd.isna(text):
+        return ""
+    text = str(text).strip().lower()
+    text = "".join(
+        c for c in unicodedata.normalize("NFD", text)
+        if unicodedata.category(c) != "Mn"
+    )
+    text = re.sub(r"[^a-z0-9ñ\s/._-]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def split_values(value):
+    if pd.isna(value) or value is None:
+        return []
+    txt = str(value).strip()
+    if not txt:
+        return []
+    parts = re.split(r"\s*[|;]\s*", txt)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def normalize_item_type(value):
+    t = normalize_text(value).replace(" ", "_")
+
+    mapping = {
+        "vf": "true_false",
+        "v_f": "true_false",
+        "verdadero_falso": "true_false",
+        "true_false": "true_false",
+        "truefalse": "true_false",
+
+        "completacion": "completion",
+        "completación": "completion",
+        "completion": "completion",
+        "exacta": "short_exact_answer",
+        "respuesta_exacta": "short_exact_answer",
+        "short_exact_answer": "short_exact_answer",
+
+        "enumeracion": "enumeration_conceptual",
+        "enumeración": "enumeration_conceptual",
+        "enumeration": "enumeration_conceptual",
+        "enumeration_conceptual": "enumeration_conceptual",
+        "lista": "enumeration_conceptual",
+
+        "matching": "classification_matching",
+        "emparejamiento": "classification_matching",
+        "relacion": "classification_matching",
+        "relación": "classification_matching",
+        "classification_matching": "classification_matching",
+
+        "criterios": "criteria",
+        "criterio": "criteria",
+        "abierta": "criteria",
+        "respuesta_abierta": "criteria",
+        "criteria": "criteria",
+    }
+
+    return mapping.get(t, t or "criteria")
+
+
+def normalize_column_name(name):
+    n = normalize_text(name)
+    n = n.replace(" ", "")
+    n = n.replace("-", "_")
+    n = n.replace(".", "_")
+    return n
+
+
+def item_number(item_id):
+    m = re.search(r"(\d+)", str(item_id))
+    return m.group(1) if m else None
+
+
+def item_aliases(item_id):
+    """
+    Permite que una pregunta definida como P1 pueda calzar con Q1,
+    pregunta_1, pregunta1, item1, item_1, etc.
+    """
+    raw = str(item_id).strip()
+    n = item_number(raw)
+
+    aliases = {raw, raw.upper(), raw.lower(), normalize_column_name(raw)}
+
+    if n:
+        aliases.update({
+            f"P{n}", f"p{n}",
+            f"Q{n}", f"q{n}",
+            f"pregunta{n}", f"pregunta_{n}",
+            f"item{n}", f"item_{n}",
+            f"i{n}", f"I{n}",
+        })
+
+    return {normalize_column_name(a) for a in aliases}
+
+
+def find_column(df, desired_name, extra_aliases=None):
+    normalized_cols = {normalize_column_name(c): c for c in df.columns}
+    aliases = {normalize_column_name(desired_name)}
+
+    if extra_aliases:
+        aliases.update(normalize_column_name(a) for a in extra_aliases)
+
+    for a in aliases:
+        if a in normalized_cols:
+            return normalized_cols[a]
+
+    return None
+
+
+def find_item_column(df, item_id):
+    normalized_cols = {normalize_column_name(c): c for c in df.columns}
+    for alias in item_aliases(item_id):
+        if alias in normalized_cols:
+            return normalized_cols[alias]
+    return None
+
+
+def get_student_id(row, df):
+    col = find_column(df, "student_id", ["id", "alumno_id", "estudiante_id", "rut", "codigo", "código"])
+    return row.get(col, "") if col else ""
+
+
+def get_student_name(row, df):
+    col = find_column(df, "nombre", ["name", "student_name", "alumno", "estudiante", "nombre_estudiante"])
+    return row.get(col, "") if col else ""
+
+
+# ============================================================
+# RÚBRICAS JSON Y EXCEL
 # ============================================================
 
 def get_available_rubrics():
-    """
-    Busca todas las rúbricas JSON disponibles en /rubrics.
-    Si no hay rúbricas en /rubrics, intenta usar la rúbrica antigua
-    ubicada en la raíz del proyecto.
-    """
     rubrics = []
 
     for path in sorted(RUBRICS_DIR.glob("*.json")):
@@ -52,7 +179,6 @@ def get_available_rubrics():
         try:
             with open(LEGACY_RUBRIC_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-
             rubric_name = data.get("name") or data.get("title") or "Psicolingüística 2026"
             rubrics.append({
                 "filename": LEGACY_RUBRIC_PATH.name,
@@ -66,22 +192,27 @@ def get_available_rubrics():
 
 
 def safe_rubric_path(selected_filename):
-    """
-    Evita path traversal. Solo permite cargar rúbricas disponibles.
-    """
-    available = get_available_rubrics()
-    for r in available:
+    for r in get_available_rubrics():
         if r["filename"] == selected_filename:
             return r["path"]
     return None
 
 
-def load_rubric(selected_filename=None):
+def load_rubric_from_json_path(path):
+    with open(path, "r", encoding="utf-8") as f:
+        rubric = json.load(f)
+
+    rubric["_rubric_filename"] = path.name
+    rubric["_rubric_display_name"] = rubric.get("name") or rubric.get("title") or path.stem.replace("_", " ").title()
+    return rubric
+
+
+def load_selected_rubric(selected_filename=None):
     available = get_available_rubrics()
 
     if not available:
         raise FileNotFoundError(
-            "No se encontraron rúbricas JSON. Crea la carpeta /rubrics y agrega al menos una rúbrica .json."
+            "No se encontraron rúbricas JSON en /rubrics ni rúbrica antigua en la raíz."
         )
 
     if selected_filename:
@@ -91,30 +222,158 @@ def load_rubric(selected_filename=None):
     else:
         path = available[0]["path"]
 
-    with open(path, "r", encoding="utf-8") as f:
-        rubric = json.load(f)
+    return load_rubric_from_json_path(path)
 
-    rubric["_rubric_filename"] = path.name
-    rubric["_rubric_display_name"] = rubric.get("name") or rubric.get("title") or path.stem.replace("_", " ").title()
+
+def build_question_from_excel_row(row):
+    """
+    Formato simple de rúbrica Excel esperado:
+
+    pregunta | tipo | max_score | respuestas | criterios | required_items | prompt
+
+    Ejemplos:
+    P1 | criterios | 3 | lenguaje; mente; psicolingüística | lenguaje; mente; psicolingüística | |
+    P2 | VF | 1 | V | | |
+    P3 | enumeracion | 2 | memoria; atención; comprensión | | 2 |
+    P4 | matching | 3 | Broca:producción; Wernicke:comprensión | | |
+    """
+    qid = str(row.get("pregunta", "")).strip() or str(row.get("id", "")).strip()
+    item_type = normalize_item_type(row.get("tipo", row.get("item_type", "criteria")))
+    max_score = float(row.get("max_score", row.get("puntaje", row.get("puntaje_maximo", 1))) or 1)
+    prompt = "" if pd.isna(row.get("prompt", "")) else str(row.get("prompt", ""))
+
+    respuestas = split_values(row.get("respuestas", row.get("accepted_answers", "")))
+    criterios = split_values(row.get("criterios", row.get("criteria", "")))
+
+    question = {
+        "id": qid,
+        "item_type": item_type,
+        "max_score": max_score,
+        "prompt": prompt
+    }
+
+    if item_type == "true_false":
+        question["accepted_answers"] = respuestas or ["V", "Verdadero"]
+
+    elif item_type in ["completion", "short_exact_answer"]:
+        question["accepted_answers"] = respuestas
+
+    elif item_type in ["enumeration", "enumeration_conceptual", "enumeration_closed", "enumeration_categorized"]:
+        question["accepted_answers"] = respuestas
+        required = row.get("required_items", row.get("required_number_of_items", ""))
+        if not pd.isna(required) and str(required).strip():
+            question["constraints"] = {"required_number_of_items": int(float(required))}
+
+    elif item_type == "classification_matching":
+        pairs = []
+        for pair_txt in respuestas:
+            if ":" in pair_txt:
+                left, right = pair_txt.split(":", 1)
+            elif "->" in pair_txt:
+                left, right = pair_txt.split("->", 1)
+            else:
+                continue
+            pairs.append({
+                "prompt_value": left.strip(),
+                "correct_match": right.strip(),
+                "weight": max_score / max(len(respuestas), 1)
+            })
+        question["pairs"] = pairs
+
+    else:
+        # criteria / abierta
+        concepts = criterios or respuestas
+        criteria = []
+        weight = max_score / max(len(concepts), 1)
+        for c in concepts:
+            criteria.append({
+                "concept": c,
+                "weight": weight,
+                "semantic_variants": [c],
+                "accepted_values": []
+            })
+        question["item_type"] = "criteria"
+        question["criteria"] = criteria
+
+    return question
+
+
+def load_rubric_from_excel(path):
+    df = pd.read_excel(path)
+
+    # Normalizar encabezados para aceptar nombres simples.
+    original_cols = list(df.columns)
+    col_map = {}
+    for c in original_cols:
+        nc = normalize_column_name(c)
+        if nc in ["pregunta", "id", "item", "item_id"]:
+            col_map[c] = "pregunta"
+        elif nc in ["tipo", "item_type", "tipo_item"]:
+            col_map[c] = "tipo"
+        elif nc in ["max_score", "puntaje", "puntajemaximo", "puntaje_maximo"]:
+            col_map[c] = "max_score"
+        elif nc in ["respuestas", "accepted_answers", "respuesta", "respuestascorrectas", "respuesta_correcta"]:
+            col_map[c] = "respuestas"
+        elif nc in ["criterios", "criteria", "conceptos", "concepts"]:
+            col_map[c] = "criterios"
+        elif nc in ["required_items", "required_number_of_items", "numero_requerido", "n_requerido"]:
+            col_map[c] = "required_items"
+        elif nc in ["prompt", "enunciado", "pregunta_texto"]:
+            col_map[c] = "prompt"
+
+    df = df.rename(columns=col_map)
+
+    if "pregunta" not in df.columns:
+        raise ValueError("La rúbrica Excel debe incluir una columna llamada 'pregunta'.")
+
+    questions = []
+    total_score = 0.0
+
+    for _, row in df.iterrows():
+        if pd.isna(row.get("pregunta", "")) or not str(row.get("pregunta", "")).strip():
+            continue
+        q = build_question_from_excel_row(row)
+        questions.append(q)
+        total_score += float(q.get("max_score", 0))
+
+    if not questions:
+        raise ValueError("La rúbrica Excel no contiene preguntas válidas.")
+
+    required_columns = ["student_id", "nombre"] + [q["id"] for q in questions]
+
+    rubric = {
+        "name": path.stem.replace("_", " ").title(),
+        "total_score": total_score,
+        "input_format": {
+            "required_columns": required_columns
+        },
+        "questions": questions,
+        "_rubric_filename": path.name,
+        "_rubric_display_name": path.stem.replace("_", " ").title()
+    }
+
     return rubric
+
+
+async def load_uploaded_rubric(rubric_file: UploadFile):
+    suffix = Path(rubric_file.filename).suffix.lower()
+    temp_path = OUTPUT_DIR / f"uploaded_rubric_{rubric_file.filename}"
+
+    with open(temp_path, "wb") as f:
+        f.write(await rubric_file.read())
+
+    if suffix == ".json":
+        return load_rubric_from_json_path(temp_path)
+
+    if suffix in [".xlsx", ".xls"]:
+        return load_rubric_from_excel(temp_path)
+
+    raise ValueError("La rúbrica debe estar en formato .json, .xlsx o .xls.")
 
 
 # ============================================================
 # MOTOR CRB
 # ============================================================
-
-def normalize_text(text):
-    if pd.isna(text):
-        return ""
-    text = str(text).strip().lower()
-    text = "".join(
-        c for c in unicodedata.normalize("NFD", text)
-        if unicodedata.category(c) != "Mn"
-    )
-    text = re.sub(r"[^a-z0-9ñ\s/.-]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
 
 def fuzzy_contains(answer, target, threshold=78):
     answer_n = normalize_text(answer)
@@ -205,29 +464,6 @@ def score_enumeration(answer, question):
     required = question.get("constraints", {}).get("required_number_of_items")
     accepted = question.get("accepted_concepts", question.get("accepted_answers", []))
 
-    if isinstance(accepted, dict):
-        total_hits = 0
-        total_required = 0
-        details = []
-
-        for cat, vals in accepted.items():
-            cat_hits = 0
-            for v in vals:
-                ok, _ = fuzzy_contains(answer, v, threshold=68)
-                if ok:
-                    cat_hits += 1
-
-            needed = question.get("constraints", {}).get("min_per_category", 1)
-            counted = min(cat_hits, needed)
-            total_hits += counted
-            total_required += needed
-            details.append(f"{cat}: {counted}/{needed}")
-
-        score = max_score * (total_hits / total_required) if total_required else 0
-        conf = min(1.0, total_hits / total_required) if total_required else 0
-
-        return round(score, 2), round(conf, 2), "Enumeración categorizada: " + "; ".join(details)
-
     hits = []
     for concept in accepted:
         ok, _ = fuzzy_contains(answer, concept, threshold=68)
@@ -262,7 +498,6 @@ def score_matching(answer, question):
             found.append(f"{left} -> {right}")
 
     confidence = total / max_score if max_score else 0
-
     return round(min(total, max_score), 2), round(confidence, 2), "Relaciones detectadas: " + "; ".join(found)
 
 
@@ -287,20 +522,39 @@ def score_answer(answer, question):
     return score, conf, fb, status
 
 
-def validate_columns(df, rubric):
-    required = rubric.get("input_format", {}).get("required_columns", [])
-    return [c for c in required if c not in df.columns]
+# ============================================================
+# VALIDACIÓN FLEXIBLE
+# ============================================================
+
+def validate_columns_flexible(df, rubric):
+    """
+    Valida con flexibilidad:
+    - student_id puede ser id, alumno_id, rut, codigo...
+    - nombre puede ser name, estudiante, alumno...
+    - P1 puede calzar con Q1, pregunta1, item1...
+    """
+    missing = []
+
+    if not find_column(df, "student_id", ["id", "alumno_id", "estudiante_id", "rut", "codigo", "código"]):
+        missing.append("student_id/id")
+
+    if not find_column(df, "nombre", ["name", "student_name", "alumno", "estudiante", "nombre_estudiante"]):
+        missing.append("nombre/name")
+
+    for q in rubric.get("questions", []):
+        pid = q.get("id")
+        if not find_item_column(df, pid):
+            aliases = sorted(item_aliases(pid))
+            missing.append(f"{pid} ({' / '.join(list(aliases)[:5])}...)")
+
+    return missing
 
 
 # ============================================================
-# INSIGHTS EVALUATIVOS
+# INSIGHTS
 # ============================================================
 
 def build_question_insights(question_stats, questions):
-    """
-    Genera métricas por pregunta.
-    Usa nomenclatura P1, P2... si la rúbrica está definida así.
-    """
     question_map = {q.get("id"): q for q in questions}
     insights_rows = []
     problematic_questions = []
@@ -344,16 +598,10 @@ def build_question_insights(question_stats, questions):
 
 
 def build_type_insights(insights_rows):
-    """
-    Resume desempeño por tipo de ítem.
-    """
     if not insights_rows:
         return []
 
     df = pd.DataFrame(insights_rows)
-    if "tipo_item" not in df.columns:
-        return []
-
     grouped = (
         df.groupby("tipo_item", dropna=False)
         .agg(
@@ -380,14 +628,10 @@ def build_type_insights(insights_rows):
 
 
 def build_interpretation(insights_rows, problematic_questions, total_students, rubric_name):
-    """
-    Genera interpretación automática breve.
-    """
     if not insights_rows:
         return "No fue posible generar interpretación porque no se registraron métricas por pregunta."
 
     df = pd.DataFrame(insights_rows)
-
     avg_eval = float(df["promedio_porcentaje"].mean()) if "promedio_porcentaje" in df else 0
     avg_review = float(df["revision_pct"].mean()) if "revision_pct" in df else 0
     avg_conf = float(df["confianza_promedio"].mean()) if "confianza_promedio" in df else 0
@@ -406,344 +650,100 @@ def build_interpretation(insights_rows, problematic_questions, total_students, r
             + ", debido a baja aceptación, baja confianza o alta proporción de respuestas marcadas para revisión."
         )
     else:
-        problem_text = (
-            "No se detectan preguntas críticamente problemáticas bajo los criterios actuales de Evalia."
-        )
+        problem_text = "No se detectan preguntas críticamente problemáticas bajo los criterios actuales de Evalia."
 
-    interpretation = (
+    return (
         f"La evaluación procesada con la rúbrica '{rubric_name}' incluyó {total_students} estudiante(s). "
         f"El desempeño global estimado por pregunta se ubica en un nivel {level}, "
         f"con un promedio general de {avg_eval:.1f}% del puntaje esperado. "
         f"La confianza promedio del sistema fue {avg_conf:.2f} y la tasa promedio de revisión manual fue {avg_review:.1f}%. "
         f"{problem_text} "
-        "Estos resultados deben interpretarse como una primera capa de inteligencia evaluativa: "
-        "permiten orientar la revisión docente, detectar ítems que podrían requerir ajuste y mejorar progresivamente la calidad de la evaluación."
+        "Estos resultados constituyen una primera capa de inteligencia evaluativa: permiten orientar la revisión docente, "
+        "detectar ítems que podrían requerir ajuste y mejorar progresivamente la calidad de la evaluación."
     )
-
-    return interpretation
 
 
 # ============================================================
-# INTERFAZ
+# CSS/UI
 # ============================================================
 
 def base_css():
     return """
     <style>
       :root {
-        --bg: #f5f6f8;
-        --card: #ffffff;
-        --ink: #15171a;
-        --muted: #667085;
-        --line: #e5e7eb;
-        --accent: #111827;
-        --soft: #f9fafb;
-        --ok: #067647;
+        --bg: #f5f6f8; --card: #ffffff; --ink: #15171a; --muted: #667085;
+        --line: #e5e7eb; --accent: #111827; --soft: #f9fafb; --ok: #067647;
       }
-
       * { box-sizing: border-box; }
-
       body {
-        margin: 0;
-        min-height: 100vh;
+        margin: 0; min-height: 100vh;
         font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-        background:
-          radial-gradient(circle at top left, rgba(17,24,39,.08), transparent 28%),
-          var(--bg);
+        background: radial-gradient(circle at top left, rgba(17,24,39,.08), transparent 28%), var(--bg);
         color: var(--ink);
       }
-
-      .page {
-        width: 100%;
-        min-height: 100vh;
-        display: flex;
-        justify-content: center;
-        padding: 42px 20px;
-      }
-
-      .shell {
-        width: 100%;
-        max-width: 920px;
-      }
-
-      .topbar {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 26px;
-      }
-
-      .brand {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-      }
-
+      .page { width: 100%; min-height: 100vh; display: flex; justify-content: center; padding: 42px 20px; }
+      .shell { width: 100%; max-width: 920px; }
+      .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 26px; }
+      .brand { display: flex; align-items: center; gap: 12px; }
       .logo {
-        width: 42px;
-        height: 42px;
-        border-radius: 14px;
-        background: #111827;
-        color: white;
-        display: grid;
-        place-items: center;
-        font-weight: 800;
-        letter-spacing: -.03em;
+        width: 42px; height: 42px; border-radius: 14px; background: #111827; color: white;
+        display: grid; place-items: center; font-weight: 800; letter-spacing: -.03em;
       }
-
-      .brand-title {
-        font-size: 22px;
-        font-weight: 800;
-        letter-spacing: -.04em;
-      }
-
-      .brand-subtitle {
-        color: var(--muted);
-        font-size: 13px;
-        margin-top: 2px;
-      }
-
+      .brand-title { font-size: 22px; font-weight: 800; letter-spacing: -.04em; }
+      .brand-subtitle { color: var(--muted); font-size: 13px; margin-top: 2px; }
       .badge {
-        padding: 8px 12px;
-        background: white;
-        border: 1px solid var(--line);
-        border-radius: 999px;
-        color: var(--muted);
-        font-size: 13px;
+        padding: 8px 12px; background: white; border: 1px solid var(--line);
+        border-radius: 999px; color: var(--muted); font-size: 13px;
       }
-
-      .hero {
-        background: rgba(255,255,255,.86);
-        backdrop-filter: blur(12px);
-        border: 1px solid var(--line);
-        border-radius: 28px;
-        box-shadow: 0 20px 60px rgba(17,24,39,.08);
-        overflow: hidden;
+      .hero, .result-card {
+        background: rgba(255,255,255,.88); backdrop-filter: blur(12px); border: 1px solid var(--line);
+        border-radius: 28px; box-shadow: 0 20px 60px rgba(17,24,39,.08); overflow: hidden;
       }
-
-      .hero-inner {
-        padding: 34px;
+      .hero-inner, .result-card { padding: 34px; }
+      h1 { margin: 0; font-size: 42px; line-height: 1.04; letter-spacing: -.06em; }
+      .lead { margin: 14px 0 26px; color: var(--muted); font-size: 17px; line-height: 1.55; max-width: 760px; }
+      .panel { background: var(--soft); border: 1px solid var(--line); border-radius: 22px; padding: 22px; }
+      .field-label { display: block; font-weight: 700; margin-bottom: 8px; font-size: 14px; }
+      select, input.file-visible {
+        width: 100%; padding: 14px; border: 1px solid var(--line); border-radius: 14px;
+        background: white; font-size: 15px; color: var(--ink); margin-bottom: 18px;
       }
-
-      h1 {
-        margin: 0;
-        font-size: 42px;
-        line-height: 1.04;
-        letter-spacing: -.06em;
-      }
-
-      .lead {
-        margin: 14px 0 26px;
-        color: var(--muted);
-        font-size: 17px;
-        line-height: 1.55;
-        max-width: 720px;
-      }
-
-      .panel {
-        background: var(--soft);
-        border: 1px solid var(--line);
-        border-radius: 22px;
-        padding: 22px;
-      }
-
-      .field-label {
-        display: block;
-        font-weight: 700;
-        margin-bottom: 8px;
-        font-size: 14px;
-      }
-
-      select {
-        width: 100%;
-        padding: 14px 14px;
-        border: 1px solid var(--line);
-        border-radius: 14px;
-        background: white;
-        font-size: 15px;
-        color: var(--ink);
-        margin-bottom: 18px;
-      }
-
       .dropzone {
-        position: relative;
-        border: 2px dashed #cbd5e1;
-        background: white;
-        border-radius: 20px;
-        padding: 30px 22px;
-        text-align: center;
-        transition: .18s ease;
-        cursor: pointer;
+        position: relative; border: 2px dashed #cbd5e1; background: white; border-radius: 20px;
+        padding: 28px 20px; text-align: center; transition: .18s ease; cursor: pointer; margin-bottom: 18px;
       }
-
-      .dropzone:hover {
-        border-color: #111827;
-        transform: translateY(-1px);
-        box-shadow: 0 12px 28px rgba(17,24,39,.08);
-      }
-
-      .dropzone input {
-        position: absolute;
-        inset: 0;
-        opacity: 0;
-        cursor: pointer;
-      }
-
-      .drop-icon {
-        font-size: 34px;
-        margin-bottom: 10px;
-      }
-
-      .drop-title {
-        font-weight: 800;
-        font-size: 18px;
-      }
-
-      .drop-subtitle {
-        color: var(--muted);
-        margin-top: 6px;
-        font-size: 14px;
-      }
-
-      .file-name {
-        margin-top: 12px;
-        font-size: 14px;
-        color: var(--ok);
-        font-weight: 700;
-        min-height: 18px;
-      }
-
-      .actions {
-        display: flex;
-        align-items: center;
-        gap: 14px;
-        margin-top: 18px;
-        flex-wrap: wrap;
-      }
-
+      .dropzone:hover { border-color: #111827; transform: translateY(-1px); box-shadow: 0 12px 28px rgba(17,24,39,.08); }
+      .dropzone input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+      .drop-icon { font-size: 30px; margin-bottom: 8px; }
+      .drop-title { font-weight: 800; font-size: 17px; }
+      .drop-subtitle { color: var(--muted); margin-top: 6px; font-size: 14px; }
+      .file-name { margin-top: 10px; font-size: 14px; color: var(--ok); font-weight: 700; min-height: 18px; }
+      .actions { display: flex; align-items: center; gap: 14px; margin-top: 18px; flex-wrap: wrap; }
       button, .button {
-        border: none;
-        border-radius: 14px;
-        padding: 13px 19px;
-        font-size: 15px;
-        font-weight: 800;
-        background: var(--accent);
-        color: white;
-        cursor: pointer;
-        text-decoration: none;
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        transition: .18s ease;
+        border: none; border-radius: 14px; padding: 13px 19px; font-size: 15px; font-weight: 800;
+        background: var(--accent); color: white; cursor: pointer; text-decoration: none;
+        display: inline-flex; align-items: center; gap: 8px; transition: .18s ease;
       }
-
-      button:hover, .button:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 14px 24px rgba(17,24,39,.18);
-      }
-
-      .hint {
-        color: var(--muted);
-        font-size: 13px;
-      }
-
-      .features {
-        display: grid;
-        grid-template-columns: repeat(4, 1fr);
-        gap: 12px;
-        padding: 18px 34px 30px;
-      }
-
-      .feature {
-        background: white;
-        border: 1px solid var(--line);
-        border-radius: 18px;
-        padding: 16px;
-        color: var(--muted);
-        font-size: 13px;
-      }
-
-      .feature strong {
-        display: block;
-        color: var(--ink);
-        font-size: 14px;
-        margin-bottom: 5px;
-      }
-
-      .loader {
-        display: none;
-        align-items: center;
-        gap: 10px;
-        color: var(--muted);
-        font-size: 14px;
-        margin-top: 14px;
-      }
-
+      button:hover, .button:hover { transform: translateY(-1px); box-shadow: 0 14px 24px rgba(17,24,39,.18); }
+      .hint { color: var(--muted); font-size: 13px; }
+      .features { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; padding: 18px 34px 30px; }
+      .feature { background: white; border: 1px solid var(--line); border-radius: 18px; padding: 16px; color: var(--muted); font-size: 13px; }
+      .feature strong { display: block; color: var(--ink); font-size: 14px; margin-bottom: 5px; }
+      .loader { display: none; align-items: center; gap: 10px; color: var(--muted); font-size: 14px; margin-top: 14px; }
       .spinner {
-        width: 18px;
-        height: 18px;
-        border: 3px solid #e5e7eb;
-        border-top-color: #111827;
-        border-radius: 50%;
-        animation: spin 1s linear infinite;
+        width: 18px; height: 18px; border: 3px solid #e5e7eb; border-top-color: #111827;
+        border-radius: 50%; animation: spin 1s linear infinite;
       }
-
       @keyframes spin { to { transform: rotate(360deg); } }
-
-      .result-card {
-        background: white;
-        border: 1px solid var(--line);
-        border-radius: 28px;
-        box-shadow: 0 20px 60px rgba(17,24,39,.08);
-        padding: 34px;
-      }
-
-      .result-title {
-        font-size: 30px;
-        font-weight: 900;
-        letter-spacing: -.04em;
-        margin: 0 0 10px;
-      }
-
-      .metric-grid {
-        display: grid;
-        grid-template-columns: repeat(4, 1fr);
-        gap: 12px;
-        margin: 24px 0;
-      }
-
-      .metric {
-        border: 1px solid var(--line);
-        border-radius: 18px;
-        padding: 16px;
-        background: var(--soft);
-      }
-
-      .metric-value {
-        font-size: 24px;
-        font-weight: 900;
-      }
-
-      .metric-label {
-        color: var(--muted);
-        font-size: 13px;
-        margin-top: 4px;
-      }
-
+      .metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 24px 0; }
+      .metric { border: 1px solid var(--line); border-radius: 18px; padding: 16px; background: var(--soft); }
+      .metric-value { font-size: 24px; font-weight: 900; }
+      .metric-label { color: var(--muted); font-size: 13px; margin-top: 4px; }
       .error {
-        color: #b42318;
-        background: #fff4f2;
-        border: 1px solid #fecdca;
-        border-radius: 18px;
-        padding: 18px;
+        color: #b42318; background: #fff4f2; border: 1px solid #fecdca;
+        border-radius: 18px; padding: 18px;
       }
-
-      code {
-        background: #eef2f7;
-        padding: 2px 6px;
-        border-radius: 6px;
-      }
-
+      code { background: #eef2f7; padding: 2px 6px; border-radius: 6px; }
       @media (max-width: 760px) {
         h1 { font-size: 32px; }
         .features, .metric-grid { grid-template-columns: 1fr; }
@@ -757,22 +757,13 @@ def base_css():
 def home():
     rubrics = get_available_rubrics()
 
-    if not rubrics:
-        rubric_options = ""
-        disabled = "disabled"
-        rubric_warning = """
-        <div class="error" style="margin-bottom:18px;">
-          <strong>No hay rúbricas disponibles.</strong><br>
-          Crea una carpeta <code>rubrics</code> y agrega al menos un archivo <code>.json</code>.
-        </div>
-        """
-    else:
+    if rubrics:
         rubric_options = "\n".join(
             f'<option value="{escape(r["filename"])}">{escape(r["name"])} · {escape(r["filename"])}</option>'
             for r in rubrics
         )
-        disabled = ""
-        rubric_warning = ""
+    else:
+        rubric_options = '<option value="">Sin rúbricas predefinidas</option>'
 
     html = f"""
     <!DOCTYPE html>
@@ -794,37 +785,46 @@ def home():
                 <div class="brand-subtitle">Inteligencia Evaluativa Automatizada</div>
               </div>
             </div>
-            <div class="badge">CRB Engine · v2.1 insights</div>
+            <div class="badge">CRB Engine · v2.2 flexible</div>
           </div>
 
           <section class="hero">
             <div class="hero-inner">
               <h1>Evalúa respuestas. Detecta patrones. Mejora evaluaciones.</h1>
               <p class="lead">
-                Evalia combina corrección automatizada basada en rúbricas con inteligencia evaluativa interpretable para generar puntajes, confianza, feedback e insights por pregunta.
+                Evalia permite usar rúbricas predefinidas o subir una rúbrica simple en Excel.
+                Acepta columnas P1, Q1, pregunta1 o item1 para acercarse al uso real docente.
               </p>
-
-              {rubric_warning}
 
               <form action="/upload" enctype="multipart/form-data" method="post" id="uploadForm">
                 <div class="panel">
-                  <label class="field-label" for="rubric">Selecciona rúbrica de evaluación</label>
-                  <select name="rubric" id="rubric" {disabled}>
+
+                  <label class="field-label" for="rubric_selector">Rúbrica predefinida</label>
+                  <select name="rubric_selector" id="rubric_selector">
                     {rubric_options}
                   </select>
 
+                  <label class="field-label">O sube una rúbrica propia en Excel/JSON</label>
+                  <div class="dropzone">
+                    <input name="rubric_file" id="rubricFileInput" type="file" accept=".xlsx,.xls,.json">
+                    <div class="drop-icon">🧩</div>
+                    <div class="drop-title">Sube rúbrica simple</div>
+                    <div class="drop-subtitle">Excel con columnas: pregunta, tipo, max_score, respuestas, criterios</div>
+                    <div class="file-name" id="rubricFileName"></div>
+                  </div>
+
                   <label class="field-label">Archivo de respuestas</label>
-                  <div class="dropzone" id="dropzone">
-                    <input name="file" id="fileInput" type="file" accept=".xlsx,.xls" required {disabled}>
+                  <div class="dropzone">
+                    <input name="file" id="fileInput" type="file" accept=".xlsx,.xls" required>
                     <div class="drop-icon">📄</div>
                     <div class="drop-title">Arrastra tu Excel aquí</div>
-                    <div class="drop-subtitle">o haz clic para seleccionar archivo · formatos .xlsx / .xls</div>
+                    <div class="drop-subtitle">Formatos .xlsx / .xls · acepta P1, Q1, pregunta1 o item1</div>
                     <div class="file-name" id="fileName"></div>
                   </div>
 
                   <div class="actions">
-                    <button type="submit" id="submitBtn" {disabled}>Evaluar respuestas</button>
-                    <span class="hint">En español se recomienda usar columnas P1, P2, P3... según la rúbrica.</span>
+                    <button type="submit" id="submitBtn">Evaluar respuestas</button>
+                    <span class="hint">Si subes rúbrica propia, Evalia la usará por sobre la predefinida.</span>
                   </div>
 
                   <div class="loader" id="loader">
@@ -836,9 +836,9 @@ def home():
             </div>
 
             <div class="features">
-              <div class="feature"><strong>Multi-rúbrica</strong>Selecciona distintas evaluaciones JSON.</div>
-              <div class="feature"><strong>Corrección inteligente</strong>Puntajes por pregunta y total.</div>
-              <div class="feature"><strong>Detección de patrones</strong>Identifica ítems críticos y preguntas problemáticas.</div>
+              <div class="feature"><strong>Rúbrica Excel</strong>Pensada para profesores.</div>
+              <div class="feature"><strong>Formato flexible</strong>P1, Q1, pregunta1 o item1.</div>
+              <div class="feature"><strong>Detección de patrones</strong>Identifica ítems críticos.</div>
               <div class="feature"><strong>Reporte explicable</strong>Scores, confianza, feedback e insights.</div>
             </div>
           </section>
@@ -846,19 +846,24 @@ def home():
       </div>
 
       <script>
-        const fileInput = document.getElementById("fileInput");
-        const fileName = document.getElementById("fileName");
+        function bindFile(inputId, labelId) {{
+          const input = document.getElementById(inputId);
+          const label = document.getElementById(labelId);
+          if (input) {{
+            input.addEventListener("change", () => {{
+              if (input.files.length > 0) {{
+                label.textContent = "Archivo seleccionado: " + input.files[0].name;
+              }}
+            }});
+          }}
+        }}
+
+        bindFile("fileInput", "fileName");
+        bindFile("rubricFileInput", "rubricFileName");
+
         const form = document.getElementById("uploadForm");
         const loader = document.getElementById("loader");
         const submitBtn = document.getElementById("submitBtn");
-
-        if (fileInput) {{
-          fileInput.addEventListener("change", () => {{
-            if (fileInput.files.length > 0) {{
-              fileName.textContent = "Archivo seleccionado: " + fileInput.files[0].name;
-            }}
-          }});
-        }}
 
         if (form) {{
           form.addEventListener("submit", () => {{
@@ -879,34 +884,26 @@ def home():
 @app.post("/upload")
 async def upload(
     file: UploadFile = File(...),
-    rubric: str = Form(...)
+    rubric_selector: str = Form(""),
+    rubric_file: Optional[UploadFile] = File(None)
 ):
     try:
-        selected_rubric = load_rubric(rubric)
+        if rubric_file is not None and rubric_file.filename:
+            selected_rubric = await load_uploaded_rubric(rubric_file)
+        else:
+            selected_rubric = load_selected_rubric(rubric_selector)
     except Exception as e:
         return HTMLResponse(
             f"""
-            <!DOCTYPE html>
-            <html lang="es">
-            <head><meta charset="UTF-8"><title>Error · Evalia</title>{base_css()}</head>
-            <body>
-              <div class="page">
-                <main class="shell">
-                  <div class="result-card">
-                    <div class="error">
-                      <strong>Error al cargar la rúbrica.</strong><br>{escape(str(e))}
-                    </div>
-                    <br><a class="button" href="/">Volver</a>
-                  </div>
-                </main>
-              </div>
-            </body>
-            </html>
+            <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Error · Evalia</title>{base_css()}</head>
+            <body><div class="page"><main class="shell"><div class="result-card">
+              <div class="error"><strong>Error al cargar la rúbrica.</strong><br>{escape(str(e))}</div>
+              <br><a class="button" href="/">Volver</a>
+            </div></main></div></body></html>
             """
         )
 
     input_path = OUTPUT_DIR / file.filename
-
     with open(input_path, "wb") as f:
         f.write(await file.read())
 
@@ -915,54 +912,26 @@ async def upload(
     except Exception as e:
         return HTMLResponse(
             f"""
-            <!DOCTYPE html>
-            <html lang="es">
-            <head><meta charset="UTF-8"><title>Error · Evalia</title>{base_css()}</head>
-            <body>
-              <div class="page">
-                <main class="shell">
-                  <div class="result-card">
-                    <div class="error">
-                      <strong>No se pudo leer el Excel.</strong><br>{escape(str(e))}
-                    </div>
-                    <br><a class="button" href="/">Volver</a>
-                  </div>
-                </main>
-              </div>
-            </body>
-            </html>
+            <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Error · Evalia</title>{base_css()}</head>
+            <body><div class="page"><main class="shell"><div class="result-card">
+              <div class="error"><strong>No se pudo leer el Excel.</strong><br>{escape(str(e))}</div>
+              <br><a class="button" href="/">Volver</a>
+            </div></main></div></body></html>
             """
         )
 
-    missing = validate_columns(df, selected_rubric)
+    missing = validate_columns_flexible(df, selected_rubric)
 
     if missing:
-        expected = selected_rubric.get("input_format", {}).get("required_columns", [])
         return HTMLResponse(
             f"""
-            <!DOCTYPE html>
-            <html lang="es">
-            <head><meta charset="UTF-8"><title>Error de formato · Evalia</title>{base_css()}</head>
-            <body>
-              <div class="page">
-                <main class="shell">
-                  <div class="result-card">
-                    <h1 class="result-title">Error de formato</h1>
-                    <div class="error">
-                      <strong>Faltan columnas requeridas:</strong><br>
-                      {escape(", ".join(missing))}
-                    </div>
-                    <p class="lead">
-                      La rúbrica <strong>{escape(selected_rubric.get("_rubric_display_name", ""))}</strong>
-                      espera las siguientes columnas:
-                      <br><code>{escape(", ".join(expected))}</code>
-                    </p>
-                    <a class="button" href="/">Volver</a>
-                  </div>
-                </main>
-              </div>
-            </body>
-            </html>
+            <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Error de formato · Evalia</title>{base_css()}</head>
+            <body><div class="page"><main class="shell"><div class="result-card">
+              <h1>Error de formato</h1>
+              <div class="error"><strong>Faltan columnas requeridas o equivalentes:</strong><br>{escape(", ".join(missing))}</div>
+              <p class="lead">Evalia acepta equivalencias como <code>P1/Q1/pregunta1/item1</code>, pero no encontró columnas suficientes.</p>
+              <a class="button" href="/">Volver</a>
+            </div></main></div></body></html>
             """
         )
 
@@ -989,15 +958,17 @@ async def upload(
         }
 
     for _, row in df.iterrows():
-        sid = row.get("student_id")
-        nombre = row.get("nombre")
+        sid = get_student_id(row, df)
+        nombre = get_student_name(row, df)
         score_row = {"student_id": sid, "nombre": nombre}
         conf_row = {"student_id": sid, "nombre": nombre}
         total = 0.0
 
         for p in questions:
             pid = p["id"]
-            answer = row.get(pid, "")
+            col = find_item_column(df, pid)
+            answer = row.get(col, "") if col else ""
+
             score, conf, fb, status = score_answer(answer, p)
 
             score_row[f"{pid}_score"] = score
@@ -1022,8 +993,9 @@ async def upload(
             feedback_rows.append({
                 "student_id": sid,
                 "nombre": nombre,
-                "rubric": selected_rubric.get("_rubric_display_name", ""),
+                "rubric": selected_rubric.get("_rubric_display_name", selected_rubric.get("name", "")),
                 "pregunta_id": pid,
+                "columna_detectada": col,
                 "prompt": p.get("prompt", ""),
                 "answer": answer,
                 "score": score,
@@ -1039,7 +1011,7 @@ async def upload(
         score_rows.append(score_row)
         conf_rows.append(conf_row)
 
-    rubric_name = selected_rubric.get("_rubric_display_name", "")
+    rubric_name = selected_rubric.get("_rubric_display_name", selected_rubric.get("name", "Rúbrica"))
     insights_rows, problematic_questions = build_question_insights(question_stats, questions)
     type_insights_rows = build_type_insights(insights_rows)
     interpretation = build_interpretation(insights_rows, problematic_questions, len(df), rubric_name)
@@ -1056,7 +1028,7 @@ async def upload(
         pd.DataFrame(conf_rows).to_excel(writer, sheet_name="confidence", index=False)
         pd.DataFrame(feedback_rows).to_excel(writer, sheet_name="feedback", index=False)
 
-        summary = pd.DataFrame([{
+        pd.DataFrame([{
             "rubric": rubric_name,
             "rubric_file": selected_rubric.get("_rubric_filename", ""),
             "students_processed": len(df),
@@ -1068,8 +1040,7 @@ async def upload(
             "accepted_pct": auto_rate,
             "caution_pct": caution_rate,
             "review_pct": review_rate
-        }])
-        summary.to_excel(writer, sheet_name="summary", index=False)
+        }]).to_excel(writer, sheet_name="summary", index=False)
 
         pd.DataFrame(insights_rows).to_excel(writer, sheet_name="INSIGHTS", index=False)
         pd.DataFrame(type_insights_rows).to_excel(writer, sheet_name="INSIGHTS_TIPOS", index=False)
@@ -1083,67 +1054,28 @@ async def upload(
 
     return HTMLResponse(
         f"""
-        <!DOCTYPE html>
-        <html lang="es">
-        <head>
-          <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>Resultados · Evalia</title>
-          {base_css()}
-        </head>
-        <body>
-          <div class="page">
-            <main class="shell">
-              <div class="topbar">
-                <div class="brand">
-                  <div class="logo">E</div>
-                  <div>
-                    <div class="brand-title">Evalia</div>
-                    <div class="brand-subtitle">Reporte generado</div>
-                  </div>
-                </div>
-                <div class="badge">CRB Engine · v2.1 insights</div>
-              </div>
-
-              <section class="result-card">
-                <h1 class="result-title">Procesamiento completado</h1>
-                <p class="lead">
-                  Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong>
-                  y generó un reporte Excel con puntajes, confianza, feedback, insights e interpretación.
-                </p>
-
-                <div class="metric-grid">
-                  <div class="metric">
-                    <div class="metric-value">{len(df)}</div>
-                    <div class="metric-label">estudiante(s)</div>
-                  </div>
-                  <div class="metric">
-                    <div class="metric-value">{len(questions)}</div>
-                    <div class="metric-label">preguntas evaluadas</div>
-                  </div>
-                  <div class="metric">
-                    <div class="metric-value">{auto_rate}%</div>
-                    <div class="metric-label">aceptación automática</div>
-                  </div>
-                  <div class="metric">
-                    <div class="metric-value">{review_rate}%</div>
-                    <div class="metric-label">requiere revisión</div>
-                  </div>
-                </div>
-
-                <p class="lead">
-                  <strong>Insight inicial:</strong> {escape(problematic_display)}
-                </p>
-
-                <div class="actions">
-                  <a class="button" href="/download/{output_name}">Descargar reporte Excel</a>
-                  <a class="button" style="background:#475467;" href="/">Evaluar otro archivo</a>
-                </div>
-              </section>
-            </main>
+        <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultados · Evalia</title>{base_css()}</head>
+        <body><div class="page"><main class="shell">
+          <div class="topbar">
+            <div class="brand"><div class="logo">E</div><div><div class="brand-title">Evalia</div><div class="brand-subtitle">Reporte generado</div></div></div>
+            <div class="badge">CRB Engine · v2.2 flexible</div>
           </div>
-        </body>
-        </html>
+          <section class="result-card">
+            <h1>Procesamiento completado</h1>
+            <p class="lead">Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong> y generó un reporte Excel explicable.</p>
+            <div class="metric-grid">
+              <div class="metric"><div class="metric-value">{len(df)}</div><div class="metric-label">estudiante(s)</div></div>
+              <div class="metric"><div class="metric-value">{len(questions)}</div><div class="metric-label">preguntas evaluadas</div></div>
+              <div class="metric"><div class="metric-value">{auto_rate}%</div><div class="metric-label">aceptación automática</div></div>
+              <div class="metric"><div class="metric-value">{review_rate}%</div><div class="metric-label">requiere revisión</div></div>
+            </div>
+            <p class="lead"><strong>Insight inicial:</strong> {escape(problematic_display)}</p>
+            <div class="actions">
+              <a class="button" href="/download/{output_name}">Descargar reporte Excel</a>
+              <a class="button" style="background:#475467;" href="/">Evaluar otro archivo</a>
+            </div>
+          </section>
+        </main></div></body></html>
         """
     )
 
