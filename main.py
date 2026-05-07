@@ -8,6 +8,8 @@ import unicodedata
 from rapidfuzz import fuzz
 from html import escape
 from typing import Optional
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "outputs"
@@ -18,7 +20,7 @@ RUBRICS_DIR.mkdir(exist_ok=True)
 
 LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
-app = FastAPI(title="Evalia CRB", version="2.2")
+app = FastAPI(title="Evalia CRB", version="2.3")
 
 
 # ============================================================
@@ -357,16 +359,23 @@ def load_rubric_from_excel(path):
 
 async def load_uploaded_rubric(rubric_file: UploadFile):
     suffix = Path(rubric_file.filename).suffix.lower()
-    temp_path = OUTPUT_DIR / f"uploaded_rubric_{rubric_file.filename}"
+    original_name = Path(rubric_file.filename).name
+    temp_path = OUTPUT_DIR / f"uploaded_rubric_{original_name}"
 
     with open(temp_path, "wb") as f:
         f.write(await rubric_file.read())
 
     if suffix == ".json":
-        return load_rubric_from_json_path(temp_path)
+        rubric = load_rubric_from_json_path(temp_path)
+        rubric["_rubric_filename"] = original_name
+        rubric["_rubric_display_name"] = rubric.get("name") or rubric.get("title") or Path(original_name).stem.replace("_", " ").title()
+        return rubric
 
     if suffix in [".xlsx", ".xls"]:
-        return load_rubric_from_excel(temp_path)
+        rubric = load_rubric_from_excel(temp_path)
+        rubric["_rubric_filename"] = original_name
+        rubric["_rubric_display_name"] = Path(original_name).stem.replace("_", " ").title()
+        return rubric
 
     raise ValueError("La rúbrica debe estar en formato .json, .xlsx o .xls.")
 
@@ -522,6 +531,31 @@ def score_answer(answer, question):
     return score, conf, fb, status
 
 
+def performance_level(pct):
+    try:
+        pct = float(pct)
+    except Exception:
+        return "Sin información"
+    if pct >= 80:
+        return "Alto"
+    if pct >= 60:
+        return "Medio"
+    return "Bajo"
+
+
+def pedagogical_item_suggestion(classification, review_pct, avg_score_pct, avg_confidence):
+    classification = str(classification or "")
+    if "problemático" in classification:
+        return "Revisar el enunciado, la rúbrica o los criterios de corrección; varios estudiantes podrían haber interpretado la pregunta de manera distinta a lo esperado."
+    if review_pct >= 30:
+        return "Conviene revisar manualmente una muestra de respuestas antes de cerrar la calificación."
+    if avg_score_pct < 60:
+        return "La pregunta parece difícil para el grupo; puede requerir retroalimentación o refuerzo de contenidos."
+    if avg_confidence < 0.70:
+        return "La respuesta esperada podría necesitar criterios más explícitos o ejemplos adicionales."
+    return "El ítem muestra funcionamiento estable bajo los criterios actuales de Evalia."
+
+
 # ============================================================
 # VALIDACIÓN FLEXIBLE
 # ============================================================
@@ -587,11 +621,13 @@ def build_question_insights(question_stats, questions):
             "puntaje_maximo": max_score,
             "promedio_puntaje": round(avg_score_raw, 2),
             "promedio_porcentaje": round(avg_score_pct, 1),
+            "nivel_item": performance_level(avg_score_pct),
             "confianza_promedio": round(avg_confidence, 2),
             "aceptacion_pct": round(accepted_pct, 1),
             "cautela_pct": round(caution_pct, 1),
             "revision_pct": round(review_pct, 1),
-            "clasificacion_evalia": classification
+            "clasificacion_evalia": classification,
+            "sugerencia_docente": pedagogical_item_suggestion(classification, review_pct, avg_score_pct, avg_confidence)
         })
 
     return insights_rows, problematic_questions
@@ -662,6 +698,110 @@ def build_interpretation(insights_rows, problematic_questions, total_students, r
         "detectar ítems que podrían requerir ajuste y mejorar progresivamente la calidad de la evaluación."
     )
 
+
+
+# ============================================================
+# REPORTE EXCEL PREMIUM / DOCENTE
+# ============================================================
+
+def build_teacher_report_rows(score_rows, insights_rows, interpretation, problematic_questions, rubric_name, total_students, total_questions, auto_rate, caution_rate, review_rate):
+    avg_pct = 0.0
+    if score_rows:
+        vals = [float(r.get("porcentaje", 0) or 0) for r in score_rows]
+        avg_pct = sum(vals) / len(vals)
+
+    if insights_rows:
+        sorted_items = sorted(insights_rows, key=lambda x: float(x.get("promedio_porcentaje", 0) or 0))
+        hardest = ", ".join([str(x.get("pregunta")) for x in sorted_items[:3]])
+        best = ", ".join([str(x.get("pregunta")) for x in sorted_items[-3:][::-1]])
+    else:
+        hardest = "Sin información"
+        best = "Sin información"
+
+    return [
+        {"seccion": "Síntesis", "indicador": "Rúbrica aplicada", "valor": rubric_name},
+        {"seccion": "Síntesis", "indicador": "Estudiantes procesados", "valor": total_students},
+        {"seccion": "Síntesis", "indicador": "Preguntas evaluadas", "valor": total_questions},
+        {"seccion": "Resultados", "indicador": "Promedio general estimado", "valor": f"{avg_pct:.1f}%"},
+        {"seccion": "Resultados", "indicador": "Nivel global", "valor": performance_level(avg_pct)},
+        {"seccion": "Trazabilidad", "indicador": "Aceptación automática", "valor": f"{auto_rate}%"},
+        {"seccion": "Trazabilidad", "indicador": "Aceptado con cautela", "valor": f"{caution_rate}%"},
+        {"seccion": "Trazabilidad", "indicador": "Requiere revisión manual", "valor": f"{review_rate}%"},
+        {"seccion": "Ítems", "indicador": "Preguntas con mayor dificultad", "valor": hardest},
+        {"seccion": "Ítems", "indicador": "Preguntas con mejor funcionamiento", "valor": best},
+        {"seccion": "Ítems", "indicador": "Preguntas potencialmente problemáticas", "valor": ", ".join(problematic_questions) if problematic_questions else "Sin preguntas críticas"},
+        {"seccion": "Interpretación", "indicador": "Lectura automática", "valor": interpretation},
+        {"seccion": "Sugerencia", "indicador": "Uso docente recomendado", "valor": "Usar este reporte como primera capa de revisión: confirmar manualmente los casos marcados como revisar y ajustar preguntas o criterios si un ítem aparece como problemático."},
+    ]
+
+
+def format_workbook(writer):
+    wb = writer.book
+    header_fill = PatternFill("solid", fgColor="111827")
+    header_font = Font(color="FFFFFF", bold=True)
+    soft_fill = PatternFill("solid", fgColor="F3F4F6")
+    green_fill = PatternFill("solid", fgColor="DCFCE7")
+    yellow_fill = PatternFill("solid", fgColor="FEF9C3")
+    red_fill = PatternFill("solid", fgColor="FEE2E2")
+    line = Side(style="thin", color="E5E7EB")
+    border = Border(left=line, right=line, top=line, bottom=line)
+
+    for ws in wb.worksheets:
+        ws.freeze_panes = "A2"
+        ws.sheet_view.showGridLines = False
+
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = border
+
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                cell.border = border
+                if cell.row % 2 == 0:
+                    cell.fill = soft_fill
+
+        headers = {cell.value: idx + 1 for idx, cell in enumerate(ws[1])}
+
+        def color_by_column(col_name):
+            col_idx = headers.get(col_name)
+            if not col_idx:
+                return
+            for r in range(2, ws.max_row + 1):
+                value = ws.cell(r, col_idx).value
+                txt = str(value).lower() if value is not None else ""
+                fill = None
+                if any(x in txt for x in ["alto", "aceptado", "funcionamiento alto", "estable"]):
+                    fill = green_fill
+                if any(x in txt for x in ["medio", "cautela"]):
+                    fill = yellow_fill
+                if any(x in txt for x in ["bajo", "revisar", "problemático", "problemat"]):
+                    fill = red_fill
+                if fill:
+                    ws.cell(r, col_idx).fill = fill
+
+        for cn in ["nivel_desempeno", "nivel_item", "status", "clasificacion_evalia"]:
+            color_by_column(cn)
+
+        for col in range(1, ws.max_column + 1):
+            letter = get_column_letter(col)
+            max_len = 0
+            for cell in ws[letter]:
+                value = "" if cell.value is None else str(cell.value)
+                max_len = max(max_len, min(len(value), 70))
+            ws.column_dimensions[letter].width = max(13, min(max_len + 2, 58))
+
+        ws.auto_filter.ref = ws.dimensions
+
+    if "REPORTE_DOCENTE" in wb.sheetnames:
+        wb.move_sheet(wb["REPORTE_DOCENTE"], offset=-len(wb.sheetnames))
+        ws = wb["REPORTE_DOCENTE"]
+        ws.freeze_panes = "A2"
+        for row in range(2, ws.max_row + 1):
+            ws.cell(row, 1).font = Font(bold=True)
+            ws.cell(row, 2).font = Font(bold=True)
 
 # ============================================================
 # CSS/UI
@@ -785,7 +925,7 @@ def home():
                 <div class="brand-subtitle">Inteligencia Evaluativa Automatizada</div>
               </div>
             </div>
-            <div class="badge">CRB Engine · v2.2 flexible</div>
+            <div class="badge">CRB Engine · v2.3 docente</div>
           </div>
 
           <section class="hero">
@@ -1008,6 +1148,7 @@ async def upload(
         total_score = float(selected_rubric.get("total_score", 0)) or sum(float(p.get("max_score", 0)) for p in questions) or 1
         score_row["total"] = round(total, 2)
         score_row["porcentaje"] = round((total / total_score) * 100, 2)
+        score_row["nivel_desempeno"] = performance_level(score_row["porcentaje"])
         score_rows.append(score_row)
         conf_rows.append(conf_row)
 
@@ -1023,32 +1164,48 @@ async def upload(
     review_rate = round((review_count / total_answers) * 100, 1) if total_answers else 0
     caution_rate = round((caution_count / total_answers) * 100, 1) if total_answers else 0
 
+    summary_rows = [{
+        "rubric": rubric_name,
+        "rubric_file": selected_rubric.get("_rubric_filename", ""),
+        "students_processed": len(df),
+        "questions_evaluated": len(questions),
+        "total_answers": total_answers,
+        "accepted": accepted_count,
+        "accepted_with_caution": caution_count,
+        "review_required": review_count,
+        "accepted_pct": auto_rate,
+        "caution_pct": caution_rate,
+        "review_pct": review_rate
+    }]
+
+    teacher_report_rows = build_teacher_report_rows(
+        score_rows=score_rows,
+        insights_rows=insights_rows,
+        interpretation=interpretation,
+        problematic_questions=problematic_questions,
+        rubric_name=rubric_name,
+        total_students=len(df),
+        total_questions=len(questions),
+        auto_rate=auto_rate,
+        caution_rate=caution_rate,
+        review_rate=review_rate
+    )
+
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        pd.DataFrame(score_rows).to_excel(writer, sheet_name="scores", index=False)
-        pd.DataFrame(conf_rows).to_excel(writer, sheet_name="confidence", index=False)
-        pd.DataFrame(feedback_rows).to_excel(writer, sheet_name="feedback", index=False)
-
-        pd.DataFrame([{
-            "rubric": rubric_name,
-            "rubric_file": selected_rubric.get("_rubric_filename", ""),
-            "students_processed": len(df),
-            "questions_evaluated": len(questions),
-            "total_answers": total_answers,
-            "accepted": accepted_count,
-            "accepted_with_caution": caution_count,
-            "review_required": review_count,
-            "accepted_pct": auto_rate,
-            "caution_pct": caution_rate,
-            "review_pct": review_rate
-        }]).to_excel(writer, sheet_name="summary", index=False)
-
-        pd.DataFrame(insights_rows).to_excel(writer, sheet_name="INSIGHTS", index=False)
-        pd.DataFrame(type_insights_rows).to_excel(writer, sheet_name="INSIGHTS_TIPOS", index=False)
+        pd.DataFrame(teacher_report_rows).to_excel(writer, sheet_name="REPORTE_DOCENTE", index=False)
+        pd.DataFrame(score_rows).to_excel(writer, sheet_name="Puntajes", index=False)
+        pd.DataFrame(conf_rows).to_excel(writer, sheet_name="Confianza", index=False)
+        pd.DataFrame(feedback_rows).to_excel(writer, sheet_name="Feedback", index=False)
+        pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Resumen_Tecnico", index=False)
+        pd.DataFrame(insights_rows).to_excel(writer, sheet_name="Analisis_Items", index=False)
+        pd.DataFrame(type_insights_rows).to_excel(writer, sheet_name="Analisis_Tipos", index=False)
         pd.DataFrame([{
             "rubric": rubric_name,
             "resumen_interpretativo": interpretation,
             "preguntas_potencialmente_problematicas": ", ".join(problematic_questions) if problematic_questions else "Sin preguntas críticas"
-        }]).to_excel(writer, sheet_name="INTERPRETACION", index=False)
+        }]).to_excel(writer, sheet_name="Interpretacion", index=False)
+
+        format_workbook(writer)
 
     problematic_display = ", ".join(problematic_questions) if problematic_questions else "Sin preguntas críticas"
 
@@ -1058,7 +1215,7 @@ async def upload(
         <body><div class="page"><main class="shell">
           <div class="topbar">
             <div class="brand"><div class="logo">E</div><div><div class="brand-title">Evalia</div><div class="brand-subtitle">Reporte generado</div></div></div>
-            <div class="badge">CRB Engine · v2.2 flexible</div>
+            <div class="badge">CRB Engine · v2.3 docente</div>
           </div>
           <section class="result-card">
             <h1>Procesamiento completado</h1>
