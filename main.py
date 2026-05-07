@@ -780,7 +780,7 @@ def home():
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Evalia · Evaluación Automatizada Inteligente</title>
+      <title>Evalia · Inteligencia Evaluativa Automatizada</title>
       {base_css()}
     </head>
     <body>
@@ -791,7 +791,7 @@ def home():
               <div class="logo">E</div>
               <div>
                 <div class="brand-title">Evalia</div>
-                <div class="brand-subtitle">Evaluación Automatizada Inteligente</div>
+                <div class="brand-subtitle">Inteligencia Evaluativa Automatizada</div>
               </div>
             </div>
             <div class="badge">CRB Engine · v2.1 insights</div>
@@ -799,10 +799,9 @@ def home():
 
           <section class="hero">
             <div class="hero-inner">
-              <h1>Corrige respuestas breves y analiza la calidad evaluativa.</h1>
+              <h1>Evalúa respuestas. Detecta patrones. Mejora evaluaciones.</h1>
               <p class="lead">
-                Evalia aplica un motor Criteria/Rubric Based para evaluar respuestas desde Excel,
-                calcular puntajes, estimar confianza, generar feedback y producir insights por pregunta.
+                Evalia combina corrección automatizada basada en rúbricas con inteligencia evaluativa interpretable para generar puntajes, confianza, feedback e insights por pregunta.
               </p>
 
               {rubric_warning}
@@ -838,9 +837,9 @@ def home():
 
             <div class="features">
               <div class="feature"><strong>Multi-rúbrica</strong>Selecciona distintas evaluaciones JSON.</div>
-              <div class="feature"><strong>Scoring automático</strong>Puntajes por pregunta y total.</div>
-              <div class="feature"><strong>Insights</strong>Detecta preguntas problemáticas.</div>
-              <div class="feature"><strong>Excel final</strong>Scores, confidence, feedback e insights.</div>
+              <div class="feature"><strong>Corrección inteligente</strong>Puntajes por pregunta y total.</div>
+              <div class="feature"><strong>Detección de patrones</strong>Identifica ítems críticos y preguntas problemáticas.</div>
+              <div class="feature"><strong>Reporte explicable</strong>Scores, confianza, feedback e insights.</div>
             </div>
           </section>
         </main>
