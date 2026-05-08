@@ -9,6 +9,8 @@ import logging
 import hashlib
 import time
 import traceback
+import os
+import math
 from rapidfuzz import fuzz
 from html import escape
 from typing import Optional, Dict, Any, List, Tuple
@@ -26,10 +28,10 @@ RUBRICS_DIR.mkdir(exist_ok=True)
 LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
 # ============================================================
-# ROBUSTEZ TÉCNICA v3.1: LOGGING, CACHÉ Y TRAZABILIDAD
+# ROBUSTEZ TÉCNICA + EMBEDDINGS v3.2: LOGGING, CACHÉ, TRAZABILIDAD Y SIMILITUD SEMÁNTICA
 # ============================================================
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.0"
 LOG_PATH = OUTPUT_DIR / "evalia_runtime.log"
 
 logging.basicConfig(
@@ -42,9 +44,108 @@ logging.basicConfig(
 )
 logger = logging.getLogger("evalia")
 
-app = FastAPI(title="Evalia CRB", version="3.1.0")
+app = FastAPI(title="Evalia CRB", version="3.2.0")
 
 SEMANTIC_CACHE: Dict[str, Any] = {}
+
+# ============================================================
+# EMBEDDINGS SEMÁNTICOS v3.2 — modo híbrido y seguro
+# ============================================================
+# Evalia puede usar embeddings reales si el entorno tiene instalado
+# sentence-transformers y el modelo está disponible. Si no, la app
+# sigue funcionando con el motor semántico por reglas de v3.1.
+#
+# Para activar embeddings reales en Render/local:
+#   1) agregar sentence-transformers a requirements.txt
+#   2) definir EVALIA_EMBEDDINGS=1
+#   3) opcional: EVALIA_EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
+
+EMBEDDINGS_ENABLED = os.getenv("EVALIA_EMBEDDINGS", "0").strip().lower() in {"1", "true", "yes", "on"}
+EMBEDDING_MODEL_NAME = os.getenv("EVALIA_EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
+EMBEDDING_MODEL = None
+EMBEDDING_STATUS = {
+    "enabled_requested": EMBEDDINGS_ENABLED,
+    "available": False,
+    "model": EMBEDDING_MODEL_NAME,
+    "mode": "reglas_semanticas",
+    "message": "Embeddings no activados; usando motor semántico por reglas."
+}
+
+def get_embedding_model():
+    global EMBEDDING_MODEL
+    if not EMBEDDINGS_ENABLED:
+        return None
+    if EMBEDDING_MODEL is not None:
+        return EMBEDDING_MODEL
+    try:
+        from sentence_transformers import SentenceTransformer
+        EMBEDDING_MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        EMBEDDING_STATUS.update({
+            "available": True,
+            "mode": "hibrido_reglas_embeddings",
+            "message": f"Embeddings activos con modelo {EMBEDDING_MODEL_NAME}."
+        })
+        log_event("embedding_model_loaded", model=EMBEDDING_MODEL_NAME)
+        return EMBEDDING_MODEL
+    except Exception as e:
+        EMBEDDING_STATUS.update({
+            "available": False,
+            "mode": "reglas_semanticas",
+            "message": f"Embeddings solicitados, pero no disponibles: {str(e)}"
+        })
+        log_event("embedding_model_unavailable", error=str(e))
+        return None
+
+def cosine_similarity(vec_a, vec_b):
+    try:
+        import numpy as np
+        a = np.asarray(vec_a, dtype=float)
+        b = np.asarray(vec_b, dtype=float)
+        denom = (np.linalg.norm(a) * np.linalg.norm(b))
+        if denom == 0:
+            return 0.0
+        return float(np.dot(a, b) / denom)
+    except Exception:
+        return 0.0
+
+def embedding_vector(text):
+    txt = normalize_text(text)
+    if not txt:
+        return None
+    key = cache_key("embedding_vector", txt, EMBEDDING_MODEL_NAME)
+    if key in SEMANTIC_CACHE:
+        return SEMANTIC_CACHE[key]
+    model = get_embedding_model()
+    if model is None:
+        return None
+    try:
+        vec = model.encode(txt, normalize_embeddings=True)
+        if len(SEMANTIC_CACHE) < 30000:
+            SEMANTIC_CACHE[key] = vec
+        return vec
+    except Exception as e:
+        EMBEDDING_STATUS.update({
+            "available": False,
+            "mode": "reglas_semanticas",
+            "message": f"Fallo durante cálculo de embedding: {str(e)}"
+        })
+        return None
+
+def embedding_similarity_score(answer, target):
+    key = cache_key("embedding_similarity", answer, target, EMBEDDING_MODEL_NAME)
+    if key in SEMANTIC_CACHE:
+        return SEMANTIC_CACHE[key]
+    va = embedding_vector(answer)
+    vt = embedding_vector(target)
+    if va is None or vt is None:
+        return None
+    sim = cosine_similarity(va, vt)
+    # Convierte similitud coseno a escala 0-100. En respuestas breves, 0.55-0.75 suele ser útil.
+    score = max(0, min(100, round(((sim + 1) / 2) * 100)))
+    result = (score, round(sim, 4))
+    if len(SEMANTIC_CACHE) < 30000:
+        SEMANTIC_CACHE[key] = result
+    return result
 
 def cache_key(*parts):
     raw = "||".join(str(p) for p in parts)
@@ -57,7 +158,7 @@ def log_event(event, **kwargs):
     except Exception:
         pass
 
-def safe_error_page(title, message, detail=None, badge="CRB Engine · v3.1 robustez semántica"):
+def safe_error_page(title, message, detail=None, badge="CRB Engine · v3.2 embeddings semánticos"):
     detail_html = f"<br><small>{escape(str(detail))}</small>" if detail else ""
     return HTMLResponse(
         f'''
@@ -771,6 +872,21 @@ def semantic_match_uncached(answer, target, threshold=68, semantic_threshold=62)
     if overlap >= semantic_threshold:
         return True, int(overlap), "solapamiento conceptual"
 
+    # Capa v3.2: embeddings semánticos reales cuando están disponibles.
+    # Se usa como apoyo de recuperación conceptual, especialmente en respuestas breves
+    # que no comparten suficientes palabras con la rúbrica.
+    emb = embedding_similarity_score(answer_n, target_n)
+    if emb is not None:
+        emb_score, emb_cosine = emb
+        if emb_score > best_score:
+            best_score = emb_score
+            best_method = f"embedding semántico cos={emb_cosine}"
+        # Umbrales conservadores para evitar falsos positivos.
+        if emb_score >= 82:
+            return True, int(emb_score), f"embedding semántico cos={emb_cosine}"
+        if answer_length_profile(answer_n) in ["brief", "short"] and emb_score >= 78:
+            return True, int(emb_score), f"embedding semántico breve cos={emb_cosine}"
+
     return False, int(best_score), best_method
 
 
@@ -1089,7 +1205,8 @@ def semantic_diagnosis(answer, question, score=None, confidence=None, status=Non
         "error_severity": severity,
         "conceptual_coverage": round(coverage, 2),
         "teacher_suggestion_semantic": teacher_suggestion,
-        "evalia_decision_basis": f"cobertura={coverage:.2f}; relaciones={len(relations)}; contradicciones={len(contradictions)}; perfil={profile}"
+        "embedding_mode": EMBEDDING_STATUS.get("mode", "reglas_semanticas"),
+        "evalia_decision_basis": f"cobertura={coverage:.2f}; relaciones={len(relations)}; contradicciones={len(contradictions)}; perfil={profile}; embeddings={EMBEDDING_STATUS.get('mode', 'reglas_semanticas')}"
     }
 
 
@@ -1809,7 +1926,7 @@ def base_css():
     """
 
 
-def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v3.1 robustez semántica"):
+def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v3.2 embeddings semánticos"):
     return f"""
     <div class="topbar">
       <div class="brand">
@@ -2368,6 +2485,16 @@ async def upload(
     elapsed_seconds = round(time.time() - started_at, 3)
     log_event("upload_completed", output=output_name, seconds=elapsed_seconds, accepted_pct=auto_rate, caution_pct=caution_rate, review_pct=review_rate)
 
+    embeddings_rows = [{
+        "version": APP_VERSION,
+        "embeddings_solicitados": EMBEDDING_STATUS.get("enabled_requested"),
+        "embeddings_disponibles": EMBEDDING_STATUS.get("available"),
+        "modo": EMBEDDING_STATUS.get("mode"),
+        "modelo": EMBEDDING_STATUS.get("model"),
+        "mensaje": EMBEDDING_STATUS.get("message"),
+        "nota": "Si embeddings_disponibles=False, Evalia procesó normalmente con reglas semánticas; para activar embeddings reales agregue sentence-transformers y EVALIA_EMBEDDINGS=1."
+    }]
+
     technical_trace_rows = [{
         "version": APP_VERSION,
         "archivo_respuestas": file.filename,
@@ -2377,6 +2504,8 @@ async def upload(
         "respuestas_evaluadas": total_answers,
         "tiempo_procesamiento_segundos": elapsed_seconds,
         "cache_semantico_items": len(SEMANTIC_CACHE),
+        "embedding_mode": EMBEDDING_STATUS.get("mode"),
+        "embedding_model": EMBEDDING_STATUS.get("model"),
         "log_runtime": str(LOG_PATH.name),
         "criterio_robustez": "validación preventiva + logging + caché semántico + trazabilidad por respuesta"
     }]
@@ -2385,7 +2514,7 @@ async def upload(
     teacher_report_rows.insert(0, {
         "seccion": "Producto",
         "indicador": "Sistema",
-        "valor": "Evalia by Altiora · Inteligencia Semántica Docente · v3.1"
+        "valor": "Evalia by Altiora · Inteligencia Semántica Docente · v3.2 embeddings híbridos"
     })
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -2397,6 +2526,7 @@ async def upload(
         pd.DataFrame(traceability_rows).to_excel(writer, sheet_name="TRAZABILIDAD_EVALIA", index=False)
         pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Resumen_Tecnico", index=False)
         pd.DataFrame(technical_trace_rows).to_excel(writer, sheet_name="ROBUSTEZ_TECNICA", index=False)
+        pd.DataFrame(embeddings_rows).to_excel(writer, sheet_name="EMBEDDINGS", index=False)
         pd.DataFrame(insights_rows).to_excel(writer, sheet_name="Analisis_Items", index=False)
         pd.DataFrame(type_insights_rows).to_excel(writer, sheet_name="Analisis_Tipos", index=False)
         pd.DataFrame([{
@@ -2413,7 +2543,7 @@ async def upload(
         f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultados · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v3.1 robustez semántica")}
+          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v3.2 embeddings semánticos")}
           <section class="result-card">
             <h1>Procesamiento completado</h1>
             <p class="lead">Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong> y generó un reporte Excel explicable.</p>
@@ -2443,7 +2573,7 @@ def download(filename: str):
         return HTMLResponse(
             f"""
             <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Archivo no encontrado · Evalia</title>{base_css()}</head>
-            <body><div class="page"><main class="shell">{shell_topbar("Archivo no encontrado", "CRB Engine · v3.1 robustez semántica")}<div class="result-card">
+            <body><div class="page"><main class="shell">{shell_topbar("Archivo no encontrado", "CRB Engine · v3.2 embeddings semánticos")}<div class="result-card">
               <h1>No se pudo acceder al archivo</h1>
               <div class="error">El reporte solicitado no existe o no fue generado correctamente.</div>
               <p class="lead">Vuelve al inicio y procesa nuevamente la rúbrica y las respuestas.</p>
