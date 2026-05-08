@@ -31,7 +31,7 @@ LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 # ROBUSTEZ TÉCNICA + EMBEDDINGS v3.5: BASELINE VALIDACIÓN, EMBEDDINGS OPTIMIZADOS, FALLBACK, CACHÉ Y TRAZABILIDAD
 # ============================================================
 
-APP_VERSION = "4.1.1-ocr-v1.2-upload-fix"
+APP_VERSION = "4.1.5-core-v3.5-plus-ocr-safe-gate"
 LOG_PATH = OUTPUT_DIR / "evalia_runtime.log"
 
 logging.basicConfig(
@@ -44,7 +44,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("evalia")
 
-app = FastAPI(title="Evalia OCR-MVP", version="4.1.1-ocr-v1.2-upload-fix")
+app = FastAPI(title="Evalia OCR-MVP", version=APP_VERSION)
 
 SEMANTIC_CACHE: Dict[str, Any] = {}
 
@@ -2446,7 +2446,7 @@ def ocr_confidence_state(ocr_conf, seg_conf):
         return combined, "verde", "OCR/segmentación confiable"
     if combined >= 0.48:
         return combined, "amarillo", "OCR/segmentación aceptable con cautela"
-    return combined, "rojo", "Revisión manual recomendada"
+    return combined, "rojo", "Revisión manual recomendada · Safe gate activo"
 
 
 def cognitive_level_from_score(score, max_score, confidence, diagnosis):
@@ -2474,7 +2474,7 @@ def hidden_input(name, value):
 @app.get("/ocr", response_class=HTMLResponse)
 def ocr_home():
     return HTMLResponse(f"""
-    <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Evalia OCR v1.2</title>{base_css()}
+    <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Evalia OCR v1.5</title>{base_css()}
     <style>
       .upload-box{{border:2px dashed #93c5fd;background:#f8fbff;border-radius:18px;padding:16px;margin:8px 0 16px 0;cursor:pointer;transition:.15s;}}
       .upload-box:hover{{background:#eef6ff;border-color:#2563eb;}}
@@ -2485,7 +2485,7 @@ def ocr_home():
       .progress-note{{display:none;margin-top:12px;padding:12px;border-radius:14px;background:#eff6ff;border:1px solid #bfdbfe;color:#1e3a8a;font-weight:700;}}
     </style></head>
     <body><div class="page"><main class="shell">
-      {shell_topbar("Evalia OCR v1.2", "Inteligencia evaluativa explicable")}
+      {shell_topbar("Evalia OCR v1.5", "Inteligencia evaluativa explicable")}
       <section class="hero"><div class="hero-inner">
         <h1>Evaluación desde imágenes manuscritas</h1>
         <p class="lead">Sube una rúbrica, identifica al estudiante y carga fotos de sus hojas. Esta versión muestra explícitamente si los archivos quedaron registrados antes de procesar.</p>
@@ -2630,7 +2630,7 @@ async def ocr_process(
         return HTMLResponse(f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Revisión OCR · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Revisión docente OCR", "Evalia OCR v1.2")}
+          {shell_topbar("Revisión docente OCR", "Evalia OCR v1.5")}
           <section class="result-card">
             <h1>Revisa y corrige antes de evaluar</h1>
             <p class="lead"><strong>{escape(student_name)}</strong> · {escape(student_id)} · {escape(course)} · {escape(exam_name)}</p>
@@ -2676,6 +2676,33 @@ async def ocr_evaluate(request: Request):
         row_score = {"student_id": meta.get("student_id", ""), "nombre": meta.get("student_name", "")}
         row_conf = {"student_id": meta.get("student_id", ""), "nombre": meta.get("student_name", "")}
 
+        # SAFE GATE OCR v1.5:
+        # En versiones previas, si OCR/segmentación fallaba, Evalia podía avanzar y cerrar todo en 0.
+        # Esta capa reconstruye segmentos desde el texto bruto corregido y detiene la evaluación
+        # cuando no existen respuestas reales evaluables o cuando la segmentación es demasiado débil.
+        raw_text_edited = str(form.get("raw_text_edited", "")).strip()
+        fallback_segments, fallback_info = segment_ocr_text_by_questions(raw_text_edited, rubric)
+        direct_answers_preview = {}
+        for _q in rubric.get("questions", []):
+            _qid = str(_q.get("id", ""))
+            direct_answers_preview[_qid] = str(form.get(f"answer__{_qid}", "")).strip()
+        direct_nonempty = [v for v in direct_answers_preview.values() if v.strip()]
+        fallback_nonempty = [v for v in fallback_segments.values() if str(v).strip()]
+        weak_segmentation = float(fallback_info.get("confidence", 0) or 0) < 0.48
+        likely_single_dump = len(fallback_nonempty) <= 1 and len(rubric.get("questions", [])) > 1 and bool(raw_text_edited)
+        if not direct_nonempty and not fallback_nonempty:
+            return safe_error_page(
+                "Evaluación detenida por OCR",
+                "No hay respuestas evaluables. Evalia no asignará 0 cuando el problema es OCR o segmentación.",
+                "Pega una transcripción manual en el campo OCR bruto o escribe las respuestas directamente en cada pregunta."
+            )
+        if not direct_nonempty and weak_segmentation and likely_single_dump:
+            return safe_error_page(
+                "Revisión manual requerida",
+                "Hay texto OCR, pero la segmentación no es suficientemente confiable para evaluar automáticamente.",
+                "Distribuye el texto en las casillas P1, P2, P3, etc. antes de evaluar. Modo detectado: " + str(fallback_info.get("mode", ""))
+            )
+
         for q in rubric.get("questions", []):
             qid = str(q.get("id", ""))
             answer = str(form.get(f"answer__{qid}", ""))
@@ -2714,7 +2741,7 @@ async def ocr_evaluate(request: Request):
             "puntaje_total": round(total, 2), "puntaje_maximo": total_score, "porcentaje": pct,
             "nivel_desempeno": performance_level(pct),
             "aceptado_pct": round(accepted / n * 100, 1), "cautela_pct": round(caution / n * 100, 1), "revision_pct": round(review / n * 100, 1),
-            "ocr_engine": OCR_STATUS.get("engine"), "criterio_mvp": "copiloto evaluativo: OCR editable + microjuicios explicables + revisión docente"
+            "ocr_engine": OCR_STATUS.get("engine"), "criterio_mvp": "copiloto evaluativo: OCR editable + microjuicios explicables + revisión docente", "safe_gate_ocr": "activo: no evalúa en cero cuando OCR/segmentación falla"
         }]
 
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -2731,7 +2758,7 @@ async def ocr_evaluate(request: Request):
         return HTMLResponse(f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultado OCR · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Reporte OCR generado", "Evalia OCR v1.2")}
+          {shell_topbar("Reporte OCR generado", "Evalia OCR v1.5")}
           <section class="result-card">
             <h1>Evaluación completada</h1>
             <p class="lead"><strong>{escape(meta.get('student_name',''))}</strong> obtuvo {round(total,2)} / {total_score} puntos ({pct}%).</p>
