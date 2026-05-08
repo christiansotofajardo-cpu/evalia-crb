@@ -5,3 +5,7 @@ pandas
 openpyxl
 rapidfuzz
 jinja2
+numpy
+pillow
+pytesseract
+opencv-python-headless
