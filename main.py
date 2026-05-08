@@ -33,7 +33,7 @@ LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 # ROBUSTEZ TÉCNICA + EMBEDDINGS v3.5: BASELINE VALIDACIÓN, EMBEDDINGS OPTIMIZADOS, FALLBACK, CACHÉ Y TRAZABILIDAD
 # ============================================================
 
-APP_VERSION = "4.2.0-core-v3.5-ocr-modern-router"
+APP_VERSION = "4.2.1-ocr-modern-router-json-safe"
 LOG_PATH = OUTPUT_DIR / "evalia_runtime.log"
 
 logging.basicConfig(
@@ -249,6 +249,42 @@ def log_event(event, **kwargs):
         logger.info(f"{event} | {payload}" if payload else event)
     except Exception:
         pass
+
+
+def make_json_safe(obj, seen=None):
+    """
+    Convierte objetos complejos en estructuras JSON seguras.
+    Evita errores tipo: Circular reference detected.
+    """
+    if seen is None:
+        seen = set()
+
+    obj_id = id(obj)
+    if obj_id in seen:
+        return "[circular_reference_removed]"
+
+    if isinstance(obj, (dict, list, tuple, set)):
+        seen.add(obj_id)
+
+    if isinstance(obj, dict):
+        return {str(k): make_json_safe(v, seen) for k, v in obj.items()}
+
+    if isinstance(obj, (list, tuple, set)):
+        return [make_json_safe(v, seen) for v in obj]
+
+    if isinstance(obj, Path):
+        return str(obj)
+
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+
+    try:
+        if pd.isna(obj):
+            return ""
+    except Exception:
+        pass
+
+    return str(obj)
 
 def safe_error_page(title, message, detail=None, badge="CRB Engine · v3.5 baseline validación"):
     detail_html = f"<br><small>{escape(str(detail))}</small>" if detail else ""
@@ -2842,7 +2878,7 @@ async def ocr_process(
 
         session_id = safe_session_id(student_id, student_name, exam_name)
         saved_rubric = OUTPUT_DIR / f"ocr_session_{session_id}_rubric.json"
-        saved_rubric.write_text(json.dumps(rubric, ensure_ascii=False), encoding="utf-8")
+        saved_rubric.write_text(json.dumps(make_json_safe(rubric), ensure_ascii=False), encoding="utf-8")
 
         ocr_blocks = []
         all_text_parts = []
@@ -2864,7 +2900,7 @@ async def ocr_process(
 
         meta = {"course": course, "exam_name": exam_name, "exam_date": exam_date, "student_id": student_id, "student_name": student_name}
         saved_meta = OUTPUT_DIR / f"ocr_session_{session_id}_meta.json"
-        saved_meta.write_text(json.dumps({"meta": meta, "ocr_blocks": ocr_blocks, "raw_text": raw_text, "segmentation": seg_info}, ensure_ascii=False), encoding="utf-8")
+        saved_meta.write_text(json.dumps(make_json_safe({"meta": meta, "ocr_blocks": ocr_blocks, "raw_text": raw_text, "segmentation": seg_info}), ensure_ascii=False), encoding="utf-8")
 
         q_html = []
         for q in rubric.get("questions", []):
