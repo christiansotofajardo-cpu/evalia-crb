@@ -31,7 +31,7 @@ LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 # ROBUSTEZ TÉCNICA + EMBEDDINGS v3.5: BASELINE VALIDACIÓN, EMBEDDINGS OPTIMIZADOS, FALLBACK, CACHÉ Y TRAZABILIDAD
 # ============================================================
 
-APP_VERSION = "4.1.0-ocr-v1.1"
+APP_VERSION = "4.1.1-ocr-v1.2-upload-fix"
 LOG_PATH = OUTPUT_DIR / "evalia_runtime.log"
 
 logging.basicConfig(
@@ -44,7 +44,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("evalia")
 
-app = FastAPI(title="Evalia OCR-MVP", version="4.1.0-ocr-v1.1")
+app = FastAPI(title="Evalia OCR-MVP", version="4.1.1-ocr-v1.2-upload-fix")
 
 SEMANTIC_CACHE: Dict[str, Any] = {}
 
@@ -2474,28 +2474,95 @@ def hidden_input(name, value):
 @app.get("/ocr", response_class=HTMLResponse)
 def ocr_home():
     return HTMLResponse(f"""
-    <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Evalia OCR v1.1</title>{base_css()}</head>
+    <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Evalia OCR v1.2</title>{base_css()}
+    <style>
+      .upload-box{{border:2px dashed #93c5fd;background:#f8fbff;border-radius:18px;padding:16px;margin:8px 0 16px 0;cursor:pointer;transition:.15s;}}
+      .upload-box:hover{{background:#eef6ff;border-color:#2563eb;}}
+      .upload-box input{{display:block!important;width:100%;padding:10px;background:white;border:1px solid #cbd5e1;border-radius:12px;cursor:pointer;}}
+      .file-status{{margin-top:8px;padding:10px;border-radius:12px;background:#ecfdf5;border:1px solid #86efac;color:#065f46;font-weight:700;display:none;}}
+      .file-status.warn{{display:block;background:#fff7ed;border-color:#fed7aa;color:#9a3412;}}
+      .helper-note{{font-size:12px;color:#475569;margin-top:4px;}}
+      .progress-note{{display:none;margin-top:12px;padding:12px;border-radius:14px;background:#eff6ff;border:1px solid #bfdbfe;color:#1e3a8a;font-weight:700;}}
+    </style></head>
     <body><div class="page"><main class="shell">
-      {shell_topbar("Evalia OCR v1.1", "Inteligencia evaluativa explicable")}
+      {shell_topbar("Evalia OCR v1.2", "Inteligencia evaluativa explicable")}
       <section class="hero"><div class="hero-inner">
         <h1>Evaluación desde imágenes manuscritas</h1>
-        <p class="lead">Sube una rúbrica, identifica al estudiante y carga fotos de sus hojas. Evalia hará OCR cuando esté disponible, segmentará respuestas y dejará todo editable antes de evaluar.</p>
-        <form action="/ocr/process" enctype="multipart/form-data" method="post">
+        <p class="lead">Sube una rúbrica, identifica al estudiante y carga fotos de sus hojas. Esta versión muestra explícitamente si los archivos quedaron registrados antes de procesar.</p>
+        <form id="ocrForm" action="/ocr/process" enctype="multipart/form-data" method="post">
           <div class="panel">
             <label class="field-label">Curso</label><input name="course" placeholder="Ej.: Psicolingüística" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
             <label class="field-label">Certamen / evaluación</label><input name="exam_name" placeholder="Ej.: Certamen 1" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
             <label class="field-label">Fecha</label><input name="exam_date" placeholder="2026-05-08" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
             <label class="field-label">ID estudiante</label><input name="student_id" required placeholder="Ej.: A01" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
             <label class="field-label">Nombre estudiante</label><input name="student_name" required placeholder="Nombre completo" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
-            <label class="field-label">Rúbrica Excel/JSON</label><div class="dropzone"><input name="rubric_file" type="file" accept=".xlsx,.xls,.json" required><small>Arrastra o selecciona la rúbrica Excel/JSON</small></div>
-            <label class="field-label">Imágenes de hojas del estudiante</label><div class="dropzone"><input name="image_files" type="file" accept="image/*" multiple required><small>Arrastra o selecciona una o más fotos/escaneos del estudiante</small></div>
-            <div class="actions"><button type="submit">Procesar OCR y revisar</button><a class="button secondary" href="/">Volver a Excel</a></div>
+
+            <label class="field-label">Rúbrica Excel/JSON</label>
+            <div class="upload-box" id="rubricDrop">
+              <input id="rubricInput" name="rubric_file" type="file" accept=".xlsx,.xls,.json" required>
+              <div class="helper-note">Selecciona o arrastra aquí la rúbrica. Formatos: .xlsx, .xls, .json</div>
+              <div id="rubricStatus" class="file-status warn">Ninguna rúbrica seleccionada todavía.</div>
+            </div>
+
+            <label class="field-label">Imágenes de hojas del estudiante</label>
+            <div class="upload-box" id="imageDrop">
+              <input id="imageInput" name="image_files" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp" multiple required>
+              <div class="helper-note">Selecciona o arrastra una o más fotos/escaneos. Formatos recomendados: PNG/JPG.</div>
+              <div id="imageStatus" class="file-status warn">Ninguna imagen seleccionada todavía.</div>
+            </div>
+
+            <details style="margin:10px 0 14px 0;">
+              <summary style="cursor:pointer;font-weight:800;color:#334155;">Opcional: pegar texto manual si OCR falla</summary>
+              <textarea name="manual_raw_text" rows="5" placeholder="Puedes pegar aquí una transcripción manual completa. Si Tesseract no está instalado en Render, Evalia usará este texto como respaldo." style="width:100%;margin-top:8px;padding:12px;border-radius:14px;border:1px solid #d1d5db;"></textarea>
+            </details>
+
+            <div class="actions"><button id="submitBtn" type="submit">Procesar OCR y revisar</button><a class="button secondary" href="/">Volver a Excel</a></div>
+            <div id="progressNote" class="progress-note">Archivos recibidos en el navegador. Enviando a Evalia para OCR/segmentación...</div>
           </div>
         </form>
       </div></section>{footer_altiora()}
-    </main></div></body></html>
+    </main></div>
+    <script>
+      const rubricInput = document.getElementById('rubricInput');
+      const imageInput = document.getElementById('imageInput');
+      const rubricStatus = document.getElementById('rubricStatus');
+      const imageStatus = document.getElementById('imageStatus');
+      const form = document.getElementById('ocrForm');
+      const progressNote = document.getElementById('progressNote');
+      const submitBtn = document.getElementById('submitBtn');
+      function bytesToMB(n){{ return (n/1024/1024).toFixed(2) + ' MB'; }}
+      function updateFileStatus(input, box, label){{
+        const files = Array.from(input.files || []);
+        if(!files.length){{
+          box.className = 'file-status warn';
+          box.style.display = 'block';
+          box.textContent = label === 'rubrica' ? 'Ninguna rúbrica seleccionada todavía.' : 'Ninguna imagen seleccionada todavía.';
+          return;
+        }}
+        box.className = 'file-status';
+        box.style.display = 'block';
+        const names = files.map(f => f.name + ' (' + bytesToMB(f.size) + ')').join(' · ');
+        box.textContent = (label === 'rubrica' ? 'Rúbrica registrada: ' : files.length + ' imagen(es) registrada(s): ') + names;
+      }}
+      rubricInput.addEventListener('change', () => updateFileStatus(rubricInput, rubricStatus, 'rubrica'));
+      imageInput.addEventListener('change', () => updateFileStatus(imageInput, imageStatus, 'imagenes'));
+      form.addEventListener('submit', (e) => {{
+        updateFileStatus(rubricInput, rubricStatus, 'rubrica');
+        updateFileStatus(imageInput, imageStatus, 'imagenes');
+        if(!rubricInput.files.length || !imageInput.files.length){{
+          e.preventDefault();
+          alert('Falta seleccionar la rúbrica o al menos una imagen del estudiante.');
+          return false;
+        }}
+        progressNote.style.display = 'block';
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Procesando...';
+      }});
+      updateFileStatus(rubricInput, rubricStatus, 'rubrica');
+      updateFileStatus(imageInput, imageStatus, 'imagenes');
+    </script>
+    </body></html>
     """)
-
 
 @app.post("/ocr/process", response_class=HTMLResponse)
 async def ocr_process(
@@ -2505,9 +2572,15 @@ async def ocr_process(
     student_id: str = Form(""),
     student_name: str = Form(""),
     rubric_file: UploadFile = File(...),
-    image_files: List[UploadFile] = File(...)
+    image_files: List[UploadFile] = File(...),
+    manual_raw_text: str = Form("")
 ):
     try:
+        if not rubric_file or not rubric_file.filename:
+            return safe_error_page("Falta rúbrica", "No se recibió ningún archivo de rúbrica. Selecciona o arrastra un Excel/JSON.")
+        valid_images = [img for img in image_files if img is not None and img.filename]
+        if not valid_images and not str(manual_raw_text or "").strip():
+            return safe_error_page("Faltan imágenes", "No se recibió ninguna imagen del estudiante ni texto manual de respaldo.")
         rubric = await load_uploaded_rubric(rubric_file)
         issues = validate_rubric_integrity(rubric)
         if issues:
@@ -2519,7 +2592,7 @@ async def ocr_process(
 
         ocr_blocks = []
         all_text_parts = []
-        for idx, img in enumerate(image_files, start=1):
+        for idx, img in enumerate(valid_images, start=1):
             suffix = Path(img.filename or f"hoja_{idx}.png").suffix or ".png"
             safe_name = f"{session_id}_hoja_{idx}{suffix}"
             out_path = IMAGE_DIR / safe_name
@@ -2551,13 +2624,13 @@ async def ocr_process(
             </div>
             """)
 
-        ocr_detail = "<br>".join([escape(f"{b.get('file')}: {b.get('engine')} · conf={b.get('confidence')} · {b.get('message')}") for b in ocr_blocks])
+        ocr_detail = "<br>".join([escape(f"{b.get('file')}: {b.get('engine')} · conf={b.get('confidence')} · {b.get('message')}") for b in ocr_blocks]) or "Sin imágenes procesadas; usando texto manual si fue ingresado."
         color_badge = {"verde":"#dcfce7", "amarillo":"#fef9c3", "rojo":"#fee2e2"}.get(color_state, "#f3f4f6")
 
         return HTMLResponse(f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Revisión OCR · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Revisión docente OCR", "Evalia OCR v1.1")}
+          {shell_topbar("Revisión docente OCR", "Evalia OCR v1.2")}
           <section class="result-card">
             <h1>Revisa y corrige antes de evaluar</h1>
             <p class="lead"><strong>{escape(student_name)}</strong> · {escape(student_id)} · {escape(course)} · {escape(exam_name)}</p>
@@ -2658,7 +2731,7 @@ async def ocr_evaluate(request: Request):
         return HTMLResponse(f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultado OCR · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Reporte OCR generado", "Evalia OCR v1.1")}
+          {shell_topbar("Reporte OCR generado", "Evalia OCR v1.2")}
           <section class="result-card">
             <h1>Evaluación completada</h1>
             <p class="lead"><strong>{escape(meta.get('student_name',''))}</strong> obtuvo {round(total,2)} / {total_score} puntos ({pct}%).</p>
