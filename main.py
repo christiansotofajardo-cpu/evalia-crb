@@ -1,13 +1,17 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from pathlib import Path
 import pandas as pd
 import json
 import re
 import unicodedata
+import logging
+import hashlib
+import time
+import traceback
 from rapidfuzz import fuzz
 from html import escape
-from typing import Optional
+from typing import Optional, Dict, Any, List, Tuple
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -21,7 +25,61 @@ RUBRICS_DIR.mkdir(exist_ok=True)
 
 LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
-app = FastAPI(title="Evalia CRB", version="3.0.0")
+# ============================================================
+# ROBUSTEZ TÉCNICA v3.1: LOGGING, CACHÉ Y TRAZABILIDAD
+# ============================================================
+
+APP_VERSION = "3.1.0"
+LOG_PATH = OUTPUT_DIR / "evalia_runtime.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("evalia")
+
+app = FastAPI(title="Evalia CRB", version="3.1.0")
+
+SEMANTIC_CACHE: Dict[str, Any] = {}
+
+def cache_key(*parts):
+    raw = "||".join(str(p) for p in parts)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+def log_event(event, **kwargs):
+    try:
+        payload = " | ".join(f"{k}={v}" for k, v in kwargs.items())
+        logger.info(f"{event} | {payload}" if payload else event)
+    except Exception:
+        pass
+
+def safe_error_page(title, message, detail=None, badge="CRB Engine · v3.1 robustez semántica"):
+    detail_html = f"<br><small>{escape(str(detail))}</small>" if detail else ""
+    return HTMLResponse(
+        f'''
+        <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Error · Evalia</title>{base_css()}</head>
+        <body><div class="page"><main class="shell">{shell_topbar("Error controlado", badge)}<div class="result-card">
+          <h1>{escape(title)}</h1>
+          <div class="error"><strong>{escape(message)}</strong>{detail_html}</div>
+          <p class="lead">Evalia detuvo el procesamiento para evitar un reporte inconsistente. Revisa el formato o vuelve a intentar con el modelo descargable.</p>
+          <a class="button" href="/">Volver</a>
+        </div>{footer_altiora()}</main></div></body></html>
+        ''',
+        status_code=400
+    )
+
+@app.exception_handler(Exception)
+async def evalia_unhandled_exception_handler(request: Request, exc: Exception):
+    logger.error("unhandled_exception | path=%s | error=%s\n%s", request.url.path, exc, traceback.format_exc())
+    return safe_error_page(
+        "Error interno controlado",
+        "Ocurrió un problema durante el procesamiento, pero fue registrado para depuración.",
+        str(exc)
+    )
 
 
 # ============================================================
@@ -673,7 +731,7 @@ def semantic_match_basic(answer, target):
     return False, int(max(score, overlap)), "sin coincidencia"
 
 
-def semantic_match(answer, target, threshold=68, semantic_threshold=62):
+def semantic_match_uncached(answer, target, threshold=68, semantic_threshold=62):
     answer_n = normalize_text(answer)
     target_n = normalize_text(target)
     if not answer_n or not target_n:
@@ -714,6 +772,16 @@ def semantic_match(answer, target, threshold=68, semantic_threshold=62):
         return True, int(overlap), "solapamiento conceptual"
 
     return False, int(best_score), best_method
+
+
+def semantic_match(answer, target, threshold=68, semantic_threshold=62):
+    key = cache_key("semantic_match", answer, target, threshold, semantic_threshold)
+    if key in SEMANTIC_CACHE:
+        return SEMANTIC_CACHE[key]
+    result = semantic_match_uncached(answer, target, threshold=threshold, semantic_threshold=semantic_threshold)
+    if len(SEMANTIC_CACHE) < 20000:
+        SEMANTIC_CACHE[key] = result
+    return result
 
 
 def contradictions_lookup(term):
@@ -915,6 +983,16 @@ def get_question_concepts(question):
     return []
 
 
+CONCEPT_RELATION_MARKERS_V31 = {
+    "causalidad": ["causa", "provoca", "produce", "genera", "debido a", "por eso", "gracias a"],
+    "funcion": ["sirve", "permite", "ayuda", "cumple", "se encarga", "participa"],
+    "definicion": ["es", "son", "se define", "corresponde", "consiste"],
+    "consecuencia": ["afecta", "daña", "impacta", "consecuencia", "resultado"],
+    "oposicion": ["pero", "sin embargo", "en cambio", "a diferencia"],
+    "comparacion": ["más que", "menos que", "mayor", "menor", "similar", "distinto"],
+    "gradiente": ["aumenta", "disminuye", "sube", "baja", "profundidad", "temperatura"],
+}
+
 def detect_concept_relations(answer, concepts):
     answer_n = normalize_text(answer)
     present, _evidence = detect_present_concepts(answer, concepts)
@@ -924,12 +1002,12 @@ def detect_concept_relations(answer, concepts):
             if normalize_text(pat) in answer_n:
                 relation_hits.append(rel)
                 break
-    # Relaciones escolares frecuentes no siempre incluidas en RELATION_PATTERNS.
-    extra = {
-        "consecuencia": ["afecta", "daña", "impacta", "provoca", "produce", "consecuencia", "causa"],
+    # Relaciones escolares frecuentes y mapa ampliado v3.1.
+    extra = dict(CONCEPT_RELATION_MARKERS_V31)
+    extra.update({
         "cambio_gradual": ["aumenta", "disminuye", "más", "menos", "mayor", "menor", "cambia"],
         "regulacion": ["regula", "modera", "mantiene", "estabiliza"],
-    }
+    })
     for rel, patterns in extra.items():
         for pat in patterns:
             if normalize_text(pat) in answer_n:
@@ -1262,6 +1340,71 @@ def performance_level(pct):
     return "Bajo"
 
 
+
+# ============================================================
+# VALIDACIÓN PREVENTIVA v3.1
+# ============================================================
+
+def validate_rubric_integrity(rubric):
+    issues = []
+    questions = rubric.get("questions", []) if isinstance(rubric, dict) else []
+    if not questions:
+        issues.append("La rúbrica no contiene preguntas válidas.")
+        return issues
+    seen = set()
+    for i, q in enumerate(questions, start=1):
+        qid = str(q.get("id", "")).strip()
+        if not qid:
+            issues.append(f"La pregunta {i} no tiene identificador.")
+        elif qid in seen:
+            issues.append(f"El identificador de pregunta está duplicado: {qid}.")
+        seen.add(qid)
+        try:
+            max_score = float(q.get("max_score", 0))
+            if max_score <= 0:
+                issues.append(f"{qid}: el puntaje debe ser mayor que 0.")
+        except Exception:
+            issues.append(f"{qid}: el puntaje no es numérico.")
+        item_type = normalize_item_type(q.get("item_type", "criteria"))
+        if item_type == "criteria" and not q.get("criteria") and not q.get("accepted_answers"):
+            issues.append(f"{qid}: pregunta abierta sin criterios ni ideas esperadas.")
+        if item_type in ["completion", "short_exact_answer", "true_false"] and not q.get("accepted_answers"):
+            issues.append(f"{qid}: pregunta cerrada sin respuesta esperada.")
+        if item_type == "classification_matching" and not q.get("pairs"):
+            issues.append(f"{qid}: pregunta de relacionar sin pares válidos. Usa Concepto:Respuesta; Concepto:Respuesta.")
+    return issues
+
+def validate_dataframe_integrity(df):
+    issues = []
+    if df is None or df.empty:
+        issues.append("El archivo de respuestas está vacío.")
+        return issues
+    if len(df.columns) < 3:
+        issues.append("El archivo de respuestas debe incluir identificación, nombre y al menos una pregunta.")
+    unnamed = [str(c) for c in df.columns if str(c).lower().startswith("unnamed")]
+    if len(unnamed) >= max(2, len(df.columns)//2):
+        issues.append("El Excel parece tener muchas columnas vacías o sin nombre. Revisa la fila de encabezados.")
+    if len(df) > 5000:
+        issues.append("El archivo contiene más de 5000 filas. Para esta versión se recomienda dividir el procesamiento.")
+    return issues
+
+def build_traceability_row(student_id, nombre, pregunta_id, answer, score, confidence, status, diagnosis, feedback):
+    return {
+        "student_id": student_id,
+        "nombre": nombre,
+        "pregunta_id": pregunta_id,
+        "status_evalia": status,
+        "score": score,
+        "confidence": confidence,
+        "perfil_respuesta": diagnosis.get("answer_profile", ""),
+        "cobertura_conceptual": diagnosis.get("conceptual_coverage", ""),
+        "relaciones_detectadas": diagnosis.get("conceptual_relations", ""),
+        "tipo_error": diagnosis.get("error_type", ""),
+        "severidad_error": diagnosis.get("error_severity", ""),
+        "base_decision": diagnosis.get("evalia_decision_basis", ""),
+        "feedback_evalia": feedback,
+        "respuesta_original": answer
+    }
 
 # ============================================================
 # VALIDACIÓN FLEXIBLE
@@ -1666,7 +1809,7 @@ def base_css():
     """
 
 
-def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v3.0 inteligencia semántica"):
+def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v3.1 robustez semántica"):
     return f"""
     <div class="topbar">
       <div class="brand">
@@ -1802,7 +1945,10 @@ async def preview_upload(
 
         df = pd.read_excel(temp_input_path)
         questions = selected_rubric.get("questions", [])
+        rubric_issues = validate_rubric_integrity(selected_rubric)
+        df_issues = validate_dataframe_integrity(df)
         missing = validate_columns_flexible(df, selected_rubric)
+        format_issues = rubric_issues + df_issues
 
         detected = []
         for q in questions:
@@ -1820,14 +1966,14 @@ async def preview_upload(
             type_counts[t] = type_counts.get(t, 0) + 1
 
         return JSONResponse({
-            "ok": len(missing) == 0,
+            "ok": len(missing) == 0 and len(format_issues) == 0,
             "rubric": selected_rubric.get("_rubric_display_name", selected_rubric.get("name", "Rúbrica")),
             "students": int(len(df)),
             "questions": int(len(questions)),
             "columns": [str(c) for c in df.columns],
             "types": type_counts,
             "detected": detected,
-            "missing": missing
+            "missing": missing + format_issues
         })
 
     except Exception as e:
@@ -2067,7 +2213,9 @@ async def upload(
             """
         )
 
-    missing = validate_columns_flexible(df, selected_rubric)
+    rubric_issues = validate_rubric_integrity(selected_rubric)
+    df_issues = validate_dataframe_integrity(df)
+    missing = validate_columns_flexible(df, selected_rubric) + rubric_issues + df_issues
 
     if missing:
         return HTMLResponse(
@@ -2082,11 +2230,15 @@ async def upload(
             """
         )
 
+    started_at = time.time()
+    log_event("upload_started", file=file.filename, students=len(df), questions=len(selected_rubric.get("questions", [])))
+
     questions = selected_rubric.get("questions", [])
     score_rows = []
     conf_rows = []
     feedback_rows = []
     semantic_pattern_rows = []
+    traceability_rows = []
 
     accepted_count = 0
     caution_count = 0
@@ -2150,6 +2302,7 @@ async def upload(
                 "status": status,
                 **diagnosis
             })
+            traceability_rows.append(build_traceability_row(sid, nombre, pid, answer, score, conf, status, diagnosis, fb))
 
             feedback_rows.append({
                 "student_id": sid,
@@ -2212,11 +2365,27 @@ async def upload(
         review_rate=review_rate
     )
 
+    elapsed_seconds = round(time.time() - started_at, 3)
+    log_event("upload_completed", output=output_name, seconds=elapsed_seconds, accepted_pct=auto_rate, caution_pct=caution_rate, review_pct=review_rate)
+
+    technical_trace_rows = [{
+        "version": APP_VERSION,
+        "archivo_respuestas": file.filename,
+        "rubrica": rubric_name,
+        "estudiantes": len(df),
+        "preguntas": len(questions),
+        "respuestas_evaluadas": total_answers,
+        "tiempo_procesamiento_segundos": elapsed_seconds,
+        "cache_semantico_items": len(SEMANTIC_CACHE),
+        "log_runtime": str(LOG_PATH.name),
+        "criterio_robustez": "validación preventiva + logging + caché semántico + trazabilidad por respuesta"
+    }]
+
     # Se agrega una fila de identidad de producto al reporte docente.
     teacher_report_rows.insert(0, {
         "seccion": "Producto",
         "indicador": "Sistema",
-        "valor": "Evalia by Altiora · Inteligencia Semántica Docente · v3.0"
+        "valor": "Evalia by Altiora · Inteligencia Semántica Docente · v3.1"
     })
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -2225,7 +2394,9 @@ async def upload(
         pd.DataFrame(conf_rows).to_excel(writer, sheet_name="Confianza", index=False)
         pd.DataFrame(feedback_rows).to_excel(writer, sheet_name="Feedback", index=False)
         pd.DataFrame(semantic_pattern_rows).to_excel(writer, sheet_name="PATRONES_SEMANTICOS", index=False)
+        pd.DataFrame(traceability_rows).to_excel(writer, sheet_name="TRAZABILIDAD_EVALIA", index=False)
         pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Resumen_Tecnico", index=False)
+        pd.DataFrame(technical_trace_rows).to_excel(writer, sheet_name="ROBUSTEZ_TECNICA", index=False)
         pd.DataFrame(insights_rows).to_excel(writer, sheet_name="Analisis_Items", index=False)
         pd.DataFrame(type_insights_rows).to_excel(writer, sheet_name="Analisis_Tipos", index=False)
         pd.DataFrame([{
@@ -2242,7 +2413,7 @@ async def upload(
         f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultados · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v3.0 inteligencia semántica")}
+          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v3.1 robustez semántica")}
           <section class="result-card">
             <h1>Procesamiento completado</h1>
             <p class="lead">Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong> y generó un reporte Excel explicable.</p>
@@ -2272,7 +2443,7 @@ def download(filename: str):
         return HTMLResponse(
             f"""
             <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Archivo no encontrado · Evalia</title>{base_css()}</head>
-            <body><div class="page"><main class="shell">{shell_topbar("Archivo no encontrado", "CRB Engine · v3.0 inteligencia semántica")}<div class="result-card">
+            <body><div class="page"><main class="shell">{shell_topbar("Archivo no encontrado", "CRB Engine · v3.1 robustez semántica")}<div class="result-card">
               <h1>No se pudo acceder al archivo</h1>
               <div class="error">El reporte solicitado no existe o no fue generado correctamente.</div>
               <p class="lead">Vuelve al inicio y procesa nuevamente la rúbrica y las respuestas.</p>
