@@ -28,10 +28,10 @@ RUBRICS_DIR.mkdir(exist_ok=True)
 LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
 # ============================================================
-# ROBUSTEZ TÉCNICA + EMBEDDINGS v3.2: LOGGING, CACHÉ, TRAZABILIDAD Y SIMILITUD SEMÁNTICA
+# ROBUSTEZ TÉCNICA + EMBEDDINGS v3.3: EMBEDDINGS REALES, FALLBACK, CACHÉ Y TRAZABILIDAD
 # ============================================================
 
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.3.0"
 LOG_PATH = OUTPUT_DIR / "evalia_runtime.log"
 
 logging.basicConfig(
@@ -44,29 +44,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger("evalia")
 
-app = FastAPI(title="Evalia CRB", version="3.2.0")
+app = FastAPI(title="Evalia CRB", version="3.3.0")
 
 SEMANTIC_CACHE: Dict[str, Any] = {}
 
 # ============================================================
-# EMBEDDINGS SEMÁNTICOS v3.2 — modo híbrido y seguro
+# EMBEDDINGS SEMÁNTICOS v3.3 — activación real segura
 # ============================================================
 # Evalia puede usar embeddings reales si el entorno tiene instalado
 # sentence-transformers y el modelo está disponible. Si no, la app
-# sigue funcionando con el motor semántico por reglas de v3.1.
+# sigue funcionando con el motor semántico por reglas de v3.1/v3.2.
 #
 # Para activar embeddings reales en Render/local:
 #   1) agregar sentence-transformers a requirements.txt
 #   2) definir EVALIA_EMBEDDINGS=1
 #   3) opcional: EVALIA_EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
+#   4) opcional: EVALIA_EMBEDDING_DEVICE=cpu
 
 EMBEDDINGS_ENABLED = os.getenv("EVALIA_EMBEDDINGS", "0").strip().lower() in {"1", "true", "yes", "on"}
 EMBEDDING_MODEL_NAME = os.getenv("EVALIA_EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
+EMBEDDING_DEVICE = os.getenv("EVALIA_EMBEDDING_DEVICE", "cpu")
 EMBEDDING_MODEL = None
 EMBEDDING_STATUS = {
     "enabled_requested": EMBEDDINGS_ENABLED,
     "available": False,
     "model": EMBEDDING_MODEL_NAME,
+    "device": EMBEDDING_DEVICE,
     "mode": "reglas_semanticas",
     "message": "Embeddings no activados; usando motor semántico por reglas."
 }
@@ -79,13 +82,13 @@ def get_embedding_model():
         return EMBEDDING_MODEL
     try:
         from sentence_transformers import SentenceTransformer
-        EMBEDDING_MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        EMBEDDING_MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME, device=EMBEDDING_DEVICE)
         EMBEDDING_STATUS.update({
             "available": True,
             "mode": "hibrido_reglas_embeddings",
-            "message": f"Embeddings activos con modelo {EMBEDDING_MODEL_NAME}."
+            "message": f"Embeddings reales activos con modelo {EMBEDDING_MODEL_NAME} en dispositivo {EMBEDDING_DEVICE}."
         })
-        log_event("embedding_model_loaded", model=EMBEDDING_MODEL_NAME)
+        log_event("embedding_model_loaded", model=EMBEDDING_MODEL_NAME, device=EMBEDDING_DEVICE)
         return EMBEDDING_MODEL
     except Exception as e:
         EMBEDDING_STATUS.update({
@@ -158,7 +161,7 @@ def log_event(event, **kwargs):
     except Exception:
         pass
 
-def safe_error_page(title, message, detail=None, badge="CRB Engine · v3.2 embeddings semánticos"):
+def safe_error_page(title, message, detail=None, badge="CRB Engine · v3.3 embeddings reales"):
     detail_html = f"<br><small>{escape(str(detail))}</small>" if detail else ""
     return HTMLResponse(
         f'''
@@ -872,7 +875,7 @@ def semantic_match_uncached(answer, target, threshold=68, semantic_threshold=62)
     if overlap >= semantic_threshold:
         return True, int(overlap), "solapamiento conceptual"
 
-    # Capa v3.2: embeddings semánticos reales cuando están disponibles.
+    # Capa v3.3: embeddings semánticos reales cuando están disponibles.
     # Se usa como apoyo de recuperación conceptual, especialmente en respuestas breves
     # que no comparten suficientes palabras con la rúbrica.
     emb = embedding_similarity_score(answer_n, target_n)
@@ -1926,7 +1929,7 @@ def base_css():
     """
 
 
-def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v3.2 embeddings semánticos"):
+def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v3.3 embeddings reales"):
     return f"""
     <div class="topbar">
       <div class="brand">
@@ -2491,8 +2494,9 @@ async def upload(
         "embeddings_disponibles": EMBEDDING_STATUS.get("available"),
         "modo": EMBEDDING_STATUS.get("mode"),
         "modelo": EMBEDDING_STATUS.get("model"),
+        "dispositivo": EMBEDDING_STATUS.get("device"),
         "mensaje": EMBEDDING_STATUS.get("message"),
-        "nota": "Si embeddings_disponibles=False, Evalia procesó normalmente con reglas semánticas; para activar embeddings reales agregue sentence-transformers y EVALIA_EMBEDDINGS=1."
+        "nota": "Si embeddings_disponibles=False, Evalia procesó normalmente con reglas semánticas. Para activar embeddings reales agregue sentence-transformers, torch y EVALIA_EMBEDDINGS=1."
     }]
 
     technical_trace_rows = [{
@@ -2506,6 +2510,7 @@ async def upload(
         "cache_semantico_items": len(SEMANTIC_CACHE),
         "embedding_mode": EMBEDDING_STATUS.get("mode"),
         "embedding_model": EMBEDDING_STATUS.get("model"),
+        "embedding_device": EMBEDDING_STATUS.get("device"),
         "log_runtime": str(LOG_PATH.name),
         "criterio_robustez": "validación preventiva + logging + caché semántico + trazabilidad por respuesta"
     }]
@@ -2514,7 +2519,7 @@ async def upload(
     teacher_report_rows.insert(0, {
         "seccion": "Producto",
         "indicador": "Sistema",
-        "valor": "Evalia by Altiora · Inteligencia Semántica Docente · v3.2 embeddings híbridos"
+        "valor": "Evalia by Altiora · Inteligencia Semántica Docente · v3.3 embeddings reales"
     })
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -2543,7 +2548,7 @@ async def upload(
         f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultados · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v3.2 embeddings semánticos")}
+          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v3.3 embeddings reales")}
           <section class="result-card">
             <h1>Procesamiento completado</h1>
             <p class="lead">Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong> y generó un reporte Excel explicable.</p>
@@ -2573,7 +2578,7 @@ def download(filename: str):
         return HTMLResponse(
             f"""
             <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Archivo no encontrado · Evalia</title>{base_css()}</head>
-            <body><div class="page"><main class="shell">{shell_topbar("Archivo no encontrado", "CRB Engine · v3.2 embeddings semánticos")}<div class="result-card">
+            <body><div class="page"><main class="shell">{shell_topbar("Archivo no encontrado", "CRB Engine · v3.3 embeddings reales")}<div class="result-card">
               <h1>No se pudo acceder al archivo</h1>
               <div class="error">El reporte solicitado no existe o no fue generado correctamente.</div>
               <p class="lead">Vuelve al inicio y procesa nuevamente la rúbrica y las respuestas.</p>
