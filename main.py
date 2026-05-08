@@ -28,10 +28,10 @@ RUBRICS_DIR.mkdir(exist_ok=True)
 LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
 # ============================================================
-# ROBUSTEZ TÉCNICA + EMBEDDINGS v3.4: EMBEDDINGS REALES OPTIMIZADOS, FALLBACK, CACHÉ Y TRAZABILIDAD
+# ROBUSTEZ TÉCNICA + EMBEDDINGS v3.5: BASELINE VALIDACIÓN, EMBEDDINGS OPTIMIZADOS, FALLBACK, CACHÉ Y TRAZABILIDAD
 # ============================================================
 
-APP_VERSION = "3.4.0"
+APP_VERSION = "3.5.0"
 LOG_PATH = OUTPUT_DIR / "evalia_runtime.log"
 
 logging.basicConfig(
@@ -44,12 +44,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("evalia")
 
-app = FastAPI(title="Evalia CRB", version="3.4.0")
+app = FastAPI(title="Evalia CRB", version="3.5.0")
 
 SEMANTIC_CACHE: Dict[str, Any] = {}
 
 # ============================================================
-# EMBEDDINGS SEMÁNTICOS v3.4 — activación real segura
+# EMBEDDINGS SEMÁNTICOS v3.5 — activación real segura
 # ============================================================
 # Evalia puede usar embeddings reales si el entorno tiene instalado
 # sentence-transformers y el modelo está disponible. Si no, la app
@@ -248,7 +248,7 @@ def log_event(event, **kwargs):
     except Exception:
         pass
 
-def safe_error_page(title, message, detail=None, badge="CRB Engine · v3.4 embeddings optimizados"):
+def safe_error_page(title, message, detail=None, badge="CRB Engine · v3.5 baseline validación"):
     detail_html = f"<br><small>{escape(str(detail))}</small>" if detail else ""
     return HTMLResponse(
         f'''
@@ -2016,7 +2016,7 @@ def base_css():
     """
 
 
-def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v3.4 embeddings optimizados"):
+def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v3.5 baseline validación"):
     return f"""
     <div class="topbar">
       <div class="brand">
@@ -2608,14 +2608,37 @@ async def upload(
         "embedding_model": EMBEDDING_STATUS.get("model"),
         "embedding_device": EMBEDDING_STATUS.get("device"),
         "log_runtime": str(LOG_PATH.name),
-        "criterio_robustez": "validación preventiva + logging + caché semántico + precálculo batch de embeddings + trazabilidad por respuesta"
+        "criterio_robustez": "baseline congelado + validación preventiva + logging + caché semántico + precálculo batch de embeddings + trazabilidad por respuesta"
+    }]
+
+    validation_science_rows = [{
+        "version": APP_VERSION,
+        "modo_validacion": "baseline_prevalidacion",
+        "baseline_congelado": True,
+        "archivo_respuestas": file.filename,
+        "rubrica": rubric_name,
+        "estudiantes": len(df),
+        "preguntas": len(questions),
+        "respuestas_evaluadas": total_answers,
+        "alta_confianza_pct": auto_rate,
+        "parcial_intermedia_pct": caution_rate,
+        "revision_sugerida_pct": review_rate,
+        "tiempo_total_segundos": elapsed_seconds,
+        "embedding_mode": EMBEDDING_STATUS.get("mode"),
+        "embedding_model": EMBEDDING_STATUS.get("model"),
+        "embedding_batch_status": embedding_batch_info.get("status"),
+        "embedding_batch_precomputed_items": embedding_batch_info.get("precomputed"),
+        "embedding_batch_seconds": embedding_batch_info.get("seconds"),
+        "cache_semantico_items": len(SEMANTIC_CACHE),
+        "variables_exportadas": "score, confidence, status, feedback, patrones semánticos, trazabilidad, embeddings, robustez técnica",
+        "uso_recomendado": "Usar esta versión como baseline estable para comparar Evalia contra corrección humana en corpus reales."
     }]
 
     # Se agrega una fila de identidad de producto al reporte docente.
     teacher_report_rows.insert(0, {
         "seccion": "Producto",
         "indicador": "Sistema",
-        "valor": "Evalia by Altiora · Inteligencia Semántica Docente · v3.4 embeddings optimizados"
+        "valor": "Evalia by Altiora · Inteligencia Semántica Docente · v3.5 baseline validación"
     })
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -2628,6 +2651,7 @@ async def upload(
         pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Resumen_Tecnico", index=False)
         pd.DataFrame(technical_trace_rows).to_excel(writer, sheet_name="ROBUSTEZ_TECNICA", index=False)
         pd.DataFrame(embeddings_rows).to_excel(writer, sheet_name="EMBEDDINGS", index=False)
+        pd.DataFrame(validation_science_rows).to_excel(writer, sheet_name="VALIDACION_CIENTIFICA", index=False)
         pd.DataFrame(insights_rows).to_excel(writer, sheet_name="Analisis_Items", index=False)
         pd.DataFrame(type_insights_rows).to_excel(writer, sheet_name="Analisis_Tipos", index=False)
         pd.DataFrame([{
@@ -2644,7 +2668,7 @@ async def upload(
         f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultados · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v3.4 embeddings optimizados")}
+          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v3.5 baseline validación")}
           <section class="result-card">
             <h1>Procesamiento completado</h1>
             <p class="lead">Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong> y generó un reporte Excel explicable.</p>
@@ -2674,7 +2698,7 @@ def download(filename: str):
         return HTMLResponse(
             f"""
             <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Archivo no encontrado · Evalia</title>{base_css()}</head>
-            <body><div class="page"><main class="shell">{shell_topbar("Archivo no encontrado", "CRB Engine · v3.4 embeddings optimizados")}<div class="result-card">
+            <body><div class="page"><main class="shell">{shell_topbar("Archivo no encontrado", "CRB Engine · v3.5 baseline validación")}<div class="result-card">
               <h1>No se pudo acceder al archivo</h1>
               <div class="error">El reporte solicitado no existe o no fue generado correctamente.</div>
               <p class="lead">Vuelve al inicio y procesa nuevamente la rúbrica y las respuestas.</p>
