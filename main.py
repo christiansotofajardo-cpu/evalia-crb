@@ -11,6 +11,8 @@ import time
 import traceback
 import os
 import math
+import base64
+import mimetypes
 from rapidfuzz import fuzz
 from html import escape
 from typing import Optional, Dict, Any, List, Tuple
@@ -31,7 +33,7 @@ LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 # ROBUSTEZ TÉCNICA + EMBEDDINGS v3.5: BASELINE VALIDACIÓN, EMBEDDINGS OPTIMIZADOS, FALLBACK, CACHÉ Y TRAZABILIDAD
 # ============================================================
 
-APP_VERSION = "4.1.5-core-v3.5-plus-ocr-safe-gate"
+APP_VERSION = "4.2.0-core-v3.5-ocr-modern-router"
 LOG_PATH = OUTPUT_DIR / "evalia_runtime.log"
 
 logging.basicConfig(
@@ -2245,19 +2247,216 @@ def preprocess_image_for_ocr(path):
         return path
 
 
-def run_ocr_on_image(path):
-    """OCR híbrido seguro v1.1: intenta pytesseract y conserva líneas/bloques.
-    Si el binario de Tesseract no está disponible en Render, activa fallback manual transparente.
+def extract_text_from_mistral_response(payload):
+    """Extrae texto desde distintas variantes de respuesta del OCR de Mistral."""
+    if not isinstance(payload, dict):
+        return ""
+
+    parts = []
+
+    # Formato habitual: pages -> markdown/text
+    for page in payload.get("pages", []) or []:
+        if isinstance(page, dict):
+            txt = page.get("markdown") or page.get("text") or page.get("content") or ""
+            if txt:
+                parts.append(str(txt))
+
+    # Fallbacks por si cambia el envelope de respuesta.
+    for key in ["markdown", "text", "content", "output_text"]:
+        if payload.get(key):
+            parts.append(str(payload.get(key)))
+
+    # Algunos SDK/API devuelven choices.
+    for ch in payload.get("choices", []) or []:
+        msg = ch.get("message", {}) if isinstance(ch, dict) else {}
+        content = msg.get("content", "") if isinstance(msg, dict) else ""
+        if content:
+            parts.append(str(content))
+
+    return "\n\n".join([p.strip() for p in parts if str(p).strip()]).strip()
+
+
+def run_mistral_ocr_on_file(path):
+    """OCR moderno principal mediante Mistral OCR.
+
+    Requiere variable de entorno en Render:
+      MISTRAL_API_KEY = tu_api_key
+
+    Usa base64 local, por lo que no requiere URL pública del archivo.
+    Documentación oficial: Mistral OCR soporta imágenes y PDFs con base64.
     """
     started = time.time()
-    if not PIL_AVAILABLE:
+    api_key = os.getenv("MISTRAL_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    try:
+        import requests
+    except Exception as e:
         return {
             "text": "",
             "confidence": 0.0,
-            "engine": "manual_fallback",
-            "seconds": 0.0,
-            "message": "PIL no está disponible; transcripción manual requerida."
+            "engine": "mistral_unavailable",
+            "seconds": round(time.time() - started, 3),
+            "message": f"MISTRAL_API_KEY existe, pero falta requests en requirements: {e}"
         }
+
+    try:
+        file_bytes = Path(path).read_bytes()
+        mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+        b64 = base64.b64encode(file_bytes).decode("utf-8")
+        data_url = f"data:{mime};base64,{b64}"
+
+        # Mistral usa image_url para imágenes y document_url para PDFs/documentos.
+        if mime.startswith("image/"):
+            document = {"type": "image_url", "image_url": data_url}
+        else:
+            document = {"type": "document_url", "document_url": data_url}
+
+        model_name = os.getenv("EVALIA_MISTRAL_OCR_MODEL", "mistral-ocr-latest")
+        timeout = int(os.getenv("EVALIA_OCR_TIMEOUT", "90"))
+        payload = {
+            "model": model_name,
+            "document": document,
+            "include_image_base64": False
+        }
+
+        resp = requests.post(
+            "https://api.mistral.ai/v1/ocr",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json=payload,
+            timeout=timeout,
+        )
+
+        if resp.status_code >= 400:
+            msg = resp.text[:700]
+            log_event("mistral_ocr_failed", file=Path(path).name, status=resp.status_code, error=msg)
+            return {
+                "text": "",
+                "confidence": 0.0,
+                "engine": "mistral_failed",
+                "seconds": round(time.time() - started, 3),
+                "message": f"Mistral OCR respondió {resp.status_code}: {msg}"
+            }
+
+        data = resp.json()
+        text = extract_text_from_mistral_response(data)
+        if not text:
+            return {
+                "text": "",
+                "confidence": 0.0,
+                "engine": "mistral_empty",
+                "seconds": round(time.time() - started, 3),
+                "message": "Mistral OCR se ejecutó, pero no devolvió texto útil."
+            }
+
+        OCR_STATUS.update({
+            "engine": "mistral_ocr",
+            "available": True,
+            "message": "OCR moderno activo con Mistral OCR."
+        })
+        return {
+            "text": text,
+            "confidence": 0.88,
+            "engine": "mistral_ocr",
+            "seconds": round(time.time() - started, 3),
+            "message": f"OCR moderno aplicado con {model_name}."
+        }
+
+    except Exception as e:
+        log_event("mistral_ocr_exception", file=Path(path).name, error=str(e))
+        return {
+            "text": "",
+            "confidence": 0.0,
+            "engine": "mistral_exception",
+            "seconds": round(time.time() - started, 3),
+            "message": f"Mistral OCR falló: {str(e)}"
+        }
+
+
+def run_easyocr_on_image(path):
+    """Fallback local moderno. Es más pesado que Tesseract; úsalo solo si está instalado."""
+    started = time.time()
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        import easyocr
+    except Exception:
+        return None
+
+    try:
+        img_path = preprocess_image_for_ocr(path)
+        langs = os.getenv("EVALIA_EASYOCR_LANGS", "es,en").split(",")
+        reader = easyocr.Reader([x.strip() for x in langs if x.strip()], gpu=False)
+        result = reader.readtext(str(img_path), detail=1, paragraph=False)
+        rows = []
+        confs = []
+        for box, txt, conf in result:
+            if not str(txt).strip():
+                continue
+            try:
+                top = min([p[1] for p in box])
+                left = min([p[0] for p in box])
+            except Exception:
+                top, left = 0, 0
+            rows.append({"top": top, "left": left, "text": str(txt).strip(), "conf": float(conf or 0)})
+            confs.append(float(conf or 0))
+
+        # Agrupación simple por líneas visuales.
+        rows = sorted(rows, key=lambda r: (round(r["top"] / 18), r["left"]))
+        lines = []
+        current_y = None
+        current = []
+        for r in rows:
+            y = round(r["top"] / 18)
+            if current_y is None or y == current_y:
+                current.append(r)
+                current_y = y
+            else:
+                lines.append(" ".join(x["text"] for x in sorted(current, key=lambda z: z["left"])))
+                current = [r]
+                current_y = y
+        if current:
+            lines.append(" ".join(x["text"] for x in sorted(current, key=lambda z: z["left"])))
+
+        text = "\n".join([l.strip() for l in lines if l.strip()]).strip()
+        if not text:
+            return {
+                "text": "",
+                "confidence": 0.0,
+                "engine": "easyocr_empty",
+                "seconds": round(time.time() - started, 3),
+                "message": "EasyOCR se ejecutó, pero no detectó texto útil."
+            }
+
+        OCR_STATUS.update({"engine": "easyocr", "available": True, "message": "OCR local moderno activo con EasyOCR."})
+        return {
+            "text": text,
+            "confidence": round(sum(confs) / max(len(confs), 1), 2),
+            "engine": "easyocr",
+            "seconds": round(time.time() - started, 3),
+            "message": "OCR local aplicado con EasyOCR."
+        }
+    except Exception as e:
+        log_event("easyocr_failed", file=Path(path).name, error=str(e))
+        return {
+            "text": "",
+            "confidence": 0.0,
+            "engine": "easyocr_failed",
+            "seconds": round(time.time() - started, 3),
+            "message": f"EasyOCR falló: {str(e)}"
+        }
+
+
+def run_tesseract_ocr_on_image(path):
+    """Fallback clásico: intenta pytesseract y conserva líneas/bloques."""
+    started = time.time()
+    if not PIL_AVAILABLE:
+        return None
     try:
         import pytesseract
         img_path = preprocess_image_for_ocr(path)
@@ -2290,7 +2489,6 @@ def run_ocr_on_image(path):
                 "conf": c,
             })
 
-        # Reconstrucción respetando líneas. Esto es clave para segmentar respuestas.
         grouped = {}
         for r in rows:
             key = (r["block"], r["par"], r["line"])
@@ -2305,36 +2503,92 @@ def run_ocr_on_image(path):
         avg_conf = round((sum(confs) / len(confs)) / 100, 2) if confs else 0.0
 
         if not text:
-            OCR_STATUS.update({"engine": "pytesseract_empty", "available": False, "message": "OCR ejecutado sin texto útil."})
             return {
                 "text": "",
                 "confidence": 0.0,
                 "engine": "pytesseract_empty",
                 "seconds": round(time.time() - started, 3),
-                "message": "OCR ejecutado, pero no se detectó texto útil. Usa el campo de transcripción manual."
+                "message": "Tesseract se ejecutó, pero no detectó texto útil."
             }
 
-        OCR_STATUS.update({"engine": "pytesseract", "available": True, "message": "OCR automático activo con pytesseract."})
+        OCR_STATUS.update({"engine": "pytesseract", "available": True, "message": "OCR clásico activo con pytesseract."})
         return {
             "text": text,
             "confidence": avg_conf,
             "engine": "pytesseract_lines",
             "seconds": round(time.time() - started, 3),
-            "message": "OCR automático aplicado conservando líneas."
+            "message": "OCR clásico aplicado conservando líneas."
         }
     except Exception as e:
         msg = str(e)
         hint = ""
         if "tesseract" in msg.lower():
             hint = " En Render esto suele indicar que falta el binario del sistema Tesseract, no solo la librería pytesseract."
-        log_event("ocr_unavailable_or_failed", file=path.name, error=msg)
+        log_event("tesseract_unavailable_or_failed", file=Path(path).name, error=msg)
         return {
             "text": "",
             "confidence": 0.0,
-            "engine": "manual_fallback",
+            "engine": "pytesseract_failed",
             "seconds": round(time.time() - started, 3),
-            "message": f"OCR no disponible o falló: {msg}.{hint} Puedes pegar/transcribir el texto manualmente."
+            "message": f"Tesseract no disponible o falló: {msg}.{hint}"
         }
+
+
+def run_ocr_on_image(path):
+    """Router OCR moderno v2.
+
+    Orden:
+      1) Mistral OCR si existe MISTRAL_API_KEY.
+      2) EasyOCR si está instalado.
+      3) Pytesseract si está instalado y el binario existe.
+      4) Fallback manual editable.
+
+    Regla de seguridad: nunca rompe Evalia ni evalúa en cero sin revisión docente.
+    """
+    started = time.time()
+    attempts = []
+
+    # 1) OCR moderno cloud.
+    mistral_result = run_mistral_ocr_on_file(path)
+    if mistral_result is not None:
+        attempts.append(mistral_result)
+        if str(mistral_result.get("text", "")).strip():
+            mistral_result["attempts"] = attempts
+            return mistral_result
+
+    # 2) OCR local moderno, opcional.
+    if os.getenv("EVALIA_USE_EASYOCR", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        easy_result = run_easyocr_on_image(path)
+        if easy_result is not None:
+            attempts.append(easy_result)
+            if str(easy_result.get("text", "")).strip():
+                easy_result["attempts"] = attempts
+                return easy_result
+
+    # 3) OCR clásico como último intento.
+    if os.getenv("EVALIA_USE_TESSERACT", "1").strip().lower() in {"1", "true", "yes", "on"}:
+        tess_result = run_tesseract_ocr_on_image(path)
+        if tess_result is not None:
+            attempts.append(tess_result)
+            if str(tess_result.get("text", "")).strip():
+                tess_result["attempts"] = attempts
+                return tess_result
+
+    # 4) Fallback manual.
+    detail = " | ".join([f"{a.get('engine')}: {a.get('message')}" for a in attempts])
+    OCR_STATUS.update({
+        "engine": "manual_fallback",
+        "available": False,
+        "message": "OCR automático no produjo texto útil; se habilita revisión/transcripción manual."
+    })
+    return {
+        "text": "",
+        "confidence": 0.0,
+        "engine": "manual_fallback",
+        "seconds": round(time.time() - started, 3),
+        "message": "OCR automático no produjo texto útil. " + (detail if detail else "Configura MISTRAL_API_KEY o revisa la calidad de imagen."),
+        "attempts": attempts
+    }
 
 def compact_for_matching(txt):
     return re.sub(r"\s+", " ", normalize_text(txt or "")).strip()
