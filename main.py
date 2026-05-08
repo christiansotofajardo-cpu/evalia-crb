@@ -31,7 +31,7 @@ LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 # ROBUSTEZ TÉCNICA + EMBEDDINGS v3.5: BASELINE VALIDACIÓN, EMBEDDINGS OPTIMIZADOS, FALLBACK, CACHÉ Y TRAZABILIDAD
 # ============================================================
 
-APP_VERSION = "4.0.0-ocr-mvp-v1"
+APP_VERSION = "4.1.0-ocr-v1.1"
 LOG_PATH = OUTPUT_DIR / "evalia_runtime.log"
 
 logging.basicConfig(
@@ -44,7 +44,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("evalia")
 
-app = FastAPI(title="Evalia OCR-MVP", version="4.0.0-ocr-mvp-v1")
+app = FastAPI(title="Evalia OCR-MVP", version="4.1.0-ocr-v1.1")
 
 SEMANTIC_CACHE: Dict[str, Any] = {}
 
@@ -2012,7 +2012,7 @@ def base_css():
         .features, .metric-grid, .templates { grid-template-columns: 1fr; }
         .topbar { align-items: flex-start; gap: 14px; flex-direction: column; }
       }
-    </style>
+    .dropzone{border:2px dashed #93c5fd;background:#f8fbff;border-radius:16px;padding:14px;margin:8px 0 12px 0}.dropzone input{display:block;width:100%;margin-bottom:6px}.dropzone small{color:#475569}.ocr-warning{background:#fff7ed;border:1px solid #fed7aa;color:#7c2d12;padding:12px;border-radius:14px;margin:12px 0}</style>
     """
 
 
@@ -2246,7 +2246,9 @@ def preprocess_image_for_ocr(path):
 
 
 def run_ocr_on_image(path):
-    """OCR híbrido seguro: usa pytesseract si existe; si no, deja campo editable."""
+    """OCR híbrido seguro v1.1: intenta pytesseract y conserva líneas/bloques.
+    Si el binario de Tesseract no está disponible en Render, activa fallback manual transparente.
+    """
     started = time.time()
     if not PIL_AVAILABLE:
         return {
@@ -2263,79 +2265,180 @@ def run_ocr_on_image(path):
         config = os.getenv("EVALIA_TESSERACT_CONFIG", "--oem 3 --psm 6")
         lang = os.getenv("EVALIA_OCR_LANG", "spa+eng")
         data = pytesseract.image_to_data(img, lang=lang, config=config, output_type=pytesseract.Output.DICT)
-        words = []
+
+        rows = []
         confs = []
-        for txt, conf in zip(data.get("text", []), data.get("conf", [])):
-            txt = str(txt).strip()
-            if txt:
-                words.append(txt)
-                try:
-                    c = float(conf)
-                    if c >= 0:
-                        confs.append(c)
-                except Exception:
-                    pass
-        text = " ".join(words)
+        n = len(data.get("text", []))
+        for i in range(n):
+            txt = str(data.get("text", [""])[i]).strip()
+            if not txt:
+                continue
+            try:
+                c = float(data.get("conf", [0])[i])
+                if c >= 0:
+                    confs.append(c)
+            except Exception:
+                c = 0
+            rows.append({
+                "block": data.get("block_num", [0])[i],
+                "par": data.get("par_num", [0])[i],
+                "line": data.get("line_num", [0])[i],
+                "word": data.get("word_num", [0])[i],
+                "left": data.get("left", [0])[i],
+                "top": data.get("top", [0])[i],
+                "text": txt,
+                "conf": c,
+            })
+
+        # Reconstrucción respetando líneas. Esto es clave para segmentar respuestas.
+        grouped = {}
+        for r in rows:
+            key = (r["block"], r["par"], r["line"])
+            grouped.setdefault(key, []).append(r)
+        lines = []
+        for key in sorted(grouped.keys()):
+            words = sorted(grouped[key], key=lambda x: (x["left"], x["word"]))
+            line = " ".join(w["text"] for w in words).strip()
+            if line:
+                lines.append(line)
+        text = "\n".join(lines).strip()
         avg_conf = round((sum(confs) / len(confs)) / 100, 2) if confs else 0.0
+
+        if not text:
+            OCR_STATUS.update({"engine": "pytesseract_empty", "available": False, "message": "OCR ejecutado sin texto útil."})
+            return {
+                "text": "",
+                "confidence": 0.0,
+                "engine": "pytesseract_empty",
+                "seconds": round(time.time() - started, 3),
+                "message": "OCR ejecutado, pero no se detectó texto útil. Usa el campo de transcripción manual."
+            }
+
         OCR_STATUS.update({"engine": "pytesseract", "available": True, "message": "OCR automático activo con pytesseract."})
         return {
             "text": text,
             "confidence": avg_conf,
-            "engine": "pytesseract",
+            "engine": "pytesseract_lines",
             "seconds": round(time.time() - started, 3),
-            "message": "OCR automático aplicado."
+            "message": "OCR automático aplicado conservando líneas."
         }
     except Exception as e:
-        log_event("ocr_unavailable_or_failed", file=path.name, error=str(e))
+        msg = str(e)
+        hint = ""
+        if "tesseract" in msg.lower():
+            hint = " En Render esto suele indicar que falta el binario del sistema Tesseract, no solo la librería pytesseract."
+        log_event("ocr_unavailable_or_failed", file=path.name, error=msg)
         return {
             "text": "",
             "confidence": 0.0,
             "engine": "manual_fallback",
             "seconds": round(time.time() - started, 3),
-            "message": f"OCR no disponible o falló: {str(e)}. Puedes pegar/transcribir el texto manualmente."
+            "message": f"OCR no disponible o falló: {msg}.{hint} Puedes pegar/transcribir el texto manualmente."
         }
+
+def compact_for_matching(txt):
+    return re.sub(r"\s+", " ", normalize_text(txt or "")).strip()
+
+
+def strip_prompt_from_segment(segment, prompt):
+    """Quita el enunciado detectado dentro del OCR para dejar preferentemente la respuesta."""
+    seg = str(segment or "").strip()
+    pr = str(prompt or "").strip()
+    if not seg or not pr:
+        return seg
+    seg_norm = compact_for_matching(seg)
+    pr_norm = compact_for_matching(pr)
+    if not pr_norm:
+        return seg
+    # Si el prompt aparece casi literal, corta después del prompt original aproximado por longitud.
+    pos = seg_norm.find(pr_norm[:max(18, min(len(pr_norm), 55))])
+    if pos >= 0:
+        # Fallback simple: remueve las palabras del prompt desde el inicio si están cerca.
+        prompt_words = pr_norm.split()
+        seg_words = seg.split()
+        if len(seg_words) > len(prompt_words):
+            return " ".join(seg_words[min(len(prompt_words), len(seg_words)):]).strip()
+    return seg
 
 
 def segment_ocr_text_by_questions(raw_text, rubric):
-    """Segmenta por marcas P1/P2/Pregunta 1/1. Si no logra segmentar, deja sugerencia editable."""
-    text = str(raw_text or "")
+    """Segmentador OCR v1.1.
+    Usa tres capas: marcas numéricas, anclas por enunciado de rúbrica y fallback manual.
+    """
+    text = str(raw_text or "").replace("\r", "\n")
     questions = rubric.get("questions", [])
     segments = {str(q.get("id", "")): "" for q in questions}
     if not text.strip() or not questions:
         return segments, {"mode": "empty_or_manual", "confidence": 0.0, "notes": "No hay texto OCR suficiente para segmentar."}
 
+    # Normaliza marcas frecuentes que Tesseract confunde.
+    working = re.sub(r"(?m)^\s*(\d+)\s+", r"\1. ", text)
+    working = re.sub(r"(?i)preg\.?\s*(\d+)", r"Pregunta \1", working)
+
     markers = []
     for q in questions:
         qid = str(q.get("id", ""))
-        patterns = normalize_question_id_for_regex(qid)
-        for pat in patterns:
-            m = re.search(rf"(?i)(^|\s)({pat})(\s|:)", text)
-            if m:
-                markers.append((m.start(2), qid, m.end(2)))
+        for pat in normalize_question_id_for_regex(qid):
+            for m in re.finditer(rf"(?im)(^|\n|\s)({pat})(\s|:)", working):
+                markers.append((m.start(2), qid, m.end(2), "marker"))
                 break
-    markers = sorted(markers, key=lambda x: x[0])
+            if any(x[1] == qid for x in markers):
+                break
+
+    # Segunda capa: buscar inicios por fragmentos del prompt.
+    low_work = compact_for_matching(working)
+    for q in questions:
+        qid = str(q.get("id", ""))
+        if any(x[1] == qid for x in markers):
+            continue
+        prompt = compact_for_matching(q.get("prompt", ""))
+        if len(prompt) < 18:
+            continue
+        candidates = [prompt[:60], prompt[:40], " ".join(prompt.split()[:6])]
+        for cand in candidates:
+            if len(cand) < 18:
+                continue
+            idx = low_work.find(cand)
+            if idx >= 0:
+                # Índice aproximado sobre texto original; suficiente para ordenar cortes.
+                approx = int(idx / max(len(low_work), 1) * len(working))
+                markers.append((approx, qid, approx, "prompt_anchor"))
+                break
+
+    # Deduplicar por pregunta, conservando la primera posición.
+    dedup = {}
+    for pos, qid, endpos, mode in sorted(markers, key=lambda x: x[0]):
+        dedup.setdefault(qid, (pos, qid, endpos, mode))
+    markers = sorted(dedup.values(), key=lambda x: x[0])
 
     if len(markers) >= 2:
-        for i, (start, qid, end_marker) in enumerate(markers):
-            end = markers[i + 1][0] if i + 1 < len(markers) else len(text)
-            seg = text[end_marker:end]
+        q_by_id = {str(q.get("id", "")): q for q in questions}
+        for i, (start, qid, end_marker, mode) in enumerate(markers):
+            end = markers[i + 1][0] if i + 1 < len(markers) else len(working)
+            seg = working[end_marker:end]
             seg = re.sub(r"^\s*[:\).-]*\s*", "", seg).strip()
+            seg = strip_prompt_from_segment(seg, q_by_id.get(qid, {}).get("prompt", ""))
+            # Limpieza de restos de corrección docente frecuentes.
+            seg = re.sub(r"(?i)\b(bien|buena justificacion|buena justificación|falto mas detalle|faltó más detalle)\b", "", seg).strip()
             segments[qid] = seg
-        conf = min(0.90, 0.45 + 0.10 * len([v for v in segments.values() if v.strip()]))
-        return segments, {"mode": "by_question_markers", "confidence": round(conf, 2), "notes": "Segmentación por marcas visibles de pregunta."}
+        filled = len([v for v in segments.values() if v.strip()])
+        conf = min(0.92, 0.40 + 0.08 * filled + (0.10 if any(m[3] == "prompt_anchor" for m in markers) else 0))
+        return segments, {"mode": "markers_plus_prompt_anchors", "confidence": round(conf, 2), "notes": "Segmentación por marcas visibles y/o enunciados de la rúbrica."}
 
-    # Fallback conservador: reparte por líneas largas si el número calza aproximadamente.
-    chunks = [c.strip() for c in re.split(r"\n+|(?<=\.)\s{2,}", text) if c.strip()]
-    if len(chunks) >= len(questions):
-        for q, chunk in zip(questions, chunks):
-            segments[str(q.get("id", ""))] = chunk
-        return segments, {"mode": "line_fallback", "confidence": 0.45, "notes": "Segmentación tentativa por bloques de texto; revisar manualmente."}
+    # Fallback: si el docente pegó texto ordenado con separadores tipo P1:, P2:, etc.
+    manual_markers = re.split(r"(?im)(?:^|\n)\s*(?:p|pregunta)?\s*(\d{1,2})\s*[:\).-]\s*", working)
+    if len(manual_markers) > 2:
+        for i in range(1, len(manual_markers), 2):
+            n = manual_markers[i]
+            ans = manual_markers[i+1] if i+1 < len(manual_markers) else ""
+            for q in questions:
+                if item_number(q.get("id")) == n:
+                    segments[str(q.get("id"))] = ans.strip()
+        return segments, {"mode": "manual_numbered_text", "confidence": 0.70, "notes": "Segmentación desde texto numerado pegado/editado manualmente."}
 
-    # Último fallback: deja todo en la primera pregunta para que el docente edite.
     first = str(questions[0].get("id", ""))
-    segments[first] = text.strip()
+    segments[first] = working.strip()
     return segments, {"mode": "manual_review_required", "confidence": 0.25, "notes": "No se detectaron marcas suficientes; revisar y distribuir respuestas manualmente."}
-
 
 def ocr_confidence_state(ocr_conf, seg_conf):
     combined = round((0.65 * float(ocr_conf or 0)) + (0.35 * float(seg_conf or 0)), 2)
@@ -2371,9 +2474,9 @@ def hidden_input(name, value):
 @app.get("/ocr", response_class=HTMLResponse)
 def ocr_home():
     return HTMLResponse(f"""
-    <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Evalia OCR-MVP v1</title>{base_css()}</head>
+    <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Evalia OCR v1.1</title>{base_css()}</head>
     <body><div class="page"><main class="shell">
-      {shell_topbar("Evalia OCR-MVP v1", "Inteligencia evaluativa explicable")}
+      {shell_topbar("Evalia OCR v1.1", "Inteligencia evaluativa explicable")}
       <section class="hero"><div class="hero-inner">
         <h1>Evaluación desde imágenes manuscritas</h1>
         <p class="lead">Sube una rúbrica, identifica al estudiante y carga fotos de sus hojas. Evalia hará OCR cuando esté disponible, segmentará respuestas y dejará todo editable antes de evaluar.</p>
@@ -2384,8 +2487,8 @@ def ocr_home():
             <label class="field-label">Fecha</label><input name="exam_date" placeholder="2026-05-08" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
             <label class="field-label">ID estudiante</label><input name="student_id" required placeholder="Ej.: A01" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
             <label class="field-label">Nombre estudiante</label><input name="student_name" required placeholder="Nombre completo" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
-            <label class="field-label">Rúbrica Excel/JSON</label><input name="rubric_file" type="file" accept=".xlsx,.xls,.json" required>
-            <label class="field-label">Imágenes de hojas del estudiante</label><input name="image_files" type="file" accept="image/*" multiple required>
+            <label class="field-label">Rúbrica Excel/JSON</label><div class="dropzone"><input name="rubric_file" type="file" accept=".xlsx,.xls,.json" required><small>Arrastra o selecciona la rúbrica Excel/JSON</small></div>
+            <label class="field-label">Imágenes de hojas del estudiante</label><div class="dropzone"><input name="image_files" type="file" accept="image/*" multiple required><small>Arrastra o selecciona una o más fotos/escaneos del estudiante</small></div>
             <div class="actions"><button type="submit">Procesar OCR y revisar</button><a class="button secondary" href="/">Volver a Excel</a></div>
           </div>
         </form>
@@ -2454,7 +2557,7 @@ async def ocr_process(
         return HTMLResponse(f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Revisión OCR · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Revisión docente OCR", "Evalia OCR-MVP v1")}
+          {shell_topbar("Revisión docente OCR", "Evalia OCR v1.1")}
           <section class="result-card">
             <h1>Revisa y corrige antes de evaluar</h1>
             <p class="lead"><strong>{escape(student_name)}</strong> · {escape(student_id)} · {escape(course)} · {escape(exam_name)}</p>
@@ -2503,6 +2606,8 @@ async def ocr_evaluate(request: Request):
         for q in rubric.get("questions", []):
             qid = str(q.get("id", ""))
             answer = str(form.get(f"answer__{qid}", ""))
+            if not answer.strip() and fallback_segments.get(qid, "").strip():
+                answer = fallback_segments.get(qid, "")
             score, conf, fb, status = score_answer(answer, q)
             diagnosis = semantic_diagnosis(answer, q, score=score, confidence=conf, status=status)
             cog_level = cognitive_level_from_score(score, q.get("max_score", 1), conf, diagnosis)
@@ -2553,7 +2658,7 @@ async def ocr_evaluate(request: Request):
         return HTMLResponse(f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultado OCR · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Reporte OCR generado", "Evalia OCR-MVP v1")}
+          {shell_topbar("Reporte OCR generado", "Evalia OCR v1.1")}
           <section class="result-card">
             <h1>Evaluación completada</h1>
             <p class="lead"><strong>{escape(meta.get('student_name',''))}</strong> obtuvo {round(total,2)} / {total_score} puntos ({pct}%).</p>
