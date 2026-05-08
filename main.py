@@ -31,7 +31,7 @@ LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 # ROBUSTEZ TÉCNICA + EMBEDDINGS v3.5: BASELINE VALIDACIÓN, EMBEDDINGS OPTIMIZADOS, FALLBACK, CACHÉ Y TRAZABILIDAD
 # ============================================================
 
-APP_VERSION = "3.5.0"
+APP_VERSION = "4.0.0-ocr-mvp-v1"
 LOG_PATH = OUTPUT_DIR / "evalia_runtime.log"
 
 logging.basicConfig(
@@ -44,7 +44,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("evalia")
 
-app = FastAPI(title="Evalia CRB", version="3.5.0")
+app = FastAPI(title="Evalia OCR-MVP", version="4.0.0-ocr-mvp-v1")
 
 SEMANTIC_CACHE: Dict[str, Any] = {}
 
@@ -2187,6 +2187,391 @@ async def preview_upload(
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
 
+
+
+# ============================================================
+# EVALIA OCR-MVP v1 · CAPA DE INTELIGENCIA EVALUATIVA EXPLICABLE
+# ============================================================
+# Esta capa NO reemplaza el motor semántico v3.5: lo reutiliza.
+# Agrega flujo por estudiante: imágenes -> OCR -> segmentación -> edición docente -> evaluación.
+
+IMAGE_DIR = OUTPUT_DIR / "ocr_images"
+IMAGE_DIR.mkdir(exist_ok=True)
+
+OCR_STATUS = {
+    "engine": "manual_fallback",
+    "available": False,
+    "message": "OCR automático no disponible; se habilita transcripción/edición manual."
+}
+
+try:
+    from PIL import Image, ImageOps, ImageFilter
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
+
+
+def safe_session_id(*parts):
+    raw = "||".join(str(x) for x in parts) + "||" + str(time.time())
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def normalize_question_id_for_regex(qid):
+    n = item_number(qid)
+    if n:
+        return [re.escape(str(qid)), rf"p\s*{n}", rf"pregunta\s*{n}", rf"item\s*{n}", rf"{n}\s*[\)\.-]"]
+    return [re.escape(str(qid))]
+
+
+def preprocess_image_for_ocr(path):
+    """Preprocesamiento liviano para fotos WhatsApp: orientación, escala, gris y contraste."""
+    if not PIL_AVAILABLE:
+        return path
+    try:
+        img = Image.open(path)
+        img = ImageOps.exif_transpose(img)
+        max_side = max(img.size)
+        if max_side < 1800:
+            scale = 1800 / max_side
+            img = img.resize((int(img.width * scale), int(img.height * scale)))
+        img = ImageOps.grayscale(img)
+        img = ImageOps.autocontrast(img)
+        img = img.filter(ImageFilter.SHARPEN)
+        out = Path(str(path) + "_pre.png")
+        img.save(out)
+        return out
+    except Exception as e:
+        log_event("ocr_preprocess_failed", file=path.name, error=str(e))
+        return path
+
+
+def run_ocr_on_image(path):
+    """OCR híbrido seguro: usa pytesseract si existe; si no, deja campo editable."""
+    started = time.time()
+    if not PIL_AVAILABLE:
+        return {
+            "text": "",
+            "confidence": 0.0,
+            "engine": "manual_fallback",
+            "seconds": 0.0,
+            "message": "PIL no está disponible; transcripción manual requerida."
+        }
+    try:
+        import pytesseract
+        img_path = preprocess_image_for_ocr(path)
+        img = Image.open(img_path)
+        config = os.getenv("EVALIA_TESSERACT_CONFIG", "--oem 3 --psm 6")
+        lang = os.getenv("EVALIA_OCR_LANG", "spa+eng")
+        data = pytesseract.image_to_data(img, lang=lang, config=config, output_type=pytesseract.Output.DICT)
+        words = []
+        confs = []
+        for txt, conf in zip(data.get("text", []), data.get("conf", [])):
+            txt = str(txt).strip()
+            if txt:
+                words.append(txt)
+                try:
+                    c = float(conf)
+                    if c >= 0:
+                        confs.append(c)
+                except Exception:
+                    pass
+        text = " ".join(words)
+        avg_conf = round((sum(confs) / len(confs)) / 100, 2) if confs else 0.0
+        OCR_STATUS.update({"engine": "pytesseract", "available": True, "message": "OCR automático activo con pytesseract."})
+        return {
+            "text": text,
+            "confidence": avg_conf,
+            "engine": "pytesseract",
+            "seconds": round(time.time() - started, 3),
+            "message": "OCR automático aplicado."
+        }
+    except Exception as e:
+        log_event("ocr_unavailable_or_failed", file=path.name, error=str(e))
+        return {
+            "text": "",
+            "confidence": 0.0,
+            "engine": "manual_fallback",
+            "seconds": round(time.time() - started, 3),
+            "message": f"OCR no disponible o falló: {str(e)}. Puedes pegar/transcribir el texto manualmente."
+        }
+
+
+def segment_ocr_text_by_questions(raw_text, rubric):
+    """Segmenta por marcas P1/P2/Pregunta 1/1. Si no logra segmentar, deja sugerencia editable."""
+    text = str(raw_text or "")
+    questions = rubric.get("questions", [])
+    segments = {str(q.get("id", "")): "" for q in questions}
+    if not text.strip() or not questions:
+        return segments, {"mode": "empty_or_manual", "confidence": 0.0, "notes": "No hay texto OCR suficiente para segmentar."}
+
+    markers = []
+    for q in questions:
+        qid = str(q.get("id", ""))
+        patterns = normalize_question_id_for_regex(qid)
+        for pat in patterns:
+            m = re.search(rf"(?i)(^|\s)({pat})(\s|:)", text)
+            if m:
+                markers.append((m.start(2), qid, m.end(2)))
+                break
+    markers = sorted(markers, key=lambda x: x[0])
+
+    if len(markers) >= 2:
+        for i, (start, qid, end_marker) in enumerate(markers):
+            end = markers[i + 1][0] if i + 1 < len(markers) else len(text)
+            seg = text[end_marker:end]
+            seg = re.sub(r"^\s*[:\).-]*\s*", "", seg).strip()
+            segments[qid] = seg
+        conf = min(0.90, 0.45 + 0.10 * len([v for v in segments.values() if v.strip()]))
+        return segments, {"mode": "by_question_markers", "confidence": round(conf, 2), "notes": "Segmentación por marcas visibles de pregunta."}
+
+    # Fallback conservador: reparte por líneas largas si el número calza aproximadamente.
+    chunks = [c.strip() for c in re.split(r"\n+|(?<=\.)\s{2,}", text) if c.strip()]
+    if len(chunks) >= len(questions):
+        for q, chunk in zip(questions, chunks):
+            segments[str(q.get("id", ""))] = chunk
+        return segments, {"mode": "line_fallback", "confidence": 0.45, "notes": "Segmentación tentativa por bloques de texto; revisar manualmente."}
+
+    # Último fallback: deja todo en la primera pregunta para que el docente edite.
+    first = str(questions[0].get("id", ""))
+    segments[first] = text.strip()
+    return segments, {"mode": "manual_review_required", "confidence": 0.25, "notes": "No se detectaron marcas suficientes; revisar y distribuir respuestas manualmente."}
+
+
+def ocr_confidence_state(ocr_conf, seg_conf):
+    combined = round((0.65 * float(ocr_conf or 0)) + (0.35 * float(seg_conf or 0)), 2)
+    if combined >= 0.78:
+        return combined, "verde", "OCR/segmentación confiable"
+    if combined >= 0.48:
+        return combined, "amarillo", "OCR/segmentación aceptable con cautela"
+    return combined, "rojo", "Revisión manual recomendada"
+
+
+def cognitive_level_from_score(score, max_score, confidence, diagnosis):
+    pct = (float(score) / float(max_score or 1)) if max_score else 0
+    coverage = float(diagnosis.get("conceptual_coverage", 0) or 0)
+    relations = bool(diagnosis.get("conceptual_relations", ""))
+    profile = diagnosis.get("answer_profile", "")
+    if pct <= 0.05:
+        return "E0 · incorrecto/no evaluable"
+    if pct < 0.40 or coverage < 0.30:
+        return "E1 · fragmentario"
+    if pct < 0.70:
+        return "E2 · funcional"
+    if pct < 0.90 or not relations:
+        return "E3 · elaborado"
+    if relations and profile == "developed" and confidence >= 0.75:
+        return "E4 · profundo/inferencial"
+    return "E3 · elaborado"
+
+
+def hidden_input(name, value):
+    return f'<input type="hidden" name="{escape(name)}" value="{escape(str(value), quote=True)}">'
+
+
+@app.get("/ocr", response_class=HTMLResponse)
+def ocr_home():
+    return HTMLResponse(f"""
+    <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Evalia OCR-MVP v1</title>{base_css()}</head>
+    <body><div class="page"><main class="shell">
+      {shell_topbar("Evalia OCR-MVP v1", "Inteligencia evaluativa explicable")}
+      <section class="hero"><div class="hero-inner">
+        <h1>Evaluación desde imágenes manuscritas</h1>
+        <p class="lead">Sube una rúbrica, identifica al estudiante y carga fotos de sus hojas. Evalia hará OCR cuando esté disponible, segmentará respuestas y dejará todo editable antes de evaluar.</p>
+        <form action="/ocr/process" enctype="multipart/form-data" method="post">
+          <div class="panel">
+            <label class="field-label">Curso</label><input name="course" placeholder="Ej.: Psicolingüística" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
+            <label class="field-label">Certamen / evaluación</label><input name="exam_name" placeholder="Ej.: Certamen 1" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
+            <label class="field-label">Fecha</label><input name="exam_date" placeholder="2026-05-08" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
+            <label class="field-label">ID estudiante</label><input name="student_id" required placeholder="Ej.: A01" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
+            <label class="field-label">Nombre estudiante</label><input name="student_name" required placeholder="Nombre completo" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
+            <label class="field-label">Rúbrica Excel/JSON</label><input name="rubric_file" type="file" accept=".xlsx,.xls,.json" required>
+            <label class="field-label">Imágenes de hojas del estudiante</label><input name="image_files" type="file" accept="image/*" multiple required>
+            <div class="actions"><button type="submit">Procesar OCR y revisar</button><a class="button secondary" href="/">Volver a Excel</a></div>
+          </div>
+        </form>
+      </div></section>{footer_altiora()}
+    </main></div></body></html>
+    """)
+
+
+@app.post("/ocr/process", response_class=HTMLResponse)
+async def ocr_process(
+    course: str = Form(""),
+    exam_name: str = Form(""),
+    exam_date: str = Form(""),
+    student_id: str = Form(""),
+    student_name: str = Form(""),
+    rubric_file: UploadFile = File(...),
+    image_files: List[UploadFile] = File(...)
+):
+    try:
+        rubric = await load_uploaded_rubric(rubric_file)
+        issues = validate_rubric_integrity(rubric)
+        if issues:
+            return safe_error_page("Rúbrica con problemas", "La rúbrica debe corregirse antes de evaluar.", "; ".join(issues))
+
+        session_id = safe_session_id(student_id, student_name, exam_name)
+        saved_rubric = OUTPUT_DIR / f"ocr_session_{session_id}_rubric.json"
+        saved_rubric.write_text(json.dumps(rubric, ensure_ascii=False), encoding="utf-8")
+
+        ocr_blocks = []
+        all_text_parts = []
+        for idx, img in enumerate(image_files, start=1):
+            suffix = Path(img.filename or f"hoja_{idx}.png").suffix or ".png"
+            safe_name = f"{session_id}_hoja_{idx}{suffix}"
+            out_path = IMAGE_DIR / safe_name
+            with open(out_path, "wb") as f:
+                f.write(await img.read())
+            result = run_ocr_on_image(out_path)
+            ocr_blocks.append({"file": img.filename, "stored_file": safe_name, **result})
+            if result.get("text"):
+                all_text_parts.append(f"\n\n[HOJA {idx}]\n" + result.get("text", ""))
+
+        raw_text = "\n".join(all_text_parts).strip()
+        segments, seg_info = segment_ocr_text_by_questions(raw_text, rubric)
+        avg_ocr_conf = round(sum(float(b.get("confidence", 0) or 0) for b in ocr_blocks) / max(len(ocr_blocks), 1), 2)
+        combined_conf, color_state, state_label = ocr_confidence_state(avg_ocr_conf, seg_info.get("confidence", 0))
+
+        meta = {"course": course, "exam_name": exam_name, "exam_date": exam_date, "student_id": student_id, "student_name": student_name}
+        saved_meta = OUTPUT_DIR / f"ocr_session_{session_id}_meta.json"
+        saved_meta.write_text(json.dumps({"meta": meta, "ocr_blocks": ocr_blocks, "raw_text": raw_text, "segmentation": seg_info}, ensure_ascii=False), encoding="utf-8")
+
+        q_html = []
+        for q in rubric.get("questions", []):
+            qid = str(q.get("id", ""))
+            prompt = q.get("prompt", "")
+            q_html.append(f"""
+            <div class="template-card" style="display:block;">
+              <strong>{escape(qid)} · {escape(display_item_type(q.get('item_type','')))} · {q.get('max_score', '')} pts</strong>
+              <span>{escape(prompt)}</span>
+              <textarea name="answer__{escape(qid)}" rows="5" style="width:100%;margin-top:10px;padding:12px;border-radius:14px;border:1px solid #d1d5db;">{escape(segments.get(qid, ''))}</textarea>
+            </div>
+            """)
+
+        ocr_detail = "<br>".join([escape(f"{b.get('file')}: {b.get('engine')} · conf={b.get('confidence')} · {b.get('message')}") for b in ocr_blocks])
+        color_badge = {"verde":"#dcfce7", "amarillo":"#fef9c3", "rojo":"#fee2e2"}.get(color_state, "#f3f4f6")
+
+        return HTMLResponse(f"""
+        <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Revisión OCR · Evalia</title>{base_css()}</head>
+        <body><div class="page"><main class="shell">
+          {shell_topbar("Revisión docente OCR", "Evalia OCR-MVP v1")}
+          <section class="result-card">
+            <h1>Revisa y corrige antes de evaluar</h1>
+            <p class="lead"><strong>{escape(student_name)}</strong> · {escape(student_id)} · {escape(course)} · {escape(exam_name)}</p>
+            <div class="metric-grid">
+              <div class="metric"><div class="metric-value">{combined_conf}</div><div class="metric-label">confianza OCR global</div></div>
+              <div class="metric"><div class="metric-value">{seg_info.get('confidence',0)}</div><div class="metric-label">confianza segmentación</div></div>
+              <div class="metric"><div class="metric-value">{len(rubric.get('questions', []))}</div><div class="metric-label">preguntas</div></div>
+            </div>
+            <div style="background:{color_badge};padding:12px;border-radius:14px;margin:12px 0;"><strong>{escape(state_label)}</strong><br><small>{escape(seg_info.get('notes',''))}</small><br><small>{ocr_detail}</small></div>
+            <form action="/ocr/evaluate" method="post">
+              {hidden_input('session_id', session_id)}
+              {''.join(q_html)}
+              <label class="field-label">Texto OCR bruto editable / respaldo</label>
+              <textarea name="raw_text_edited" rows="8" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">{escape(raw_text)}</textarea>
+              <div class="actions"><button type="submit">Evaluar respuestas editadas</button><a class="button secondary" href="/ocr">Cargar otro estudiante</a></div>
+            </form>
+          </section>{footer_altiora()}
+        </main></div></body></html>
+        """)
+    except Exception as e:
+        logger.error("ocr_process_failed | %s\n%s", e, traceback.format_exc())
+        return safe_error_page("Error OCR controlado", "No se pudo completar el procesamiento OCR.", str(e))
+
+
+@app.post("/ocr/evaluate", response_class=HTMLResponse)
+async def ocr_evaluate(request: Request):
+    try:
+        form = await request.form()
+        session_id = str(form.get("session_id", ""))
+        rubric_path = OUTPUT_DIR / f"ocr_session_{session_id}_rubric.json"
+        meta_path = OUTPUT_DIR / f"ocr_session_{session_id}_meta.json"
+        if not rubric_path.exists() or not meta_path.exists():
+            return safe_error_page("Sesión no encontrada", "No se encontró la sesión OCR. Vuelve a cargar las imágenes.")
+        rubric = json.loads(rubric_path.read_text(encoding="utf-8"))
+        meta_payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta = meta_payload.get("meta", {})
+
+        score_rows, feedback_rows, trace_rows, semantic_rows = [], [], [], []
+        total = 0.0
+        total_score = float(rubric.get("total_score", 0)) or sum(float(q.get("max_score", 0)) for q in rubric.get("questions", [])) or 1
+        accepted = caution = review = 0
+
+        row_score = {"student_id": meta.get("student_id", ""), "nombre": meta.get("student_name", "")}
+        row_conf = {"student_id": meta.get("student_id", ""), "nombre": meta.get("student_name", "")}
+
+        for q in rubric.get("questions", []):
+            qid = str(q.get("id", ""))
+            answer = str(form.get(f"answer__{qid}", ""))
+            score, conf, fb, status = score_answer(answer, q)
+            diagnosis = semantic_diagnosis(answer, q, score=score, confidence=conf, status=status)
+            cog_level = cognitive_level_from_score(score, q.get("max_score", 1), conf, diagnosis)
+            total += float(score)
+            row_score[qid] = score
+            row_conf[qid] = conf
+            if status == "aceptado": accepted += 1
+            elif status == "aceptado_con_cautela": caution += 1
+            else: review += 1
+            feedback_rows.append({
+                "student_id": meta.get("student_id", ""), "nombre": meta.get("student_name", ""), "pregunta": qid,
+                "respuesta_editada": answer, "puntaje": score, "puntaje_maximo": q.get("max_score", ""),
+                "confianza_evaluativa": conf, "estado": status, "nivel_cognitivo": cog_level, "feedback": fb
+            })
+            trace_rows.append(build_traceability_row(meta.get("student_id", ""), meta.get("student_name", ""), qid, answer, score, conf, status, diagnosis, fb))
+            sem = {"student_id": meta.get("student_id", ""), "nombre": meta.get("student_name", ""), "pregunta": qid, **diagnosis}
+            semantic_rows.append(sem)
+
+        pct = round((total / total_score) * 100, 2)
+        row_score.update({"total": round(total, 2), "porcentaje": pct, "nivel_desempeno": performance_level(pct)})
+        row_conf.update({"confianza_promedio": round(sum([float(r.get('confianza_evaluativa',0)) for r in feedback_rows]) / max(len(feedback_rows),1), 2)})
+        score_rows.append(row_score)
+
+        output_name = f"evalia_ocr_{session_id}_{normalize_column_name(meta.get('student_name','estudiante'))}.xlsx"
+        output_path = OUTPUT_DIR / output_name
+        n = max(len(rubric.get("questions", [])), 1)
+        summary = [{
+            "version": APP_VERSION,
+            "curso": meta.get("course", ""), "evaluacion": meta.get("exam_name", ""), "fecha": meta.get("exam_date", ""),
+            "student_id": meta.get("student_id", ""), "nombre": meta.get("student_name", ""),
+            "puntaje_total": round(total, 2), "puntaje_maximo": total_score, "porcentaje": pct,
+            "nivel_desempeno": performance_level(pct),
+            "aceptado_pct": round(accepted / n * 100, 1), "cautela_pct": round(caution / n * 100, 1), "revision_pct": round(review / n * 100, 1),
+            "ocr_engine": OCR_STATUS.get("engine"), "criterio_mvp": "copiloto evaluativo: OCR editable + microjuicios explicables + revisión docente"
+        }]
+
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            pd.DataFrame(summary).to_excel(writer, sheet_name="RESUMEN_OCR", index=False)
+            pd.DataFrame(score_rows).to_excel(writer, sheet_name="Puntajes", index=False)
+            pd.DataFrame([row_conf]).to_excel(writer, sheet_name="Confianza", index=False)
+            pd.DataFrame(feedback_rows).to_excel(writer, sheet_name="Feedback", index=False)
+            pd.DataFrame(trace_rows).to_excel(writer, sheet_name="TRAZABILIDAD_EVALIA", index=False)
+            pd.DataFrame(semantic_rows).to_excel(writer, sheet_name="MICROJUICIOS", index=False)
+            pd.DataFrame(meta_payload.get("ocr_blocks", [])).to_excel(writer, sheet_name="OCR_HOJAS", index=False)
+            pd.DataFrame([{"raw_text_edited": str(form.get("raw_text_edited", "")), "raw_text_original": meta_payload.get("raw_text", "")}]).to_excel(writer, sheet_name="OCR_TEXTO", index=False)
+            format_workbook(writer)
+
+        return HTMLResponse(f"""
+        <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultado OCR · Evalia</title>{base_css()}</head>
+        <body><div class="page"><main class="shell">
+          {shell_topbar("Reporte OCR generado", "Evalia OCR-MVP v1")}
+          <section class="result-card">
+            <h1>Evaluación completada</h1>
+            <p class="lead"><strong>{escape(meta.get('student_name',''))}</strong> obtuvo {round(total,2)} / {total_score} puntos ({pct}%).</p>
+            <div class="metric-grid">
+              <div class="metric"><div class="metric-value">{performance_level(pct)}</div><div class="metric-label">desempeño global</div></div>
+              <div class="metric"><div class="metric-value">{round(accepted/n*100,1)}%</div><div class="metric-label">aceptado</div></div>
+              <div class="metric"><div class="metric-value">{round(caution/n*100,1)}%</div><div class="metric-label">cautela</div></div>
+              <div class="metric"><div class="metric-value">{round(review/n*100,1)}%</div><div class="metric-label">revisión</div></div>
+            </div>
+            <div class="actions"><a class="button" href="/download/{output_name}">Descargar Excel OCR</a><a class="button secondary" href="/ocr">Evaluar otro estudiante</a></div>
+          </section>{footer_altiora()}
+        </main></div></body></html>
+        """)
+    except Exception as e:
+        logger.error("ocr_evaluate_failed | %s\n%s", e, traceback.format_exc())
+        return safe_error_page("Error de evaluación OCR", "No se pudo evaluar la sesión OCR.", str(e))
+
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     html = f"""
@@ -2202,6 +2587,11 @@ def home():
       <div class="page">
         <main class="shell">
           {shell_topbar()}
+
+          <div class="template-card" style="margin-bottom:18px;">
+            <div><strong>Nuevo flujo OCR-MVP v1</strong><span>Evaluar hojas manuscritas por estudiante con OCR editable y microjuicios explicables.</span></div>
+            <a class="button" href="/ocr">Abrir OCR-MVP</a>
+          </div>
 
           <section class="hero">
             <div class="hero-inner">
