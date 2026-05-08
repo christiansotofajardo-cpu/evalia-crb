@@ -28,10 +28,10 @@ RUBRICS_DIR.mkdir(exist_ok=True)
 LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 
 # ============================================================
-# ROBUSTEZ TÉCNICA + EMBEDDINGS v3.3: EMBEDDINGS REALES, FALLBACK, CACHÉ Y TRAZABILIDAD
+# ROBUSTEZ TÉCNICA + EMBEDDINGS v3.4: EMBEDDINGS REALES OPTIMIZADOS, FALLBACK, CACHÉ Y TRAZABILIDAD
 # ============================================================
 
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.4.0"
 LOG_PATH = OUTPUT_DIR / "evalia_runtime.log"
 
 logging.basicConfig(
@@ -44,12 +44,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("evalia")
 
-app = FastAPI(title="Evalia CRB", version="3.3.0")
+app = FastAPI(title="Evalia CRB", version="3.4.0")
 
 SEMANTIC_CACHE: Dict[str, Any] = {}
 
 # ============================================================
-# EMBEDDINGS SEMÁNTICOS v3.3 — activación real segura
+# EMBEDDINGS SEMÁNTICOS v3.4 — activación real segura
 # ============================================================
 # Evalia puede usar embeddings reales si el entorno tiene instalado
 # sentence-transformers y el modelo está disponible. Si no, la app
@@ -134,6 +134,93 @@ def embedding_vector(text):
         })
         return None
 
+def precompute_embedding_vectors(texts):
+    """
+    Precalcula embeddings en lote para acelerar el procesamiento.
+    Mantiene fallback seguro: si el modelo no está disponible o falla, Evalia sigue con reglas.
+    """
+    if not EMBEDDINGS_ENABLED:
+        return {"requested": False, "precomputed": 0, "seconds": 0.0, "status": "disabled"}
+
+    model = get_embedding_model()
+    if model is None:
+        return {"requested": True, "precomputed": 0, "seconds": 0.0, "status": "model_unavailable"}
+
+    started = time.time()
+    unique_texts = []
+    seen = set()
+    for t in texts:
+        txt = normalize_text(t)
+        if not txt or txt in seen:
+            continue
+        key = cache_key("embedding_vector", txt, EMBEDDING_MODEL_NAME)
+        if key in SEMANTIC_CACHE:
+            continue
+        seen.add(txt)
+        unique_texts.append(txt)
+
+    if not unique_texts:
+        return {"requested": True, "precomputed": 0, "seconds": 0.0, "status": "cache_hit"}
+
+    try:
+        batch_size = int(os.getenv("EVALIA_EMBEDDING_BATCH_SIZE", "32"))
+        vectors = model.encode(
+            unique_texts,
+            normalize_embeddings=True,
+            batch_size=batch_size,
+            show_progress_bar=False
+        )
+        stored = 0
+        for txt, vec in zip(unique_texts, vectors):
+            if len(SEMANTIC_CACHE) >= 50000:
+                break
+            SEMANTIC_CACHE[cache_key("embedding_vector", txt, EMBEDDING_MODEL_NAME)] = vec
+            stored += 1
+        seconds = round(time.time() - started, 3)
+        EMBEDDING_STATUS.update({
+            "available": True,
+            "mode": "hibrido_reglas_embeddings_batch",
+            "message": f"Embeddings reales activos y optimizados por lote. Modelo {EMBEDDING_MODEL_NAME}."
+        })
+        log_event("embedding_batch_precomputed", items=stored, seconds=seconds)
+        return {"requested": True, "precomputed": stored, "seconds": seconds, "status": "ok"}
+    except Exception as e:
+        EMBEDDING_STATUS.update({
+            "available": False,
+            "mode": "reglas_semanticas",
+            "message": f"Fallo durante precálculo batch de embeddings: {str(e)}"
+        })
+        log_event("embedding_batch_failed", error=str(e))
+        return {"requested": True, "precomputed": 0, "seconds": round(time.time() - started, 3), "status": "failed"}
+
+
+def collect_embedding_texts(df, rubric):
+    """Recolecta textos frecuentes para precalcular embeddings antes del loop principal."""
+    texts = []
+    for q in rubric.get("questions", []):
+        texts.append(q.get("prompt", ""))
+        for item in q.get("accepted_answers", []) or []:
+            texts.append(item)
+            texts.extend(synonym_expansions(item))
+        for c in q.get("criteria", []) or []:
+            concept = c.get("concept", "")
+            texts.append(concept)
+            texts.extend(c.get("semantic_variants", []) or [])
+            texts.extend(c.get("accepted_values", []) or [])
+            texts.extend(synonym_expansions(concept))
+        for pair in q.get("pairs", []) or []:
+            texts.append(pair.get("prompt_value", ""))
+            texts.append(pair.get("correct_match", ""))
+            texts.extend(synonym_expansions(pair.get("prompt_value", "")))
+            texts.extend(synonym_expansions(pair.get("correct_match", "")))
+
+        col = find_item_column(df, q.get("id"))
+        if col:
+            for val in df[col].fillna("").tolist():
+                texts.append(val)
+    return texts
+
+
 def embedding_similarity_score(answer, target):
     key = cache_key("embedding_similarity", answer, target, EMBEDDING_MODEL_NAME)
     if key in SEMANTIC_CACHE:
@@ -161,7 +248,7 @@ def log_event(event, **kwargs):
     except Exception:
         pass
 
-def safe_error_page(title, message, detail=None, badge="CRB Engine · v3.3 embeddings reales"):
+def safe_error_page(title, message, detail=None, badge="CRB Engine · v3.4 embeddings optimizados"):
     detail_html = f"<br><small>{escape(str(detail))}</small>" if detail else ""
     return HTMLResponse(
         f'''
@@ -1929,7 +2016,7 @@ def base_css():
     """
 
 
-def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v3.3 embeddings reales"):
+def shell_topbar(subtitle="Evalia by Altiora · Inteligencia Evaluativa Automatizada", badge="CRB Engine · v3.4 embeddings optimizados"):
     return f"""
     <div class="topbar">
       <div class="brand">
@@ -2353,6 +2440,9 @@ async def upload(
     started_at = time.time()
     log_event("upload_started", file=file.filename, students=len(df), questions=len(selected_rubric.get("questions", [])))
 
+    # v3.4: precálculo batch de embeddings para reducir llamadas repetidas al modelo.
+    embedding_batch_info = precompute_embedding_vectors(collect_embedding_texts(df, selected_rubric))
+
     questions = selected_rubric.get("questions", [])
     score_rows = []
     conf_rows = []
@@ -2496,6 +2586,9 @@ async def upload(
         "modelo": EMBEDDING_STATUS.get("model"),
         "dispositivo": EMBEDDING_STATUS.get("device"),
         "mensaje": EMBEDDING_STATUS.get("message"),
+        "batch_status": embedding_batch_info.get("status"),
+        "batch_precomputed_items": embedding_batch_info.get("precomputed"),
+        "batch_seconds": embedding_batch_info.get("seconds"),
         "nota": "Si embeddings_disponibles=False, Evalia procesó normalmente con reglas semánticas. Para activar embeddings reales agregue sentence-transformers, torch y EVALIA_EMBEDDINGS=1."
     }]
 
@@ -2508,18 +2601,21 @@ async def upload(
         "respuestas_evaluadas": total_answers,
         "tiempo_procesamiento_segundos": elapsed_seconds,
         "cache_semantico_items": len(SEMANTIC_CACHE),
+        "embedding_batch_status": embedding_batch_info.get("status"),
+        "embedding_batch_precomputed_items": embedding_batch_info.get("precomputed"),
+        "embedding_batch_seconds": embedding_batch_info.get("seconds"),
         "embedding_mode": EMBEDDING_STATUS.get("mode"),
         "embedding_model": EMBEDDING_STATUS.get("model"),
         "embedding_device": EMBEDDING_STATUS.get("device"),
         "log_runtime": str(LOG_PATH.name),
-        "criterio_robustez": "validación preventiva + logging + caché semántico + trazabilidad por respuesta"
+        "criterio_robustez": "validación preventiva + logging + caché semántico + precálculo batch de embeddings + trazabilidad por respuesta"
     }]
 
     # Se agrega una fila de identidad de producto al reporte docente.
     teacher_report_rows.insert(0, {
         "seccion": "Producto",
         "indicador": "Sistema",
-        "valor": "Evalia by Altiora · Inteligencia Semántica Docente · v3.3 embeddings reales"
+        "valor": "Evalia by Altiora · Inteligencia Semántica Docente · v3.4 embeddings optimizados"
     })
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -2548,7 +2644,7 @@ async def upload(
         f"""
         <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Resultados · Evalia</title>{base_css()}</head>
         <body><div class="page"><main class="shell">
-          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v3.3 embeddings reales")}
+          {shell_topbar("Reporte generado · Evalia by Altiora", "CRB Engine · v3.4 embeddings optimizados")}
           <section class="result-card">
             <h1>Procesamiento completado</h1>
             <p class="lead">Evalia aplicó la rúbrica <strong>{escape(rubric_name)}</strong> y generó un reporte Excel explicable.</p>
@@ -2578,7 +2674,7 @@ def download(filename: str):
         return HTMLResponse(
             f"""
             <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Archivo no encontrado · Evalia</title>{base_css()}</head>
-            <body><div class="page"><main class="shell">{shell_topbar("Archivo no encontrado", "CRB Engine · v3.3 embeddings reales")}<div class="result-card">
+            <body><div class="page"><main class="shell">{shell_topbar("Archivo no encontrado", "CRB Engine · v3.4 embeddings optimizados")}<div class="result-card">
               <h1>No se pudo acceder al archivo</h1>
               <div class="error">El reporte solicitado no existe o no fue generado correctamente.</div>
               <p class="lead">Vuelve al inicio y procesa nuevamente la rúbrica y las respuestas.</p>
