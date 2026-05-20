@@ -2808,44 +2808,20 @@ def ocr_home():
 <br><br>
 
 <div id="pageInputsContainer"></div>
+<label>Imágenes de hojas del estudiante</label>
 
-<script>
-function generatePageInputs() {
-    const container = document.getElementById("pageInputsContainer");
-    const numPages = parseInt(document.getElementById("numPages").value);
-
-    container.innerHTML = "";
-
-    for (let i = 1; i <= numPages; i++) {
-
-        const block = document.createElement("div");
-        block.style.marginBottom = "18px";
-
-        block.innerHTML = `
-            <label><strong>Página ${i}</strong></label><br>
-
-            <input
-                type="file"
-                name="page_${i}"
-                accept=".png,.jpg,.jpeg"
-                required
-            >
-
-            <div style="
-                font-size:13px;
-                color:#666;
-                margin-top:6px;
-            ">
-                Sube únicamente la página ${i} del estudiante.
-            </div>
-        `;
-
-        container.appendChild(block);
-    }
-}
-
-generatePageInputs();
-</script>
+<div class="dropzone">
+  <input
+    id="imageInput"
+    name="image_files"
+    type="file"
+    accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp"
+    multiple
+    required
+  >
+  <p class="hint">Selecciona o arrastra una o más fotos/escaneos. Formatos recomendados: PNG/JPG.</p>
+  <div id="imageStatus" class="status warn">Ninguna imagen seleccionada todavía.</div>
+</div>
 
             <details style="margin:10px 0 14px 0;">
               <summary style="cursor:pointer;font-weight:800;color:#334155;">Opcional: pegar texto manual si OCR falla</summary>
