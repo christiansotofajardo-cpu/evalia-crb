@@ -2864,21 +2864,6 @@ def ocr_home():
       }});
       updateFileStatus(rubricInput, rubricStatus, 'rubrica');
       updateFileStatus(imageInput, imageStatus, 'imagenes');
-      function renderPageInputs() {
-  const n = parseInt(document.getElementById("numPages").value);
-  const box = document.getElementById("pageInputs");
-
-  box.innerHTML = "";
-
-  for (let i = 1; i <= n; i++) {
-}
-    box.innerHTML +=
-      "<label>Página " + i + "</label>" +
-      "<input name='image_files' type='file' accept='image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp' required><br><br>";
-  }
-}
-
-renderPageInputs();
     </script>
     </body></html>
     """)
