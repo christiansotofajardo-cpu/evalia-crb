@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <title>Evalia CRB</title>
+
   <style>
     body {
       font-family: Arial, sans-serif;
@@ -10,42 +11,245 @@
       background: #f7f7f8;
       color: #222;
     }
+
     .card {
       background: white;
       padding: 28px;
       border-radius: 16px;
-      max-width: 760px;
+      max-width: 860px;
+      margin: auto;
       box-shadow: 0 4px 18px rgba(0,0,0,.08);
     }
-    h1 { margin-top: 0; }
-    .muted { color: #666; }
-    input, button { font-size: 16px; margin-top: 12px; }
+
+    h1 {
+      margin-top: 0;
+    }
+
+    h2 {
+      margin-top: 38px;
+      margin-bottom: 10px;
+    }
+
+    .muted {
+      color: #666;
+      margin-bottom: 20px;
+    }
+
+    input,
+    select,
     button {
-      padding: 10px 18px;
+      font-size: 16px;
+      margin-top: 12px;
+    }
+
+    input[type="text"],
+    select {
+      width: 100%;
+      padding: 10px;
+      border-radius: 10px;
+      border: 1px solid #ccc;
+      box-sizing: border-box;
+    }
+
+    input[type="file"] {
+      margin-top: 8px;
+    }
+
+    button {
+      padding: 12px 20px;
       border: none;
       border-radius: 10px;
       cursor: pointer;
       background: #222;
       color: white;
+      font-weight: bold;
     }
+
+    button:hover {
+      opacity: .92;
+    }
+
+    .section {
+      margin-top: 32px;
+      padding-top: 24px;
+      border-top: 1px solid #e5e5e5;
+    }
+
+    .upload-block {
+      margin-top: 18px;
+      padding: 16px;
+      border: 1px dashed #bbb;
+      border-radius: 12px;
+      background: #fafafa;
+    }
+
     code {
-      background:#eee;
-      padding:2px 6px;
-      border-radius:6px;
+      background: #eee;
+      padding: 2px 6px;
+      border-radius: 6px;
     }
+
+    .small {
+      font-size: 14px;
+      color: #666;
+    }
+
   </style>
 </head>
+
 <body>
+
   <div class="card">
+
     <h1>Evalia CRB</h1>
-    <p class="muted">MVP 1 · Corrección automatizada de respuestas breves desde Excel</p>
+
+    <p class="muted">
+      MVP 1 · Corrección automatizada de respuestas breves desde Excel + OCR manuscrito por estudiante
+    </p>
+
+    <!-- ===================================================== -->
+    <!-- BLOQUE EXCEL -->
+    <!-- ===================================================== -->
+
+    <h2>Modo Excel tradicional</h2>
 
     <form action="/upload" enctype="multipart/form-data" method="post">
-      <p>Sube un Excel con columnas <code>student_id</code>, <code>nombre</code>, <code>Q1</code> ... <code>Q10</code>.</p>
-      <input name="file" type="file" accept=".xlsx,.xls" required>
+
+      <p>
+        Sube un Excel con columnas
+        <code>student_id</code>,
+        <code>nombre</code>,
+        <code>Q1</code> ...
+        <code>Q34</code>.
+      </p>
+
+      <input
+        name="file"
+        type="file"
+        accept=".xlsx,.xls"
+        required
+      >
+
       <br>
-      <button type="submit">Procesar certamen</button>
+
+      <button type="submit">
+        Procesar certamen Excel
+      </button>
+
     </form>
+
+    <!-- ===================================================== -->
+    <!-- BLOQUE OCR -->
+    <!-- ===================================================== -->
+
+    <div class="section">
+
+      <h2>Modo OCR manuscrito</h2>
+
+      <p class="small">
+        Sube las páginas del certamen de un estudiante.
+        Evalia mantendrá el orden de las páginas para reconstruir automáticamente el certamen.
+      </p>
+
+      <form
+        action="/ocr_student"
+        enctype="multipart/form-data"
+        method="post"
+      >
+
+        <!-- NOMBRE ESTUDIANTE -->
+
+        <label>
+          <strong>Nombre del estudiante</strong>
+        </label>
+
+        <input
+          name="student_name"
+          type="text"
+          placeholder="Ejemplo: Angela Méndez"
+          required
+        >
+
+        <!-- CANTIDAD PÁGINAS -->
+
+        <label style="display:block; margin-top:20px;">
+          <strong>Cantidad de páginas del certamen</strong>
+        </label>
+
+        <select
+          id="num_pages"
+          name="num_pages"
+          onchange="renderPages()"
+          required
+        >
+          <option value="1">1 página</option>
+          <option value="2">2 páginas</option>
+          <option value="3">3 páginas</option>
+          <option value="4" selected>4 páginas</option>
+          <option value="5">5 páginas</option>
+          <option value="6">6 páginas</option>
+        </select>
+
+        <!-- INPUTS DINÁMICOS -->
+
+        <div id="page_inputs"></div>
+
+        <button
+          type="submit"
+          style="margin-top:28px;"
+        >
+          Procesar OCR del estudiante
+        </button>
+
+      </form>
+
+    </div>
+
   </div>
+
+  <!-- ===================================================== -->
+  <!-- SCRIPT -->
+  <!-- ===================================================== -->
+
+  <script>
+
+    function renderPages() {
+
+      const n = parseInt(
+        document.getElementById("num_pages").value
+      );
+
+      const container =
+        document.getElementById("page_inputs");
+
+      container.innerHTML = "";
+
+      for (let i = 1; i <= n; i++) {
+
+        container.innerHTML += `
+          <div class="upload-block">
+
+            <label>
+              <strong>Página ${i}</strong>
+            </label>
+
+            <br>
+
+            <input
+              name="pages"
+              type="file"
+              accept=".jpg,.jpeg,.png,.pdf"
+              required
+            >
+
+          </div>
+        `;
+      }
+    }
+
+    renderPages();
+
+  </script>
+
 </body>
 </html>
