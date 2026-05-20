@@ -151,14 +151,23 @@
         Evalia mantendrá el orden de las páginas para reconstruir automáticamente el certamen.
       </p>
 
-      <form
-        action="/ocr_student"
+     <form
+  action="/ocr/process"
         enctype="multipart/form-data"
         method="post"
       >
 
         <!-- NOMBRE ESTUDIANTE -->
+<label style="display:block; margin-top:20px;">
+  <strong>Rúbrica Excel/JSON</strong>
+</label>
 
+<input
+  name="rubric_file"
+  type="file"
+  accept=".xlsx,.xls,.json"
+  required
+>
         <label>
           <strong>Nombre del estudiante</strong>
         </label>
@@ -236,9 +245,9 @@
             <br>
 
             <input
-              name="pages"
+              name="image_files"
               type="file"
-              accept=".jpg,.jpeg,.png,.pdf"
+           accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp"
               required
             >
 
