@@ -2810,17 +2810,7 @@ def ocr_home():
 <div id="pageInputsContainer"></div>
 <label>Imágenes de hojas del estudiante</label>
 
-<label>Página 1</label>
-<input name="image_files" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp" required>
-
-<label>Página 2</label>
-<input name="image_files" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp" required>
-
-<label>Página 3</label>
-<input name="image_files" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp" required>
-
-<label>Página 4</label>
-<input name="image_files" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp" required>
+<div id="pageInputs"></div>
   <p class="hint">Selecciona o arrastra una o más fotos/escaneos. Formatos recomendados: PNG/JPG.</p>
   <div id="imageStatus" class="status warn">Ninguna imagen seleccionada todavía.</div>
 </div>
@@ -2874,6 +2864,21 @@ def ocr_home():
       }});
       updateFileStatus(rubricInput, rubricStatus, 'rubrica');
       updateFileStatus(imageInput, imageStatus, 'imagenes');
+      function renderPageInputs() {
+  const n = parseInt(document.getElementById("numPages").value);
+  const box = document.getElementById("pageInputs");
+
+  box.innerHTML = "";
+
+  for (let i = 1; i <= n; i++) {
+
+    box.innerHTML +=
+      "<label>Página " + i + "</label>" +
+      "<input name='image_files' type='file' accept='image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp' required><br><br>";
+  }
+}
+
+renderPageInputs();
     </script>
     </body></html>
     """)
