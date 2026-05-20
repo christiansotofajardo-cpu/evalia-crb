@@ -2810,15 +2810,17 @@ def ocr_home():
 <div id="pageInputsContainer"></div>
 <label>Imágenes de hojas del estudiante</label>
 
-<div class="dropzone">
-  <input
-    id="imageInput"
-    name="image_files"
-    type="file"
-    accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp"
-    multiple
-    required
-  >
+<label>Página 1</label>
+<input name="image_files" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp" required>
+
+<label>Página 2</label>
+<input name="image_files" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp" required>
+
+<label>Página 3</label>
+<input name="image_files" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp" required>
+
+<label>Página 4</label>
+<input name="image_files" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp" required>
   <p class="hint">Selecciona o arrastra una o más fotos/escaneos. Formatos recomendados: PNG/JPG.</p>
   <div id="imageStatus" class="status warn">Ninguna imagen seleccionada todavía.</div>
 </div>
