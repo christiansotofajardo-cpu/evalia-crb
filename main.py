@@ -33,7 +33,7 @@ LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 # ROBUSTEZ TÉCNICA + EMBEDDINGS v3.5: BASELINE VALIDACIÓN, EMBEDDINGS OPTIMIZADOS, FALLBACK, CACHÉ Y TRAZABILIDAD
 # ============================================================
 
-APP_VERSION = "4.3.0-semantic-partial-inference"
+APP_VERSION = "4.3.1-semantic-partial-quality-gate"
 LOG_PATH = OUTPUT_DIR / "evalia_runtime.log"
 
 logging.basicConfig(
@@ -1339,6 +1339,111 @@ def semantic_diagnosis(answer, question, score=None, confidence=None, status=Non
 
 
 
+
+def semantic_response_quality_gate(answer, concepts):
+    """
+    Evalia v4.3.1 — compuerta de calidad para evidencia parcial.
+
+    Objetivo: mantener la sensibilidad de v4.3.0 para respuestas como Brenda
+    (comprensión no prototípica pero desarrollada), pero evitar que respuestas
+    demasiado breves, fragmentarias o superficiales reciban bonos altos solo por
+    activar algunas pistas conceptuales aisladas.
+
+    Esta compuerta NO afecta respuestas claramente correctas detectadas como match.
+    Solo modula:
+      - puntajes por evidencia parcial,
+      - bono de inferencia pedagógica,
+      - bono por relaciones conceptuales cuando depende de evidencia parcial.
+    """
+    answer_n = normalize_text(answer)
+    tokens = semantic_tokens(answer_n)
+    token_count = len(tokens)
+    profile = answer_length_profile(answer_n)
+
+    if not answer_n or answer_n in {normalize_text(x) for x in VAGUE_RESPONSES}:
+        return {
+            "partial_multiplier": 0.0,
+            "inference_multiplier": 0.0,
+            "relation_multiplier": 0.0,
+            "quality_level": "sin_evidencia",
+            "token_count": token_count,
+            "reasons": ["respuesta_vacia_o_vaga"]
+        }
+
+    relations, present_for_relations = detect_concept_relations(answer_n, concepts)
+    present, _evidence = detect_present_concepts(answer_n, concepts)
+    present_count = len(set(present))
+    relation_count = len(set(relations))
+
+    reasons = []
+
+    # Base según densidad verbal. Esto evita que una respuesta muy corta se infle
+    # por coincidencias sueltas o por aproximaciones de baja integración.
+    if token_count <= 3:
+        partial_multiplier = 0.20
+        inference_multiplier = 0.0
+        relation_multiplier = 0.25
+        quality_level = "muy_breve"
+        reasons.append("muy_pocos_tokens")
+    elif token_count <= 6:
+        partial_multiplier = 0.40
+        inference_multiplier = 0.15
+        relation_multiplier = 0.45
+        quality_level = "breve_fragmentaria"
+        reasons.append("respuesta_breve")
+    elif token_count <= 10:
+        partial_multiplier = 0.65
+        inference_multiplier = 0.45
+        relation_multiplier = 0.70
+        quality_level = "parcial_suficiente"
+        reasons.append("respuesta_corta_con_algo_de_desarrollo")
+    else:
+        partial_multiplier = 0.92
+        inference_multiplier = 0.85
+        relation_multiplier = 0.90
+        quality_level = "desarrollada"
+        reasons.append("respuesta_desarrollada")
+
+    # La presencia de conceptos y relaciones explícitas indica integración real.
+    if present_count >= 1:
+        partial_multiplier += 0.08
+        inference_multiplier += 0.08
+        relation_multiplier += 0.05
+        reasons.append("concepto_detectado")
+    if present_count >= 2:
+        partial_multiplier += 0.08
+        inference_multiplier += 0.12
+        relation_multiplier += 0.08
+        reasons.append("multiples_conceptos_detectados")
+    if relation_count >= 1:
+        partial_multiplier += 0.05
+        inference_multiplier += 0.12
+        relation_multiplier += 0.10
+        reasons.append("relacion_conceptual_detectada")
+
+    # Si hay desarrollo suficiente, permitimos máxima inferencia; si no, se mantiene contenida.
+    if profile == "developed" and (present_count >= 1 or relation_count >= 1):
+        partial_multiplier = max(partial_multiplier, 0.95)
+        inference_multiplier = max(inference_multiplier, 0.90)
+        relation_multiplier = max(relation_multiplier, 0.90)
+        reasons.append("desarrollo_con_evidencia_conceptual")
+
+    # Límites seguros.
+    partial_multiplier = max(0.0, min(1.0, partial_multiplier))
+    inference_multiplier = max(0.0, min(1.0, inference_multiplier))
+    relation_multiplier = max(0.0, min(1.0, relation_multiplier))
+
+    return {
+        "partial_multiplier": round(partial_multiplier, 3),
+        "inference_multiplier": round(inference_multiplier, 3),
+        "relation_multiplier": round(relation_multiplier, 3),
+        "quality_level": quality_level,
+        "token_count": token_count,
+        "concepts_detected_count": present_count,
+        "relations_detected_count": relation_count,
+        "reasons": reasons[:8]
+    }
+
 def partial_evidence_factor(best_score, method, profile, answer, concept):
     """
     Capa intermedia Evalia v4.3:
@@ -1388,7 +1493,7 @@ def partial_evidence_factor(best_score, method, profile, answer, concept):
     return 0.0
 
 
-def semantic_partial_inference_layer(answer, question, concepts, matched, partial_hits, contradictions):
+def semantic_partial_inference_layer(answer, question, concepts, matched, partial_hits, contradictions, quality_gate=None):
     """
     Capa de inferencia pedagógica:
     estima si una respuesta imperfecta contiene comprensión parcial válida.
@@ -1422,6 +1527,15 @@ def semantic_partial_inference_layer(answer, question, concepts, matched, partia
     # Bono máximo conservador: no debe transformar una respuesta débil en completa.
     bonus_ratio = min(0.22, thematic_bonus + relation_bonus)
 
+    if quality_gate is None:
+        quality_gate = semantic_response_quality_gate(answer, concepts)
+    inference_multiplier = float(quality_gate.get("inference_multiplier", 1.0))
+    bonus_ratio = bonus_ratio * inference_multiplier
+
+    # Seguridad adicional: si no hay suficiente densidad conceptual, no aplicar bono inferencial.
+    if quality_gate.get("quality_level") in {"muy_breve", "sin_evidencia"}:
+        bonus_ratio = 0.0
+
     return bonus_ratio, {
         "active": bonus_ratio > 0,
         "profile": profile,
@@ -1429,6 +1543,7 @@ def semantic_partial_inference_layer(answer, question, concepts, matched, partia
         "matched_count": len(set(matched)),
         "partial_count": len(set(partial_concepts)),
         "partial_hits": partial_hits[:8],
+        "quality_gate": quality_gate,
         "bonus_ratio": round(bonus_ratio, 3)
     }
 
@@ -1480,6 +1595,7 @@ def score_criteria(answer, question):
 
     contradictions = detect_contradictions(answer, concepts)
     profile = answer_length_profile(answer)
+    quality_gate = semantic_response_quality_gate(answer, concepts)
 
     for criterion in criteria:
         concept = criterion.get("concept", "")
@@ -1535,18 +1651,20 @@ def score_criteria(answer, question):
             )
 
             if partial_factor > 0:
-                partial_score = weight * partial_factor
+                quality_multiplier = float(quality_gate.get("partial_multiplier", 1.0))
+                partial_score = weight * partial_factor * quality_multiplier
                 total += partial_score
                 partial_hits.append({
                     "concept": concept,
                     "score": criterion_best,
                     "method": criterion_method,
                     "factor": round(partial_factor, 2),
+                    "quality_multiplier": round(quality_multiplier, 2),
                     "partial_score": round(partial_score, 2)
                 })
                 missing.append(concept)
                 method_notes.append(
-                    f"{concept}: evidencia parcial válida ({criterion_best}/100; factor={partial_factor:.2f}; +{partial_score:.2f})"
+                    f"{concept}: evidencia parcial válida ({criterion_best}/100; factor={partial_factor:.2f}; compuerta={quality_multiplier:.2f}; +{partial_score:.2f})"
                 )
             else:
                 missing.append(concept)
@@ -1555,8 +1673,10 @@ def score_criteria(answer, question):
 
     rel_bonus, rel_hits, present_for_relation = relation_score(answer, concepts)
     if rel_bonus and (matched or partial_hits):
-        total += max_score * rel_bonus
-        method_notes.append("Relaciones detectadas: " + ", ".join(rel_hits))
+        relation_multiplier = float(quality_gate.get("relation_multiplier", 1.0))
+        adjusted_rel_bonus = rel_bonus * relation_multiplier
+        total += max_score * adjusted_rel_bonus
+        method_notes.append("Relaciones detectadas: " + ", ".join(rel_hits) + f" (compuerta={relation_multiplier:.2f})")
 
     inference_bonus_ratio, inference_trace = semantic_partial_inference_layer(
         answer=answer,
@@ -1564,7 +1684,8 @@ def score_criteria(answer, question):
         concepts=concepts,
         matched=matched,
         partial_hits=partial_hits,
-        contradictions=contradictions
+        contradictions=contradictions,
+        quality_gate=quality_gate
     )
 
     if inference_bonus_ratio > 0:
@@ -1600,7 +1721,10 @@ def score_criteria(answer, question):
 
     # Si hay evidencia parcial distribuida, no dejar que la confianza caiga como si fuera omisión total.
     if partial_hits and not contradictions:
-        confidence = max(confidence, 0.52 if profile == "developed" else 0.46)
+        if quality_gate.get("quality_level") in {"muy_breve", "breve_fragmentaria"}:
+            confidence = max(confidence, 0.42)
+        else:
+            confidence = max(confidence, 0.52 if profile == "developed" else 0.46)
 
     if inference_bonus_ratio > 0 and not contradictions:
         confidence = max(confidence, 0.58)
@@ -1616,7 +1740,7 @@ def score_criteria(answer, question):
     if partial_hits:
         feedback.append(
             "Evidencia parcial reconocida: " +
-            "; ".join([f"{p['concept']} ({p['score']}/100; factor {p['factor']})" for p in partial_hits[:6]])
+            "; ".join([f"{p['concept']} ({p['score']}/100; factor {p['factor']}; compuerta {p.get('quality_multiplier', 1)})" for p in partial_hits[:6]])
         )
     if missing:
         feedback.append("Criterios no detectados o débiles: " + "; ".join([m for m in missing if m]))
@@ -1624,6 +1748,12 @@ def score_criteria(answer, question):
         feedback.append("Observación: respuesta breve; Evalia reconoce el núcleo, pero sugiere revisar si el docente esperaba desarrollo argumentativo.")
     if inference_bonus_ratio > 0:
         feedback.append("Capa inferencial activa: se detectó comprensión parcial distribuida o no prototípica.")
+    if partial_hits or inference_bonus_ratio > 0:
+        feedback.append(
+            "Compuerta de calidad parcial: " +
+            f"nivel={quality_gate.get('quality_level')}; tokens={quality_gate.get('token_count')}; " +
+            f"mult_parcial={quality_gate.get('partial_multiplier')}; mult_inferencia={quality_gate.get('inference_multiplier')}"
+        )
     if method_notes:
         feedback.append("Evidencia semántica: " + "; ".join(method_notes[:14]))
 
