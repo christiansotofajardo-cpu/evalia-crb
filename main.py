@@ -33,7 +33,7 @@ LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 # ROBUSTEZ TÉCNICA + EMBEDDINGS v3.5: BASELINE VALIDACIÓN, EMBEDDINGS OPTIMIZADOS, FALLBACK, CACHÉ Y TRAZABILIDAD
 # ============================================================
 
-APP_VERSION = "4.2.1-ocr-modern-router-json-safe"
+APP_VERSION = "4.3.0-semantic-partial-inference"
 LOG_PATH = OUTPUT_DIR / "evalia_runtime.log"
 
 logging.basicConfig(
@@ -1338,6 +1338,101 @@ def semantic_diagnosis(answer, question, score=None, confidence=None, status=Non
     }
 
 
+
+def partial_evidence_factor(best_score, method, profile, answer, concept):
+    """
+    Capa intermedia Evalia v4.3:
+    reconoce evidencia conceptual parcial no prototípica sin convertir cualquier
+    aproximación débil en puntaje completo.
+
+    Devuelve un factor entre 0 y 1 que se multiplica por el peso del criterio.
+    """
+    if best_score is None:
+        return 0.0
+
+    try:
+        s = float(best_score)
+    except Exception:
+        return 0.0
+
+    answer_n = normalize_text(answer)
+    concept_n = normalize_text(concept)
+
+    if not answer_n or not concept_n:
+        return 0.0
+
+    # Evitar premiar respuestas vagas o extremadamente breves sin núcleo claro.
+    if answer_n in {normalize_text(x) for x in VAGUE_RESPONSES}:
+        return 0.0
+
+    # Evitar bonos si hay negación cercana del concepto.
+    if has_negation_near(answer_n, concept_n):
+        return 0.0
+
+    # Perfil desarrollado permite más inferencia docente; perfil breve exige evidencia más alta.
+    developed_bonus = profile == "developed"
+    short_ok = profile in ["short", "developed"]
+
+    method_n = normalize_text(method)
+
+    if s >= 66:
+        return 0.75 if developed_bonus else 0.62
+    if s >= 60:
+        return 0.62 if short_ok else 0.45
+    if s >= 54:
+        return 0.48 if developed_bonus else 0.32
+    if s >= 48:
+        return 0.32 if developed_bonus else 0.0
+    if "embedding" in method_n and s >= 46 and developed_bonus:
+        return 0.30
+    return 0.0
+
+
+def semantic_partial_inference_layer(answer, question, concepts, matched, partial_hits, contradictions):
+    """
+    Capa de inferencia pedagógica:
+    estima si una respuesta imperfecta contiene comprensión parcial válida.
+    No reemplaza el puntaje; agrega un bono pequeño y trazable cuando hay
+    evidencia distribuida suficiente.
+    """
+    profile = answer_length_profile(answer)
+    answer_n = normalize_text(answer)
+
+    if not answer_n or contradictions:
+        return 0.0, {
+            "active": False,
+            "reason": "sin_respuesta_o_contradiccion",
+            "profile": profile,
+            "partial_hits": []
+        }
+
+    relations, present_for_relations = detect_concept_relations(answer, concepts)
+    partial_concepts = [p.get("concept") for p in partial_hits if p.get("factor", 0) >= 0.30]
+
+    evidence_units = len(set(matched)) + 0.55 * len(set(partial_concepts))
+    relation_bonus = 0.12 if relations and evidence_units >= 1 else 0.0
+
+    # Si la respuesta está en el dominio, pero no usa lenguaje canónico, puede recibir un bono bajo.
+    thematic_bonus = 0.0
+    if profile == "developed" and evidence_units >= 1.1:
+        thematic_bonus = 0.10
+    elif profile == "short" and evidence_units >= 1.5:
+        thematic_bonus = 0.06
+
+    # Bono máximo conservador: no debe transformar una respuesta débil en completa.
+    bonus_ratio = min(0.22, thematic_bonus + relation_bonus)
+
+    return bonus_ratio, {
+        "active": bonus_ratio > 0,
+        "profile": profile,
+        "relations": relations,
+        "matched_count": len(set(matched)),
+        "partial_count": len(set(partial_concepts)),
+        "partial_hits": partial_hits[:8],
+        "bonus_ratio": round(bonus_ratio, 3)
+    }
+
+
 def score_accepted_answers(answer, question):
     accepted = question.get("accepted_answers", [])
     if not accepted:
@@ -1379,6 +1474,7 @@ def score_criteria(answer, question):
     total = 0.0
     matched = []
     missing = []
+    partial_hits = []
     confidence_scores = []
     method_notes = []
 
@@ -1430,16 +1526,58 @@ def score_criteria(answer, question):
             matched.append(concept)
             method_notes.append(f"{concept}: {criterion_method} ({criterion_best}/100)")
         else:
-            missing.append(concept)
-            if criterion_best >= 40:
-                method_notes.append(f"{concept}: aproximación insuficiente ({criterion_best}/100)")
+            partial_factor = partial_evidence_factor(
+                criterion_best,
+                criterion_method,
+                profile,
+                answer,
+                concept
+            )
+
+            if partial_factor > 0:
+                partial_score = weight * partial_factor
+                total += partial_score
+                partial_hits.append({
+                    "concept": concept,
+                    "score": criterion_best,
+                    "method": criterion_method,
+                    "factor": round(partial_factor, 2),
+                    "partial_score": round(partial_score, 2)
+                })
+                missing.append(concept)
+                method_notes.append(
+                    f"{concept}: evidencia parcial válida ({criterion_best}/100; factor={partial_factor:.2f}; +{partial_score:.2f})"
+                )
+            else:
+                missing.append(concept)
+                if criterion_best >= 40:
+                    method_notes.append(f"{concept}: aproximación insuficiente ({criterion_best}/100)")
 
     rel_bonus, rel_hits, present_for_relation = relation_score(answer, concepts)
-    if rel_bonus and matched:
+    if rel_bonus and (matched or partial_hits):
         total += max_score * rel_bonus
         method_notes.append("Relaciones detectadas: " + ", ".join(rel_hits))
 
-    coverage = len(set(matched)) / max(len(set(concepts)), 1)
+    inference_bonus_ratio, inference_trace = semantic_partial_inference_layer(
+        answer=answer,
+        question=question,
+        concepts=concepts,
+        matched=matched,
+        partial_hits=partial_hits,
+        contradictions=contradictions
+    )
+
+    if inference_bonus_ratio > 0:
+        inference_bonus = max_score * inference_bonus_ratio
+        total += inference_bonus
+        method_notes.append(
+            f"Capa inferencial: comprensión parcial distribuida (+{inference_bonus:.2f}; razón={inference_bonus_ratio:.2f})"
+        )
+
+    strict_coverage = len(set(matched)) / max(len(set(concepts)), 1)
+    partial_coverage = (
+        len(set(matched)) + 0.55 * len(set(p.get("concept") for p in partial_hits))
+    ) / max(len(set(concepts)), 1)
 
     # Ajuste epistemológico: una respuesta breve puede ser correcta, pero no siempre completa.
     # Si hay un solo criterio y coincide, puede recibir el total. Si hay varios criterios, recibe lo que cubre.
@@ -1454,26 +1592,43 @@ def score_criteria(answer, question):
     total = min(max(total, 0), max_score)
 
     avg_evidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
-    confidence = (0.55 * avg_evidence) + (0.30 * coverage) + (0.15 * (1 if not contradictions else 0.35))
+    confidence = (0.48 * avg_evidence) + (0.32 * min(partial_coverage, 1.0)) + (0.20 * (1 if not contradictions else 0.35))
 
     # Si hay respuesta breve correcta, subir confianza operacional, pero no fabricar completitud.
     if profile in ["brief", "short"] and matched and not contradictions:
-        confidence = max(confidence, 0.68 if coverage < 0.80 else 0.82)
+        confidence = max(confidence, 0.68 if strict_coverage < 0.80 else 0.82)
+
+    # Si hay evidencia parcial distribuida, no dejar que la confianza caiga como si fuera omisión total.
+    if partial_hits and not contradictions:
+        confidence = max(confidence, 0.52 if profile == "developed" else 0.46)
+
+    if inference_bonus_ratio > 0 and not contradictions:
+        confidence = max(confidence, 0.58)
 
     if contradictions:
         confidence = min(confidence, 0.58)
 
+    confidence = min(max(confidence, 0), 1.0)
+
     feedback = []
     if matched:
         feedback.append("Criterios detectados: " + "; ".join([m for m in matched if m]))
+    if partial_hits:
+        feedback.append(
+            "Evidencia parcial reconocida: " +
+            "; ".join([f"{p['concept']} ({p['score']}/100; factor {p['factor']})" for p in partial_hits[:6]])
+        )
     if missing:
         feedback.append("Criterios no detectados o débiles: " + "; ".join([m for m in missing if m]))
     if profile in ["brief", "short"] and matched:
         feedback.append("Observación: respuesta breve; Evalia reconoce el núcleo, pero sugiere revisar si el docente esperaba desarrollo argumentativo.")
+    if inference_bonus_ratio > 0:
+        feedback.append("Capa inferencial activa: se detectó comprensión parcial distribuida o no prototípica.")
     if method_notes:
-        feedback.append("Evidencia semántica: " + "; ".join(method_notes[:12]))
+        feedback.append("Evidencia semántica: " + "; ".join(method_notes[:14]))
 
     return round(total, 2), round(confidence, 2), " | ".join(feedback)
+
 
 
 def score_enumeration(answer, question):
