@@ -33,7 +33,7 @@ LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 # ROBUSTEZ TÉCNICA + EMBEDDINGS v3.5: BASELINE VALIDACIÓN, EMBEDDINGS OPTIMIZADOS, FALLBACK, CACHÉ Y TRAZABILIDAD
 # ============================================================
 
-APP_VERSION = "4.3.1-semantic-partial-quality-gate"
+APP_VERSION = "4.3.2-flexible-rubric-v2"
 LOG_PATH = OUTPUT_DIR / "evalia_runtime.log"
 
 logging.basicConfig(
@@ -204,6 +204,19 @@ def collect_embedding_texts(df, rubric):
         for item in q.get("accepted_answers", []) or []:
             texts.append(item)
             texts.extend(synonym_expansions(item))
+
+        # Rúbrica Flexible v2: insumos adicionales definidos por el docente.
+        indispensable = q.get("indispensable_element", "")
+        if indispensable:
+            texts.append(indispensable)
+            texts.extend(synonym_expansions(indispensable))
+        for item in q.get("equivalent_examples", []) or []:
+            texts.append(item)
+            texts.extend(synonym_expansions(item))
+        observations = q.get("evaluation_observations", "")
+        if observations:
+            texts.append(observations)
+
         for c in q.get("criteria", []) or []:
             concept = c.get("concept", "")
             texts.append(concept)
@@ -621,6 +634,11 @@ def build_question_from_excel_row(row):
     criterios = split_values(row.get("criterios", row.get("criteria", "")))
     variantes_semanticas = split_values(row.get("variantes_semanticas", row.get("semantic_variants", "")))
 
+    # Rúbrica Flexible v2. Campos opcionales y compatibles hacia atrás.
+    indispensable = "" if pd.isna(row.get("elemento_indispensable", "")) else str(row.get("elemento_indispensable", "")).strip()
+    equivalentes = split_values(row.get("ejemplos_equivalentes", row.get("equivalent_examples", "")))
+    observaciones = "" if pd.isna(row.get("observaciones_evaluacion", "")) else str(row.get("observaciones_evaluacion", "")).strip()
+
     if item_type == "criteria" and not criterios:
         criterios = respuestas
 
@@ -628,17 +646,22 @@ def build_question_from_excel_row(row):
         "id": qid,
         "item_type": item_type,
         "max_score": max_score,
-        "prompt": prompt
+        "prompt": prompt,
+        "indispensable_element": indispensable,
+        "equivalent_examples": equivalentes,
+        "evaluation_observations": observaciones
     }
 
     if item_type == "true_false":
         question["accepted_answers"] = respuestas or ["V", "Verdadero"]
 
     elif item_type in ["completion", "short_exact_answer"]:
-        question["accepted_answers"] = respuestas
+        question["accepted_answers"] = respuestas + [x for x in equivalentes if x not in respuestas]
 
     elif item_type in ["enumeration", "enumeration_conceptual", "enumeration_closed", "enumeration_categorized"]:
-        question["accepted_answers"] = respuestas
+        # En enumeraciones, los ejemplos equivalentes se incorporan como formulaciones
+        # válidas adicionales. No alteran el puntaje máximo ni el número requerido.
+        question["accepted_answers"] = respuestas + [x for x in equivalentes if x not in respuestas]
         required = row.get("required_items", row.get("required_number_of_items", ""))
         if not pd.isna(required) and str(required).strip():
             question["constraints"] = {"required_number_of_items": int(float(required))}
@@ -698,6 +721,12 @@ def load_rubric_from_excel(path):
             col_map[c] = "criterios"
         elif nc in ["variantes", "variantessemanticas", "variantes_semanticas", "semantic_variants", "sinonimos", "sinónimos"]:
             col_map[c] = "variantes_semanticas"
+        elif nc in ["elementoindispensable", "elemento_indispensable", "conceptoindispensable", "concepto_indispensable", "indispensable", "indispensable_element"]:
+            col_map[c] = "elemento_indispensable"
+        elif nc in ["ejemplosequivalentesaceptados", "ejemplos_equivalentes_aceptados", "ejemplosequivalentes", "ejemplos_equivalentes", "aceptartambien", "aceptar_tambien", "equivalent_examples"]:
+            col_map[c] = "ejemplos_equivalentes"
+        elif nc in ["observacionesparalaevaluacion", "observaciones_para_la_evaluacion", "observacionesevaluacion", "observaciones_evaluacion", "instruccionesespeciales", "instrucciones_especiales", "evaluation_observations"]:
+            col_map[c] = "observaciones_evaluacion"
         elif nc in ["required_items", "required_number_of_items", "numero_requerido", "n_requerido"]:
             col_map[c] = "required_items"
         elif nc in ["prompt", "enunciado", "pregunta_texto", "instruccion", "instrucción", "consigna"]:
@@ -1577,6 +1606,76 @@ def score_true_false(answer, question):
     return 0, 0.9 if a else 0.2, "Respuesta cerrada incorrecta o vacía."
 
 
+
+def rubric_v2_support(answer, question):
+    """
+    Evalúa de forma auxiliar los campos opcionales de la Rúbrica Flexible v2.
+
+    Principios:
+    - No reemplaza la lógica principal del Core.
+    - No cambia puntajes máximos.
+    - No penaliza si la rúbrica v2 está vacía.
+    - Usa el elemento indispensable y sus ejemplos equivalentes como evidencia
+      complementaria, con un bono conservador y trazable.
+    """
+    indispensable = str(question.get("indispensable_element", "") or "").strip()
+    equivalents = [str(x).strip() for x in (question.get("equivalent_examples", []) or []) if str(x).strip()]
+    observations = str(question.get("evaluation_observations", "") or "").strip()
+
+    result = {
+        "active": bool(indispensable or equivalents or observations),
+        "indispensable": indispensable,
+        "equivalents": equivalents,
+        "observations": observations,
+        "hit": False,
+        "best_score": 0,
+        "best_method": "sin evidencia v2",
+        "best_target": "",
+        "bonus_ratio": 0.0,
+    }
+
+    targets = []
+    if indispensable:
+        targets.append(indispensable)
+    targets.extend(equivalents)
+
+    if not targets:
+        return result
+
+    best_score = 0
+    best_method = "sin coincidencia"
+    best_target = ""
+    hit = False
+
+    for target in targets:
+        ok, score, method = semantic_match(answer, target, threshold=68, semantic_threshold=58)
+        if score > best_score:
+            best_score = score
+            best_method = method
+            best_target = target
+        if ok:
+            hit = True
+
+    # Bono deliberadamente pequeño: la rúbrica v2 apoya la interpretación,
+    # pero no puede fabricar una respuesta completa por sí sola.
+    bonus_ratio = 0.0
+    if hit:
+        bonus_ratio = 0.18
+    elif best_score >= 60:
+        bonus_ratio = 0.10
+    elif best_score >= 54 and answer_length_profile(answer) == "developed":
+        bonus_ratio = 0.06
+
+    result.update({
+        "hit": hit,
+        "best_score": best_score,
+        "best_method": best_method,
+        "best_target": best_target,
+        "bonus_ratio": bonus_ratio,
+    })
+    return result
+
+
 def score_criteria(answer, question):
     criteria = question.get("criteria", [])
     if not criteria:
@@ -1596,6 +1695,7 @@ def score_criteria(answer, question):
     contradictions = detect_contradictions(answer, concepts)
     profile = answer_length_profile(answer)
     quality_gate = semantic_response_quality_gate(answer, concepts)
+    rubric_v2 = rubric_v2_support(answer, question)
 
     for criterion in criteria:
         concept = criterion.get("concept", "")
@@ -1695,6 +1795,16 @@ def score_criteria(answer, question):
             f"Capa inferencial: comprensión parcial distribuida (+{inference_bonus:.2f}; razón={inference_bonus_ratio:.2f})"
         )
 
+    # Rúbrica Flexible v2: evidencia complementaria, conservadora y trazable.
+    if rubric_v2.get("bonus_ratio", 0) > 0 and not contradictions:
+        v2_bonus = max_score * float(rubric_v2["bonus_ratio"])
+        total += v2_bonus
+        method_notes.append(
+            "Rúbrica v2: evidencia complementaria "
+            f"({rubric_v2.get('best_target', '')}; {rubric_v2.get('best_method', '')}; "
+            f"{rubric_v2.get('best_score', 0)}/100; +{v2_bonus:.2f})"
+        )
+
     strict_coverage = len(set(matched)) / max(len(set(concepts)), 1)
     partial_coverage = (
         len(set(matched)) + 0.55 * len(set(p.get("concept") for p in partial_hits))
@@ -1756,6 +1866,15 @@ def score_criteria(answer, question):
         )
     if method_notes:
         feedback.append("Evidencia semántica: " + "; ".join(method_notes[:14]))
+    if rubric_v2.get("active"):
+        v2_trace = (
+            f"elemento_indispensable={'sí' if rubric_v2.get('indispensable') else 'no'}; "
+            f"equivalentes={len(rubric_v2.get('equivalents', []))}; "
+            f"mejor_evidencia={rubric_v2.get('best_score', 0)}/100"
+        )
+        feedback.append("Rúbrica Flexible v2 activa: " + v2_trace)
+        if rubric_v2.get("observations"):
+            feedback.append("Observación docente v2: " + rubric_v2.get("observations"))
 
     return round(total, 2), round(confidence, 2), " | ".join(feedback)
 
