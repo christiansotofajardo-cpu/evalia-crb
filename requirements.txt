@@ -7,3 +7,5 @@ rapidfuzz
 jinja2
 requests
 pillow
+numpy
+opencv-python-headless
