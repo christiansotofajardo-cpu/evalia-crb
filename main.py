@@ -21,7 +21,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from feature.capture.page_detector import detect_pages, draw_detected_pages
+from feature.capture import CaptureAssistant
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "outputs"
@@ -50,6 +50,14 @@ logging.basicConfig(
 logger = logging.getLogger("evalia")
 
 app = FastAPI(title="Evalia OCR-MVP", version=APP_VERSION)
+
+# Smart Capture se mantiene como una capa independiente del motor CRB.
+capture_assistant = CaptureAssistant(
+    pages_per_student=2,
+    stop_on_bad_quality=False,
+    generate_preview=True,
+    raise_exceptions=False,
+)
 
 SEMANTIC_CACHE: Dict[str, Any] = {}
 
@@ -4039,16 +4047,17 @@ def download(filename: str):
     )
 
 # ============================================================
-# SMART CAPTURE — DETECCIÓN EXPERIMENTAL DE HOJAS
+# SMART CAPTURE — FLUJO INTEGRADO
 # ============================================================
 
 @app.post("/smart-capture/test-detection")
 async def test_smart_capture_detection(file: UploadFile = File(...)):
     """
-    Detecta hojas dentro de una fotografía y devuelve una vista previa.
+    Ejecuta el flujo completo de Smart Capture:
 
-    Esta ruta corresponde al primer hito de Smart Capture:
-    todavía no agrupa estudiantes, no ejecuta OCR y no evalúa respuestas.
+    calidad → detección → organización → vista previa.
+
+    Esta ruta todavía no ejecuta OCR ni modifica el motor CRB.
     """
     allowed_types = {
         "image/jpeg",
@@ -4062,8 +4071,8 @@ async def test_smart_capture_detection(file: UploadFile = File(...)):
         return JSONResponse(
             status_code=400,
             content={
-                "status": "error",
-                "error": "Formato de imagen no permitido.",
+                "success": False,
+                "message": "Formato de imagen no permitido.",
                 "allowed_types": sorted(allowed_types),
             },
         )
@@ -4073,96 +4082,42 @@ async def test_smart_capture_detection(file: UploadFile = File(...)):
         return JSONResponse(
             status_code=400,
             content={
-                "status": "error",
-                "error": "El archivo recibido está vacío.",
+                "success": False,
+                "message": "El archivo recibido está vacío.",
             },
         )
 
-    np_buffer = np.frombuffer(raw_bytes, dtype=np.uint8)
-    image = cv2.imdecode(np_buffer, cv2.IMREAD_COLOR)
+    result = capture_assistant.inspect_bytes(raw_bytes)
 
-    if image is None:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "error",
-                "error": "No fue posible leer la imagen enviada.",
-            },
-        )
-
-    try:
-        pages = detect_pages(image)
-        preview = draw_detected_pages(image=image, pages=pages)
-    except Exception as exc:
-        log_event(
-            "smart_capture_detection_failed",
-            filename=file.filename or "sin_nombre",
-            error=str(exc),
-        )
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "error": "Falló la detección inicial de hojas.",
-                "detail": str(exc),
-            },
-        )
-
-    success, encoded_preview = cv2.imencode(
-        ".jpg",
-        preview,
-        [int(cv2.IMWRITE_JPEG_QUALITY), 88],
+    response = capture_assistant.result_to_api_dict(
+        result=result,
+        include_preview_base64=True,
+        preview_format="jpeg",
     )
 
-    if not success:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "error": "No fue posible generar la vista previa.",
-            },
-        )
-
-    encoded_base64 = base64.b64encode(
-        encoded_preview.tobytes()
-    ).decode("utf-8")
+    # No exponer trazas internas al navegador o a clientes externos.
+    metadata = response.get("metadata")
+    if isinstance(metadata, dict):
+        metadata.pop("traceback", None)
 
     log_event(
-        "smart_capture_detection_completed",
+        "smart_capture_completed",
         filename=file.filename or "sin_nombre",
-        detected_pages=len(pages),
-        image_width=image.shape[1],
-        image_height=image.shape[0],
+        success=result.success,
+        pages_detected=result.pages_detected,
+        students_detected=result.students_detected,
+        quality_acceptable=result.quality.acceptable,
+        incomplete_students=result.incomplete_students,
     )
 
-    return {
-        "status": "ok",
-        "filename": file.filename or "imagen",
-        "detected_pages": len(pages),
-        "image": {
-            "width": int(image.shape[1]),
-            "height": int(image.shape[0]),
-        },
-        "pages": [
-            {
-                "page_id": page.page_id,
-                "confidence": round(float(page.confidence), 3),
-                "center": {
-                    "x": round(float(page.x_center), 1),
-                    "y": round(float(page.y_center), 1),
-                },
-                "width": round(float(page.width), 1),
-                "height": round(float(page.height), 1),
-                "corners": [
-                    [round(float(x), 1), round(float(y), 1)]
-                    for x, y in page.corners
-                ],
-            }
-            for page in pages
-        ],
-        "preview": {
-            "mime_type": "image/jpeg",
-            "base64": encoded_base64,
-            "data_url": f"data:image/jpeg;base64,{encoded_base64}",
-        },
-    }
+    response["filename"] = file.filename or "imagen"
+
+    # Un resultado sin hojas o con error técnico se informa de forma
+    # controlada, manteniendo el detalle útil para la interfaz.
+    status_code = 200 if result.success else 422
+
+    return JSONResponse(
+        status_code=status_code,
+        content=response,
+    )
+
