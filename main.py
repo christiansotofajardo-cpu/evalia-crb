@@ -13,12 +13,15 @@ import os
 import math
 import base64
 import mimetypes
+import cv2
+import numpy as np
 from rapidfuzz import fuzz
 from html import escape
 from typing import Optional, Dict, Any, List, Tuple
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from feature.capture.page_detector import detect_pages, draw_detected_pages
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "outputs"
@@ -33,7 +36,7 @@ LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 # ROBUSTEZ TÉCNICA + EMBEDDINGS v3.5: BASELINE VALIDACIÓN, EMBEDDINGS OPTIMIZADOS, FALLBACK, CACHÉ Y TRAZABILIDAD
 # ============================================================
 
-APP_VERSION = "4.3.2-flexible-rubric-v2"
+APP_VERSION = "4.4.0-smart-capture-alpha"
 LOG_PATH = OUTPUT_DIR / "evalia_runtime.log"
 
 logging.basicConfig(
@@ -4034,3 +4037,132 @@ def download(filename: str):
         media_type=media_type,
         filename=filename
     )
+
+# ============================================================
+# SMART CAPTURE — DETECCIÓN EXPERIMENTAL DE HOJAS
+# ============================================================
+
+@app.post("/smart-capture/test-detection")
+async def test_smart_capture_detection(file: UploadFile = File(...)):
+    """
+    Detecta hojas dentro de una fotografía y devuelve una vista previa.
+
+    Esta ruta corresponde al primer hito de Smart Capture:
+    todavía no agrupa estudiantes, no ejecuta OCR y no evalúa respuestas.
+    """
+    allowed_types = {
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/webp",
+    }
+
+    content_type = (file.content_type or "").lower()
+    if content_type not in allowed_types:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "error": "Formato de imagen no permitido.",
+                "allowed_types": sorted(allowed_types),
+            },
+        )
+
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "error": "El archivo recibido está vacío.",
+            },
+        )
+
+    np_buffer = np.frombuffer(raw_bytes, dtype=np.uint8)
+    image = cv2.imdecode(np_buffer, cv2.IMREAD_COLOR)
+
+    if image is None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "error": "No fue posible leer la imagen enviada.",
+            },
+        )
+
+    try:
+        pages = detect_pages(image)
+        preview = draw_detected_pages(image=image, pages=pages)
+    except Exception as exc:
+        log_event(
+            "smart_capture_detection_failed",
+            filename=file.filename or "sin_nombre",
+            error=str(exc),
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "error": "Falló la detección inicial de hojas.",
+                "detail": str(exc),
+            },
+        )
+
+    success, encoded_preview = cv2.imencode(
+        ".jpg",
+        preview,
+        [int(cv2.IMWRITE_JPEG_QUALITY), 88],
+    )
+
+    if not success:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "error": "No fue posible generar la vista previa.",
+            },
+        )
+
+    encoded_base64 = base64.b64encode(
+        encoded_preview.tobytes()
+    ).decode("utf-8")
+
+    log_event(
+        "smart_capture_detection_completed",
+        filename=file.filename or "sin_nombre",
+        detected_pages=len(pages),
+        image_width=image.shape[1],
+        image_height=image.shape[0],
+    )
+
+    return {
+        "status": "ok",
+        "filename": file.filename or "imagen",
+        "detected_pages": len(pages),
+        "image": {
+            "width": int(image.shape[1]),
+            "height": int(image.shape[0]),
+        },
+        "pages": [
+            {
+                "page_id": page.page_id,
+                "confidence": round(float(page.confidence), 3),
+                "center": {
+                    "x": round(float(page.x_center), 1),
+                    "y": round(float(page.y_center), 1),
+                },
+                "width": round(float(page.width), 1),
+                "height": round(float(page.height), 1),
+                "corners": [
+                    [round(float(x), 1), round(float(y), 1)]
+                    for x, y in page.corners
+                ],
+            }
+            for page in pages
+        ],
+        "preview": {
+            "mime_type": "image/jpeg",
+            "base64": encoded_base64,
+            "data_url": f"data:image/jpeg;base64,{encoded_base64}",
+        },
+    }
