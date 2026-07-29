@@ -1,9 +1,15 @@
 fastapi
 uvicorn[standard]
 python-multipart
+
 pandas
 openpyxl
 rapidfuzz
+
 jinja2
 requests
+
 pillow
+
+numpy
+opencv-python-headless

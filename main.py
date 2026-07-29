@@ -13,6 +13,8 @@ import os
 import math
 import base64
 import mimetypes
+import cv2
+import numpy as np
 from rapidfuzz import fuzz
 from html import escape
 from typing import Optional, Dict, Any, List, Tuple
@@ -34,7 +36,7 @@ LEGACY_RUBRIC_PATH = BASE_DIR / "rubric_psicolinguistica_2026.json"
 # ROBUSTEZ TÉCNICA + EMBEDDINGS v3.5: BASELINE VALIDACIÓN, EMBEDDINGS OPTIMIZADOS, FALLBACK, CACHÉ Y TRAZABILIDAD
 # ============================================================
 
-APP_VERSION = "4.3.2-flexible-rubric-v2"
+APP_VERSION = "4.4.0-smart-capture-alpha"
 LOG_PATH = OUTPUT_DIR / "evalia_runtime.log"
 
 logging.basicConfig(
@@ -4037,3 +4039,79 @@ def download(filename: str):
         media_type=media_type,
         filename=filename
     )
+
+# ============================================================
+# SMART CAPTURE — FLUJO INTEGRADO
+# ============================================================
+
+@app.post("/smart-capture/test-detection")
+async def test_smart_capture_detection(file: UploadFile = File(...)):
+    """
+    Ejecuta el flujo completo de Smart Capture:
+
+    calidad → detección → organización → vista previa.
+
+    Esta ruta todavía no ejecuta OCR ni modifica el motor CRB.
+    """
+    allowed_types = {
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/webp",
+    }
+
+    content_type = (file.content_type or "").lower()
+    if content_type not in allowed_types:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "message": "Formato de imagen no permitido.",
+                "allowed_types": sorted(allowed_types),
+            },
+        )
+
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "message": "El archivo recibido está vacío.",
+            },
+        )
+
+    result = capture_assistant.inspect_bytes(raw_bytes)
+
+    response = capture_assistant.result_to_api_dict(
+        result=result,
+        include_preview_base64=True,
+        preview_format="jpeg",
+    )
+
+    # No exponer trazas internas al navegador o a clientes externos.
+    metadata = response.get("metadata")
+    if isinstance(metadata, dict):
+        metadata.pop("traceback", None)
+
+    log_event(
+        "smart_capture_completed",
+        filename=file.filename or "sin_nombre",
+        success=result.success,
+        pages_detected=result.pages_detected,
+        students_detected=result.students_detected,
+        quality_acceptable=result.quality.acceptable,
+        incomplete_students=result.incomplete_students,
+    )
+
+    response["filename"] = file.filename or "imagen"
+
+    # Un resultado sin hojas o con error técnico se informa de forma
+    # controlada, manteniendo el detalle útil para la interfaz.
+    status_code = 200 if result.success else 422
+
+    return JSONResponse(
+        status_code=status_code,
+        content=response,
+    )
+
