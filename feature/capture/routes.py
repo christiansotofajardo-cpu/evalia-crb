@@ -28,6 +28,9 @@ from html import escape
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
+import cv2
+import numpy as np
+
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import HTMLResponse
 
@@ -143,15 +146,58 @@ def _percent(value: Any) -> str:
 
 def _preview_to_data_url(preview: Any) -> Optional[str]:
     """
-    Acepta varias salidas posibles del PreviewGenerator:
+    Convierte la salida del PreviewGenerator en una data URL compatible con <img>.
+
+    Acepta:
+    - numpy.ndarray de OpenCV;
     - data URL;
     - base64 puro;
-    - bytes;
+    - bytes o bytearray;
     - ruta local;
     - dict/objeto con data_url, base64, image_bytes, path o preview.
     """
     if preview is None:
         return None
+
+    # PreviewGenerator.render() devuelve normalmente un ndarray BGR.
+    if isinstance(preview, np.ndarray):
+        if preview.size == 0:
+            return None
+
+        image = preview
+
+        if image.dtype != np.uint8:
+            image = np.nan_to_num(
+                image,
+                nan=0.0,
+                posinf=255.0,
+                neginf=0.0,
+            )
+            if float(np.min(image)) >= 0.0 and float(np.max(image)) <= 1.0:
+                image = image * 255.0
+            image = np.clip(image, 0, 255).astype(np.uint8)
+
+        if image.ndim == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        elif image.ndim == 3 and image.shape[2] == 1:
+            image = cv2.cvtColor(image[:, :, 0], cv2.COLOR_GRAY2BGR)
+        elif image.ndim == 3 and image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        elif image.ndim != 3 or image.shape[2] != 3:
+            return None
+
+        success, encoded = cv2.imencode(
+            ".jpg",
+            np.ascontiguousarray(image),
+            [int(cv2.IMWRITE_JPEG_QUALITY), 88],
+        )
+        if not success:
+            return None
+
+        encoded_base64 = base64.b64encode(
+            encoded.tobytes()
+        ).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded_base64}"
 
     nested = _get_value(
         preview,
@@ -173,8 +219,8 @@ def _preview_to_data_url(preview: Any) -> Optional[str]:
     if nested is not None and nested is not preview:
         return _preview_to_data_url(nested)
 
-    if isinstance(preview, bytes):
-        encoded = base64.b64encode(preview).decode("ascii")
+    if isinstance(preview, (bytes, bytearray)):
+        encoded = base64.b64encode(bytes(preview)).decode("ascii")
         return f"data:image/jpeg;base64,{encoded}"
 
     if isinstance(preview, Path):
@@ -327,6 +373,8 @@ def _organization(result: Any) -> Any:
     return _get_value(
         result,
         "organization",
+        "students",
+        "student_groups",
         "organized_pages",
         "page_organization",
         "groups",
@@ -432,14 +480,23 @@ def _render_organization(organization: Any) -> str:
 
     group_rows = []
     for index, group in enumerate(_as_list(groups), start=1):
+        student_number = _get_value(
+            group,
+            "student_number",
+            default=index,
+        )
+
         group_name = _get_value(
             group,
-            "student_id",
             "student_name",
+            "student_id",
             "group_id",
             "name",
-            default=f"Grupo {index}",
+            default=None,
         )
+
+        if group_name in (None, "", "None"):
+            group_name = f"Estudiante {student_number}"
         group_pages = _as_list(
             _get_value(
                 group,
@@ -1131,5 +1188,4 @@ def register_capture_routes(app: FastAPI) -> None:
                     ),
                     status_code=500,
                 )
-
 
