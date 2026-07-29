@@ -28,9 +28,6 @@ from html import escape
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
-import cv2
-import numpy as np
-
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import HTMLResponse
 
@@ -155,52 +152,6 @@ def _preview_to_data_url(preview: Any) -> Optional[str]:
     """
     if preview is None:
         return None
-
-    # PreviewGenerator devuelve normalmente un numpy.ndarray BGR.
-    # Lo codificamos aquí para que el navegador pueda mostrarlo.
-    if isinstance(preview, np.ndarray):
-        if preview.size == 0:
-            return None
-
-        image = preview
-
-        if image.dtype != np.uint8:
-            image = np.nan_to_num(
-                image,
-                nan=0.0,
-                posinf=255.0,
-                neginf=0.0,
-            )
-
-            if (
-                float(np.min(image)) >= 0.0
-                and float(np.max(image)) <= 1.0
-            ):
-                image = image * 255.0
-
-            image = np.clip(
-                image,
-                0,
-                255,
-            ).astype(np.uint8)
-
-        success, encoded_image = cv2.imencode(
-            ".jpg",
-            image,
-            [
-                int(cv2.IMWRITE_JPEG_QUALITY),
-                88,
-            ],
-        )
-
-        if not success:
-            return None
-
-        encoded = base64.b64encode(
-            encoded_image.tobytes()
-        ).decode("ascii")
-
-        return f"data:image/jpeg;base64,{encoded}"
 
     nested = _get_value(
         preview,
@@ -379,8 +330,6 @@ def _organization(result: Any) -> Any:
         "organized_pages",
         "page_organization",
         "groups",
-        "students",
-        "student_groups",
         default=None,
     )
 
