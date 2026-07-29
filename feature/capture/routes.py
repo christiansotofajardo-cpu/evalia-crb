@@ -1132,3 +1132,4 @@ def register_capture_routes(app: FastAPI) -> None:
                     status_code=500,
                 )
 
+
