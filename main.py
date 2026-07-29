@@ -19,6 +19,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from feature.capture.routes import register_capture_routes
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "outputs"
@@ -47,6 +48,8 @@ logging.basicConfig(
 logger = logging.getLogger("evalia")
 
 app = FastAPI(title="Evalia OCR-MVP", version=APP_VERSION)
+
+register_capture_routes(app)
 
 SEMANTIC_CACHE: Dict[str, Any] = {}
 
