@@ -21,7 +21,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from feature.capture import CaptureAssistant
+from feature.capture.routes import register_capture_routes
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "outputs"
@@ -51,13 +51,7 @@ logger = logging.getLogger("evalia")
 
 app = FastAPI(title="Evalia OCR-MVP", version=APP_VERSION)
 
-# Smart Capture se mantiene como una capa independiente del motor CRB.
-capture_assistant = CaptureAssistant(
-    pages_per_student=2,
-    stop_on_bad_quality=False,
-    generate_preview=True,
-    raise_exceptions=False,
-)
+register_capture_routes(app)
 
 SEMANTIC_CACHE: Dict[str, Any] = {}
 
