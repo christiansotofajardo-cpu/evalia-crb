@@ -7,6 +7,7 @@ Responsabilidades:
 - buscar separaciones internas verticales, horizontales e inclinadas;
 - crear páginas independientes compatibles con DetectedPage;
 - conservar la página original cuando no existe evidencia suficiente;
+- registrar el motivo exacto de aceptación o rechazo en metadata;
 - mantener separado este proceso de PageDetector y del OCR.
 
 Integración prevista en CaptureAssistant:
@@ -132,6 +133,11 @@ class MultiPageSplitter:
         )
         self.max_output_pages = max(1, int(max_output_pages))
 
+        # Diagnóstico de la última inspección. Se copia a page.metadata
+        # para que aparezca en “Información técnica del análisis”.
+        self._last_hough_debug: dict = {}
+        self._last_validation_debug: dict = {}
+
     def split_pages(
         self,
         image: np.ndarray,
@@ -197,34 +203,80 @@ class MultiPageSplitter:
         page: DetectedPage,
     ) -> List[DetectedPage]:
         """
-        Intenta dividir una página candidata grande.
+        Intenta dividir una página candidata grande y registra diagnóstico.
 
-        Orden de prueba:
-        1. cuadrícula 2 × 2;
-        2. separación vertical;
-        3. separación horizontal;
-        4. separación inclinada mediante Hough;
-        5. fallback seguro a la página original.
+        El diagnóstico queda en:
+
+            page.metadata["split_debug"]
+
+        y permite saber:
+        - qué candidatos aparecieron;
+        - qué método se probó;
+        - cuántos hijos se construyeron;
+        - qué validación rechazó la división;
+        - qué líneas Hough fueron encontradas.
         """
         normalized_image = self._validate_image(image)
+
+        debug: dict = {
+            "splitter_version": "debug-v1",
+            "status": "started",
+            "selected_method": None,
+            "rejection_reason": None,
+            "attempts": [],
+            "thresholds": {
+                "minimum_parent_area_ratio": self.minimum_parent_area_ratio,
+                "minimum_child_area_ratio": self.minimum_child_area_ratio,
+                "minimum_child_side": self.minimum_child_side,
+                "minimum_split_confidence": self.minimum_split_confidence,
+                "hough_minimum_confidence": self.hough_minimum_confidence,
+                "hough_min_line_length_ratio": (
+                    self.hough_min_line_length_ratio
+                ),
+                "hough_center_tolerance_ratio": (
+                    self.hough_center_tolerance_ratio
+                ),
+                "hough_angle_tolerance_degrees": (
+                    self.hough_angle_tolerance_degrees
+                ),
+            },
+        }
+
         region = self._extract_parent_region(
             image=normalized_image,
             page=page,
         )
 
         if region is None:
+            debug.update(
+                {
+                    "status": "not_split",
+                    "rejection_reason": "parent_region_unavailable",
+                }
+            )
+            self._attach_split_debug(page, debug)
             return [page]
 
         crop, offset_x, offset_y = region
-        if crop.shape[0] < self.minimum_child_side * 2:
-            horizontal_possible = False
-        else:
-            horizontal_possible = True
+        debug["parent_region"] = {
+            "offset_x": int(offset_x),
+            "offset_y": int(offset_y),
+            "width": int(crop.shape[1]),
+            "height": int(crop.shape[0]),
+            "area": int(crop.shape[0] * crop.shape[1]),
+        }
 
-        if crop.shape[1] < self.minimum_child_side * 2:
-            vertical_possible = False
-        else:
-            vertical_possible = True
+        horizontal_possible = (
+            crop.shape[0] >= self.minimum_child_side * 2
+        )
+        vertical_possible = (
+            crop.shape[1] >= self.minimum_child_side * 2
+        )
+
+        debug["axis_possible"] = {
+            "vertical": bool(vertical_possible),
+            "horizontal": bool(horizontal_possible),
+        }
 
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -239,7 +291,6 @@ class MultiPageSplitter:
             if vertical_possible
             else None
         )
-
         horizontal_split = (
             self._find_split_axis(
                 profile=evidence["horizontal_profile"],
@@ -249,7 +300,20 @@ class MultiPageSplitter:
             else None
         )
 
-        # Primero se prueba una cuadrícula 2 × 2.
+        debug["axis_candidates"] = {
+            "vertical": self._safe_debug_value(vertical_split),
+            "horizontal": self._safe_debug_value(horizontal_split),
+            "vertical_profile_summary": self._profile_summary(
+                evidence["vertical_profile"]
+            ),
+            "horizontal_profile_summary": self._profile_summary(
+                evidence["horizontal_profile"]
+            ),
+        }
+
+        # ----------------------------------------------------------
+        # 1. Cuadrícula 2 × 2
+        # ----------------------------------------------------------
         if (
             vertical_split is not None
             and horizontal_split is not None
@@ -268,14 +332,33 @@ class MultiPageSplitter:
                 horizontal_split=horizontal_split,
                 split_confidence=grid_confidence,
             )
-            if self._children_are_valid(
+            valid, validation = self._validate_children_detailed(
                 children=children,
                 image=normalized_image,
                 expected_count=4,
-            ):
+            )
+            debug["attempts"].append(
+                {
+                    "method": "grid_2x2",
+                    "candidate_confidence": float(grid_confidence),
+                    "children_built": len(children),
+                    "accepted": bool(valid),
+                    "validation": validation,
+                }
+            )
+            if valid:
+                debug.update(
+                    {
+                        "status": "split",
+                        "selected_method": "grid_2x2",
+                    }
+                )
+                self._attach_split_debug_to_pages(children, debug)
                 return children
 
-        # Dos hojas lado a lado.
+        # ----------------------------------------------------------
+        # 2. Dos hojas lado a lado
+        # ----------------------------------------------------------
         if vertical_split is not None:
             children = self._build_axis_children(
                 image=normalized_image,
@@ -286,14 +369,35 @@ class MultiPageSplitter:
                 split=vertical_split,
                 axis="vertical",
             )
-            if self._children_are_valid(
+            valid, validation = self._validate_children_detailed(
                 children=children,
                 image=normalized_image,
                 expected_count=2,
-            ):
+            )
+            debug["attempts"].append(
+                {
+                    "method": "vertical_valley",
+                    "candidate": self._safe_debug_value(
+                        vertical_split
+                    ),
+                    "children_built": len(children),
+                    "accepted": bool(valid),
+                    "validation": validation,
+                }
+            )
+            if valid:
+                debug.update(
+                    {
+                        "status": "split",
+                        "selected_method": "vertical_valley",
+                    }
+                )
+                self._attach_split_debug_to_pages(children, debug)
                 return children
 
-        # Dos hojas apiladas.
+        # ----------------------------------------------------------
+        # 3. Dos hojas apiladas
+        # ----------------------------------------------------------
         if horizontal_split is not None:
             children = self._build_axis_children(
                 image=normalized_image,
@@ -304,17 +408,40 @@ class MultiPageSplitter:
                 split=horizontal_split,
                 axis="horizontal",
             )
-            if self._children_are_valid(
+            valid, validation = self._validate_children_detailed(
                 children=children,
                 image=normalized_image,
                 expected_count=2,
-            ):
+            )
+            debug["attempts"].append(
+                {
+                    "method": "horizontal_valley",
+                    "candidate": self._safe_debug_value(
+                        horizontal_split
+                    ),
+                    "children_built": len(children),
+                    "accepted": bool(valid),
+                    "validation": validation,
+                }
+            )
+            if valid:
+                debug.update(
+                    {
+                        "status": "split",
+                        "selected_method": "horizontal_valley",
+                    }
+                )
+                self._attach_split_debug_to_pages(children, debug)
                 return children
 
-        # Fallback geométrico: separación central inclinada.
-        hough_split = self._find_hough_separator(
-            gray=gray,
+        # ----------------------------------------------------------
+        # 4. Separación inclinada mediante Hough
+        # ----------------------------------------------------------
+        hough_split = self._find_hough_separator(gray=gray)
+        debug["hough"] = self._safe_debug_value(
+            self._last_hough_debug
         )
+
         if hough_split is not None:
             children = self._build_hough_children(
                 image=normalized_image,
@@ -324,14 +451,72 @@ class MultiPageSplitter:
                 offset_y=offset_y,
                 split=hough_split,
             )
-            if self._children_are_valid(
+            valid, validation = self._validate_children_detailed(
                 children=children,
                 image=normalized_image,
                 expected_count=2,
-            ):
+            )
+            debug["attempts"].append(
+                {
+                    "method": "hough_inclined",
+                    "candidate": self._safe_debug_value(
+                        hough_split
+                    ),
+                    "children_built": len(children),
+                    "accepted": bool(valid),
+                    "validation": validation,
+                }
+            )
+            if valid:
+                debug.update(
+                    {
+                        "status": "split",
+                        "selected_method": "hough_inclined",
+                    }
+                )
+                self._attach_split_debug_to_pages(children, debug)
                 return children
 
+        # ----------------------------------------------------------
+        # Fallback seguro
+        # ----------------------------------------------------------
+        if not debug["attempts"]:
+            if (
+                vertical_split is None
+                and horizontal_split is None
+                and hough_split is None
+            ):
+                reason = "no_split_candidate_passed_thresholds"
+            else:
+                reason = "no_valid_split_attempt"
+        else:
+            rejected = [
+                attempt
+                for attempt in debug["attempts"]
+                if not attempt.get("accepted")
+            ]
+            if rejected:
+                last_validation = rejected[-1].get(
+                    "validation",
+                    {},
+                )
+                reason = last_validation.get(
+                    "reason",
+                    "all_split_attempts_rejected",
+                )
+            else:
+                reason = "all_split_attempts_rejected"
+
+        debug.update(
+            {
+                "status": "not_split",
+                "selected_method": None,
+                "rejection_reason": reason,
+            }
+        )
+        self._attach_split_debug(page, debug)
         return [page]
+
 
     def _find_hough_separator(
         self,
@@ -340,25 +525,44 @@ class MultiPageSplitter:
         """
         Busca una línea larga, central y aproximadamente vertical u horizontal.
 
-        Se usa como fallback cuando los perfiles por ejes no detectan el hueco
-        porque la separación entre hojas aparece inclinada por perspectiva.
+        Además guarda un resumen diagnóstico en self._last_hough_debug.
         """
         height, width = gray.shape[:2]
+
+        debug = {
+            "status": "started",
+            "image_width": int(width),
+            "image_height": int(height),
+            "raw_lines_found": 0,
+            "orientation_compatible": 0,
+            "central_lines": 0,
+            "accepted_candidates": 0,
+            "best_candidate": None,
+            "rejection_reason": None,
+        }
+
         if (
             height < self.minimum_child_side * 2
             or width < self.minimum_child_side * 2
         ):
+            debug.update(
+                {
+                    "status": "rejected",
+                    "rejection_reason": "region_too_small_for_two_pages",
+                }
+            )
+            self._last_hough_debug = debug
             return None
 
-        # Realza bordes largos y reduce ruido de escritura.
         blurred = cv2.GaussianBlur(gray, (7, 7), 0)
         edges = cv2.Canny(blurred, 45, 135)
-
-        # Cierre ligero para unir segmentos de la separación sin fusionar texto.
         edges = cv2.morphologyEx(
             edges,
             cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            cv2.getStructuringElement(
+                cv2.MORPH_RECT,
+                (3, 3),
+            ),
             iterations=1,
         )
 
@@ -375,25 +579,49 @@ class MultiPageSplitter:
                 * self.hough_max_line_gap_ratio
             )
         )
+        hough_threshold = max(
+            45,
+            int(min_dimension * 0.045),
+        )
+
+        debug["parameters"] = {
+            "threshold": int(hough_threshold),
+            "min_line_length": int(max(80, min_line_length)),
+            "max_line_gap": int(max(8, max_line_gap)),
+        }
 
         lines = cv2.HoughLinesP(
             edges,
             rho=1,
             theta=np.pi / 180.0,
-            threshold=max(45, int(min_dimension * 0.045)),
+            threshold=hough_threshold,
             minLineLength=max(80, min_line_length),
             maxLineGap=max(8, max_line_gap),
         )
 
         if lines is None:
+            debug.update(
+                {
+                    "status": "rejected",
+                    "rejection_reason": "hough_returned_no_lines",
+                }
+            )
+            self._last_hough_debug = debug
             return None
+
+        debug["raw_lines_found"] = int(len(lines))
 
         center_x = width / 2.0
         center_y = height / 2.0
         candidates = []
+        orientation_compatible = 0
+        central_lines = 0
 
         for raw_line in lines[:, 0, :]:
-            x1, y1, x2, y2 = [float(v) for v in raw_line]
+            x1, y1, x2, y2 = [
+                float(v)
+                for v in raw_line
+            ]
             dx = x2 - x1
             dy = y2 - y1
             length = float(np.hypot(dx, dy))
@@ -405,7 +633,6 @@ class MultiPageSplitter:
             )
             normalized_angle = abs(angle) % 180.0
 
-            # Distancia angular a vertical y horizontal.
             distance_to_horizontal = min(
                 normalized_angle,
                 abs(180.0 - normalized_angle),
@@ -435,6 +662,8 @@ class MultiPageSplitter:
             if orientation is None:
                 continue
 
+            orientation_compatible += 1
+
             midpoint_x = (x1 + x2) / 2.0
             midpoint_y = (y1 + y2) / 2.0
 
@@ -455,6 +684,8 @@ class MultiPageSplitter:
             ):
                 continue
 
+            central_lines += 1
+
             centrality = 1.0 - min(
                 1.0,
                 center_distance
@@ -465,10 +696,7 @@ class MultiPageSplitter:
             )
             length_score = min(
                 1.0,
-                length / max(
-                    min_line_length,
-                    1.0,
-                ),
+                length / max(min_line_length, 1.0),
             )
             span_score = min(
                 1.0,
@@ -501,7 +729,12 @@ class MultiPageSplitter:
                     ),
                     "midpoint_x": float(midpoint_x),
                     "midpoint_y": float(midpoint_y),
+                    "center_distance_ratio": float(
+                        center_distance
+                    ),
+                    "span_ratio": float(span_ratio),
                     "angle": float(angle),
+                    "angle_distance": float(angle_distance),
                     "length": float(length),
                     "confidence": float(
                         np.clip(confidence, 0.0, 1.0)
@@ -509,21 +742,72 @@ class MultiPageSplitter:
                 }
             )
 
+        debug["orientation_compatible"] = int(
+            orientation_compatible
+        )
+        debug["central_lines"] = int(central_lines)
+        debug["accepted_candidates"] = int(len(candidates))
+
         if not candidates:
+            if orientation_compatible == 0:
+                reason = "no_lines_with_compatible_angle"
+            elif central_lines == 0:
+                reason = "compatible_lines_too_far_from_center"
+            else:
+                reason = "no_hough_candidate_survived_filters"
+
+            debug.update(
+                {
+                    "status": "rejected",
+                    "rejection_reason": reason,
+                }
+            )
+            self._last_hough_debug = debug
             return None
 
-        best = max(
+        ranked = sorted(
             candidates,
             key=lambda item: item["confidence"],
+            reverse=True,
         )
+        best = ranked[0]
+
+        debug["best_candidate"] = self._safe_debug_value(best)
+        debug["top_candidates"] = [
+            self._safe_debug_value(item)
+            for item in ranked[:5]
+        ]
 
         if (
             best["confidence"]
             < self.hough_minimum_confidence
         ):
+            debug.update(
+                {
+                    "status": "rejected",
+                    "rejection_reason": (
+                        "best_hough_confidence_below_threshold"
+                    ),
+                    "best_confidence": float(
+                        best["confidence"]
+                    ),
+                    "required_confidence": float(
+                        self.hough_minimum_confidence
+                    ),
+                }
+            )
+            self._last_hough_debug = debug
             return None
 
+        debug.update(
+            {
+                "status": "accepted",
+                "rejection_reason": None,
+            }
+        )
+        self._last_hough_debug = debug
         return best
+
 
     def _build_hough_children(
         self,
@@ -1234,51 +1518,111 @@ class MultiPageSplitter:
         image: np.ndarray,
         expected_count: int,
     ) -> bool:
+        valid, details = self._validate_children_detailed(
+            children=children,
+            image=image,
+            expected_count=expected_count,
+        )
+        self._last_validation_debug = details
+        return valid
+
+    def _validate_children_detailed(
+        self,
+        children: Sequence[DetectedPage],
+        image: np.ndarray,
+        expected_count: int,
+    ) -> tuple[bool, dict]:
+        """
+        Valida páginas hijas y devuelve el motivo exacto del rechazo.
+        """
+        details: dict = {
+            "expected_count": int(expected_count),
+            "actual_count": int(len(children)),
+            "accepted": False,
+            "reason": None,
+            "children": [],
+        }
+
         if len(children) != expected_count:
-            return False
+            details["reason"] = "unexpected_children_count"
+            return False, details
 
         image_area = float(
             image.shape[0] * image.shape[1]
         )
         child_areas = []
 
-        for child in children:
-            width = float(getattr(child, "width", 0.0))
-            height = float(getattr(child, "height", 0.0))
+        for index, child in enumerate(children, start=1):
+            width = float(
+                getattr(child, "width", 0.0)
+            )
+            height = float(
+                getattr(child, "height", 0.0)
+            )
             area = max(
                 float(getattr(child, "area", 0.0)),
                 width * height,
             )
+            area_ratio = area / max(image_area, 1.0)
+
+            shorter = max(min(width, height), 1.0)
+            longer = max(width, height)
+            aspect_ratio = shorter / longer
+
+            child_info = {
+                "index": int(index),
+                "width": float(width),
+                "height": float(height),
+                "area": float(area),
+                "area_ratio": float(area_ratio),
+                "aspect_ratio": float(aspect_ratio),
+            }
+            details["children"].append(child_info)
 
             if (
                 width < self.minimum_child_side
                 or height < self.minimum_child_side
             ):
-                return False
+                details["reason"] = "child_side_below_minimum"
+                details["failed_child"] = int(index)
+                return False, details
 
-            if area / max(image_area, 1.0) < (
-                self.minimum_child_area_ratio
-            ):
-                return False
+            if area_ratio < self.minimum_child_area_ratio:
+                details["reason"] = "child_area_ratio_below_minimum"
+                details["failed_child"] = int(index)
+                details["required_area_ratio"] = float(
+                    self.minimum_child_area_ratio
+                )
+                return False, details
 
-            shorter = max(min(width, height), 1.0)
-            longer = max(width, height)
-            ratio = shorter / longer
-
-            # Tolerancia amplia para hojas fotografiadas en perspectiva.
-            if ratio < 0.30:
-                return False
+            if aspect_ratio < 0.30:
+                details["reason"] = "child_aspect_ratio_too_narrow"
+                details["failed_child"] = int(index)
+                return False, details
 
             child_areas.append(area)
 
-        # Evita divisiones absurdamente desbalanceadas.
         if child_areas:
             smallest = min(child_areas)
             largest = max(child_areas)
-            if smallest / max(largest, 1.0) < 0.42:
-                return False
+            balance_ratio = smallest / max(largest, 1.0)
+            details["area_balance_ratio"] = float(
+                balance_ratio
+            )
 
-        return True
+            if balance_ratio < 0.42:
+                details["reason"] = "children_area_unbalanced"
+                details["required_balance_ratio"] = 0.42
+                return False, details
+
+        details.update(
+            {
+                "accepted": True,
+                "reason": "accepted",
+            }
+        )
+        return True, details
+
 
     def _extract_parent_region(
         self,
@@ -1398,6 +1742,84 @@ class MultiPageSplitter:
         ].copy()
 
         return None if crop.size == 0 else crop
+
+    @staticmethod
+    def _safe_debug_value(value: Any) -> Any:
+        """Convierte datos de depuración a tipos serializables."""
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return {
+                str(key): MultiPageSplitter._safe_debug_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple, set)):
+            return [
+                MultiPageSplitter._safe_debug_value(item)
+                for item in value
+            ]
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (np.floating,)):
+            return float(value)
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    @staticmethod
+    def _profile_summary(profile: np.ndarray) -> dict:
+        values = np.asarray(
+            profile,
+            dtype=np.float32,
+        ).reshape(-1)
+
+        if values.size == 0:
+            return {
+                "size": 0,
+                "minimum": None,
+                "maximum": None,
+                "median": None,
+                "minimum_index": None,
+            }
+
+        minimum_index = int(np.argmin(values))
+        return {
+            "size": int(values.size),
+            "minimum": float(np.min(values)),
+            "maximum": float(np.max(values)),
+            "median": float(np.median(values)),
+            "mean": float(np.mean(values)),
+            "minimum_index": minimum_index,
+            "minimum_position_ratio": float(
+                minimum_index / max(values.size - 1, 1)
+            ),
+        }
+
+    @staticmethod
+    def _attach_split_debug(
+        page: DetectedPage,
+        debug: dict,
+    ) -> None:
+        metadata = dict(
+            getattr(page, "metadata", {}) or {}
+        )
+        metadata["split_debug"] = (
+            MultiPageSplitter._safe_debug_value(debug)
+        )
+        page.metadata = metadata
+
+    @staticmethod
+    def _attach_split_debug_to_pages(
+        pages: Sequence[DetectedPage],
+        debug: dict,
+    ) -> None:
+        for page in pages:
+            MultiPageSplitter._attach_split_debug(
+                page,
+                debug,
+            )
 
     @staticmethod
     def _validate_image(image: Any) -> np.ndarray:
