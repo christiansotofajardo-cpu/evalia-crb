@@ -78,6 +78,22 @@ class DetectedPage:
     cropped_image:
         Imagen recortada o rectificada de la hoja.
 
+    student_name:
+        Nombre leído desde el encabezado de la hoja.
+
+    student_id:
+        Código, matrícula u otro identificador reconocido.
+
+    identity_text:
+        Texto bruto devuelto por el OCR de identidad.
+
+    identity_confidence:
+        Confianza de la lectura de identidad entre 0 y 1.
+
+    identity_status:
+        Estado de la lectura: pending, recognized, not_recognized,
+        reader_not_configured, reader_error o missing_crop.
+
     metadata:
         Información adicional del detector.
     """
@@ -94,6 +110,20 @@ class DetectedPage:
     confidence: float = 1.0
     page_number: Optional[int] = None
     cropped_image: Optional[np.ndarray] = None
+
+    # Metadatos espaciales asignados por PageOrganizer.
+    layout_row: Optional[int] = None
+    layout_column: Optional[int] = None
+    visual_order: Optional[int] = None
+
+    # Identidad y pertenencia.
+    student_number: Optional[int] = None
+    student_name: Optional[str] = None
+    student_id: Optional[str] = None
+    identity_text: Optional[str] = None
+    identity_confidence: Optional[float] = None
+    identity_status: str = "pending"
+
     metadata: Dict[str, Any] = field(
         default_factory=dict
     )
@@ -145,6 +175,23 @@ class DetectedPage:
             and self.cropped_image.size > 0
         )
 
+    @property
+    def has_identity(self) -> bool:
+        """
+        Indica si la página posee nombre o identificador reconocido.
+        """
+
+        return bool(
+            (
+                self.student_name
+                and self.student_name.strip()
+            )
+            or (
+                self.student_id
+                and self.student_id.strip()
+            )
+        )
+
     def to_dict(
         self,
         include_image: bool = False,
@@ -178,6 +225,18 @@ class DetectedPage:
             "page_number": self.page_number,
             "aspect_ratio": self.aspect_ratio,
             "has_crop": self.has_crop,
+            "layout_row": self.layout_row,
+            "layout_column": self.layout_column,
+            "visual_order": self.visual_order,
+            "student_number": self.student_number,
+            "student_name": self.student_name,
+            "student_id": self.student_id,
+            "identity_text": self.identity_text,
+            "identity_confidence": (
+                self.identity_confidence
+            ),
+            "identity_status": self.identity_status,
+            "has_identity": self.has_identity,
             "metadata": self.metadata,
         }
 
@@ -214,6 +273,15 @@ class StudentPageGroup:
         Identificador real del estudiante, cuando posteriormente
         sea reconocido o ingresado por el profesor.
 
+    student_name:
+        Nombre reconocido desde el encabezado de sus hojas.
+
+    identity_confidence:
+        Confianza promedio de la identificación.
+
+    identity_status:
+        Estado consolidado de la identidad del grupo.
+
     confirmed:
         Indica si el profesor confirmó manualmente el grupo.
 
@@ -231,6 +299,10 @@ class StudentPageGroup:
     complete: bool = False
 
     student_id: Optional[str] = None
+    student_name: Optional[str] = None
+    identity_confidence: Optional[float] = None
+    identity_status: str = "pending"
+
     confirmed: bool = False
     warnings: List[str] = field(
         default_factory=list
@@ -246,6 +318,31 @@ class StudentPageGroup:
         """
 
         return len(self.pages)
+
+    @property
+    def identity_label(self) -> str:
+        """
+        Etiqueta legible para la interfaz.
+        """
+
+        if self.student_name:
+            return self.student_name
+
+        if self.student_id:
+            return self.student_id
+
+        return f"Estudiante {self.student_number}"
+
+    @property
+    def identity_resolved(self) -> bool:
+        """
+        Indica si el grupo posee nombre o código reconocido.
+        """
+
+        return bool(
+            self.student_name
+            or self.student_id
+        )
 
     @property
     def requires_confirmation(self) -> bool:
@@ -284,6 +381,15 @@ class StudentPageGroup:
         return {
             "student_number": self.student_number,
             "student_id": self.student_id,
+            "student_name": self.student_name,
+            "identity_label": self.identity_label,
+            "identity_confidence": (
+                self.identity_confidence
+            ),
+            "identity_status": self.identity_status,
+            "identity_resolved": (
+                self.identity_resolved
+            ),
             "complete": self.complete,
             "confirmed": self.confirmed,
             "page_count": self.page_count,
@@ -494,6 +600,29 @@ class CaptureResult:
         )
 
     @property
+    def identified_students(self) -> int:
+        """
+        Número de estudiantes con identidad reconocida.
+        """
+
+        return sum(
+            1
+            for student in self.students
+            if student.identity_resolved
+        )
+
+    @property
+    def unidentified_students(self) -> int:
+        """
+        Número de estudiantes pendientes de identificación.
+        """
+
+        return (
+            self.students_detected
+            - self.identified_students
+        )
+
+    @property
     def requires_confirmation(self) -> bool:
         """
         Indica si el profesor debe revisar la organización.
@@ -569,6 +698,12 @@ class CaptureResult:
             ),
             "students_detected": (
                 self.students_detected
+            ),
+            "identified_students": (
+                self.identified_students
+            ),
+            "unidentified_students": (
+                self.unidentified_students
             ),
             "complete_students": (
                 self.complete_students
