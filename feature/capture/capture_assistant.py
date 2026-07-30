@@ -12,6 +12,8 @@ Este módulo conecta las distintas etapas del procesamiento:
         ↓
     detección de páginas
         ↓
+    separación multipágina
+        ↓
     organización por estudiante
         ↓
     generación de vista previa
@@ -44,6 +46,7 @@ from .models import (
     create_failed_capture_result,
 )
 from .page_detector import PageDetector
+from .multi_page_splitter import MultiPageSplitter
 from .page_organizer import PageOrganizer
 from .preview import PreviewGenerator
 from .quality_analyzer import QualityAnalyzer
@@ -63,6 +66,10 @@ class CaptureAssistant:
 
     page_detector:
         Instancia personalizada de PageDetector.
+
+    multi_page_splitter:
+        Instancia personalizada de MultiPageSplitter. Divide una detección
+        grande en 2 o 4 hojas cuando encuentra separaciones internas seguras.
 
     page_organizer:
         Instancia personalizada de PageOrganizer.
@@ -90,6 +97,7 @@ class CaptureAssistant:
         self,
         quality_analyzer: Optional[QualityAnalyzer] = None,
         page_detector: Optional[PageDetector] = None,
+        multi_page_splitter: Optional[MultiPageSplitter] = None,
         page_organizer: Optional[PageOrganizer] = None,
         preview_generator: Optional[PreviewGenerator] = None,
         pages_per_student: int = 2,
@@ -118,6 +126,12 @@ class CaptureAssistant:
             page_detector
             if page_detector is not None
             else PageDetector()
+        )
+
+        self.multi_page_splitter = (
+            multi_page_splitter
+            if multi_page_splitter is not None
+            else MultiPageSplitter()
         )
 
         self.page_organizer = (
@@ -508,7 +522,8 @@ class CaptureAssistant:
         image: np.ndarray,
     ) -> List[DetectedPage]:
         """
-        Ejecuta PageDetector admitiendo distintos nombres de método.
+        Ejecuta PageDetector y luego MultiPageSplitter, admitiendo
+        distintos nombres de método durante el desarrollo.
         """
 
         detector = self.page_detector
@@ -530,6 +545,19 @@ class CaptureAssistant:
 
         pages = self._extract_pages_from_detector_result(
             detected
+        )
+
+        self._validate_detected_pages(
+            pages
+        )
+
+        # El detector puede interpretar varias hojas cercanas como un único
+        # documento grande. MultiPageSplitter busca separaciones internas
+        # verticales u horizontales y devuelve 2 o 4 páginas cuando existe
+        # evidencia suficiente. Si no la encuentra, conserva la página original.
+        pages = self.multi_page_splitter.split_pages(
+            image=image,
+            pages=pages,
         )
 
         self._validate_detected_pages(
