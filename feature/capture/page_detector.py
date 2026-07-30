@@ -101,6 +101,14 @@ class PageDetector:
                     raw_candidates.append(candidate)
 
         unique_candidates = self._remove_duplicates(raw_candidates)
+
+        # Evita conservar un gran contorno exterior cuando dentro de él ya se
+        # detectaron dos o más hojas individuales. Esto es especialmente útil
+        # en fotografías de 2, 4 o más páginas sobre una misma mesa.
+        unique_candidates = self._suppress_enclosing_candidates(
+            unique_candidates
+        )
+
         unique_candidates.sort(
             key=lambda item: (
                 item["page"].center_y,
@@ -119,7 +127,19 @@ class PageDetector:
     def process(self, image: np.ndarray) -> List[DetectedPage]:
         return self.detect(image)
 
-    def _build_detection_masks(self, gray: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    def _build_detection_masks(
+        self,
+        gray: np.ndarray,
+    ) -> list[tuple[str, np.ndarray]]:
+        """
+        Construye máscaras complementarias para dos escenarios:
+
+        1. una hoja grande, donde conviene cerrar bordes moderadamente;
+        2. varias hojas cercanas, donde se deben preservar las separaciones
+           y evitar que la morfología una todo el conjunto en un solo bloque.
+
+        Las máscaras se combinan después mediante candidatos + deduplicación.
+        """
         masks: list[tuple[str, np.ndarray]] = []
 
         median_value = float(np.median(gray))
@@ -129,21 +149,44 @@ class PageDetector:
             automatic_lower = self.canny_threshold1
             automatic_upper = self.canny_threshold2
 
-        edges = cv2.Canny(gray, automatic_lower, automatic_upper)
-        edge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-        edges_closed = cv2.morphologyEx(
-            edges,
-            cv2.MORPH_CLOSE,
-            edge_kernel,
-            iterations=2,
+        # --------------------------------------------------------
+        # A. Canny detallado: prioriza separaciones entre páginas.
+        # --------------------------------------------------------
+        edges_detail = cv2.Canny(
+            gray,
+            automatic_lower,
+            automatic_upper,
         )
-        edges_closed = cv2.dilate(
-            edges_closed,
-            np.ones((3, 3), dtype=np.uint8),
+        edges_detail = cv2.morphologyEx(
+            edges_detail,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
             iterations=1,
         )
-        masks.append(("canny_automatic", edges_closed))
+        masks.append(("canny_multipage_detail", edges_detail))
 
+        # --------------------------------------------------------
+        # B. Canny balanceado: conserva robustez para una hoja.
+        # Menos agresivo que la versión anterior.
+        # --------------------------------------------------------
+        edges_balanced = cv2.Canny(
+            gray,
+            automatic_lower,
+            automatic_upper,
+        )
+        edges_balanced = cv2.morphologyEx(
+            edges_balanced,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
+            iterations=1,
+        )
+        masks.append(("canny_balanced", edges_balanced))
+
+        # --------------------------------------------------------
+        # C. Umbral adaptativo normal e invertido.
+        # La apertura elimina puentes delgados entre hojas; el cierre
+        # recompone bordes sin fusionar páginas vecinas.
+        # --------------------------------------------------------
         adaptive = cv2.adaptiveThreshold(
             gray,
             255,
@@ -154,12 +197,30 @@ class PageDetector:
         )
         adaptive = cv2.morphologyEx(
             adaptive,
-            cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)),
-            iterations=2,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=1,
         )
-        masks.append(("adaptive_threshold", adaptive))
+        adaptive = cv2.morphologyEx(
+            adaptive,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
+            iterations=1,
+        )
+        masks.append(("adaptive_light_multipage", adaptive))
 
+        adaptive_inverse = cv2.bitwise_not(adaptive)
+        adaptive_inverse = cv2.morphologyEx(
+            adaptive_inverse,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=1,
+        )
+        masks.append(("adaptive_dark_multipage", adaptive_inverse))
+
+        # --------------------------------------------------------
+        # D. Otsu normal e invertido, con morfología ligera.
+        # --------------------------------------------------------
         _, otsu = cv2.threshold(
             gray,
             0,
@@ -168,13 +229,29 @@ class PageDetector:
         )
         otsu = cv2.morphologyEx(
             otsu,
-            cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)),
-            iterations=2,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=1,
         )
-        masks.append(("otsu_light_region", otsu))
+        otsu = cv2.morphologyEx(
+            otsu,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
+            iterations=1,
+        )
+        masks.append(("otsu_light_multipage", otsu))
+
+        otsu_inverse = cv2.bitwise_not(otsu)
+        otsu_inverse = cv2.morphologyEx(
+            otsu_inverse,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=1,
+        )
+        masks.append(("otsu_dark_multipage", otsu_inverse))
 
         return masks
+
 
     def _contour_to_candidate(
         self,
@@ -301,6 +378,94 @@ class PageDetector:
             "box": (float(x), float(y), float(width), float(height)),
             "score": float(confidence),
         }
+
+    def _suppress_enclosing_candidates(
+        self,
+        candidates: list[dict],
+    ) -> list[dict]:
+        """
+        Elimina un candidato exterior cuando contiene al menos dos candidatos
+        internos plausibles. Así se evita interpretar 2–4 hojas como una sola
+        página gigante.
+
+        Se conserva el candidato grande cuando no existen suficientes páginas
+        internas, manteniendo la compatibilidad con fotografías de una hoja.
+        """
+        if len(candidates) < 3:
+            return candidates
+
+        kept: list[dict] = []
+
+        for outer in candidates:
+            outer_box = outer["box"]
+            outer_area = max(
+                float(outer_box[2] * outer_box[3]),
+                1.0,
+            )
+
+            contained: list[dict] = []
+            for inner in candidates:
+                if inner is outer:
+                    continue
+
+                inner_box = inner["box"]
+                inner_area = max(
+                    float(inner_box[2] * inner_box[3]),
+                    1.0,
+                )
+
+                # Una página interna debe ser claramente menor que el marco.
+                if inner_area >= outer_area * 0.78:
+                    continue
+
+                containment = self._box_containment_ratio(
+                    inner_box,
+                    outer_box,
+                )
+                if containment >= 0.88:
+                    contained.append(inner)
+
+            if len(contained) >= 2:
+                combined_inner_area = sum(
+                    float(item["box"][2] * item["box"][3])
+                    for item in contained
+                )
+
+                # Solo se elimina el marco si las páginas internas explican
+                # una parte sustantiva de su superficie.
+                if combined_inner_area >= outer_area * 0.38:
+                    continue
+
+            kept.append(outer)
+
+        return kept
+
+    @staticmethod
+    def _box_containment_ratio(
+        inner_box: tuple[float, float, float, float],
+        outer_box: tuple[float, float, float, float],
+    ) -> float:
+        """Fracción del rectángulo interno contenida dentro del externo."""
+        ix, iy, iw, ih = inner_box
+        ox, oy, ow, oh = outer_box
+
+        intersection_left = max(ix, ox)
+        intersection_top = max(iy, oy)
+        intersection_right = min(ix + iw, ox + ow)
+        intersection_bottom = min(iy + ih, oy + oh)
+
+        intersection_width = max(
+            0.0,
+            intersection_right - intersection_left,
+        )
+        intersection_height = max(
+            0.0,
+            intersection_bottom - intersection_top,
+        )
+        intersection_area = intersection_width * intersection_height
+        inner_area = max(float(iw * ih), 1.0)
+
+        return float(intersection_area / inner_area)
 
     def _remove_duplicates(self, candidates: list[dict]) -> list[dict]:
         ordered = sorted(candidates, key=lambda item: item["score"], reverse=True)
@@ -466,4 +631,5 @@ def draw_detected_pages(
         )
 
     return preview
+
 
