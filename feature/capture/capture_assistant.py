@@ -92,7 +92,7 @@ class CaptureAssistant:
         page_detector: Optional[PageDetector] = None,
         page_organizer: Optional[PageOrganizer] = None,
         preview_generator: Optional[PreviewGenerator] = None,
-        pages_per_student: int = 2,
+        pages_per_student: int = 1,
         stop_on_bad_quality: bool = False,
         generate_preview: bool = True,
         raise_exceptions: bool = False,
