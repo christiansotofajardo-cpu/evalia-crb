@@ -4,7 +4,7 @@ Separador multipágina para Evalia Smart Capture.
 Responsabilidades:
 - recibir la imagen original y una página candidata grande;
 - analizar si esa región contiene 2 o 4 hojas;
-- buscar separaciones internas verticales y horizontales;
+- buscar separaciones internas verticales, horizontales e inclinadas;
 - crear páginas independientes compatibles con DetectedPage;
 - conservar la página original cuando no existe evidencia suficiente;
 - mantener separado este proceso de PageDetector y del OCR.
@@ -38,7 +38,8 @@ class MultiPageSplitter:
     La primera versión está orientada a:
     - dos hojas lado a lado;
     - dos hojas una sobre otra;
-    - cuatro hojas en una cuadrícula 2 × 2.
+    - cuatro hojas en una cuadrícula 2 × 2;
+    - dos hojas separadas por una línea inclinada.
 
     Si la evidencia no es suficiente, devuelve la página original sin cambios.
     """
@@ -56,6 +57,11 @@ class MultiPageSplitter:
         minimum_valley_depth: float = 0.10,
         minimum_split_confidence: float = 0.58,
         edge_margin_ratio: float = 0.015,
+        hough_min_line_length_ratio: float = 0.36,
+        hough_max_line_gap_ratio: float = 0.035,
+        hough_center_tolerance_ratio: float = 0.24,
+        hough_minimum_confidence: float = 0.56,
+        hough_angle_tolerance_degrees: float = 28.0,
         max_output_pages: int = 8,
     ) -> None:
         if not 0 < minimum_parent_area_ratio <= 1:
@@ -108,6 +114,21 @@ class MultiPageSplitter:
         )
         self.edge_margin_ratio = float(
             np.clip(edge_margin_ratio, 0.0, 0.10)
+        )
+        self.hough_min_line_length_ratio = float(
+            np.clip(hough_min_line_length_ratio, 0.10, 0.95)
+        )
+        self.hough_max_line_gap_ratio = float(
+            np.clip(hough_max_line_gap_ratio, 0.001, 0.20)
+        )
+        self.hough_center_tolerance_ratio = float(
+            np.clip(hough_center_tolerance_ratio, 0.05, 0.45)
+        )
+        self.hough_minimum_confidence = float(
+            np.clip(hough_minimum_confidence, 0.0, 1.0)
+        )
+        self.hough_angle_tolerance_degrees = float(
+            np.clip(hough_angle_tolerance_degrees, 5.0, 45.0)
         )
         self.max_output_pages = max(1, int(max_output_pages))
 
@@ -182,7 +203,8 @@ class MultiPageSplitter:
         1. cuadrícula 2 × 2;
         2. separación vertical;
         3. separación horizontal;
-        4. fallback seguro a la página original.
+        4. separación inclinada mediante Hough;
+        5. fallback seguro a la página original.
         """
         normalized_image = self._validate_image(image)
         region = self._extract_parent_region(
@@ -289,7 +311,491 @@ class MultiPageSplitter:
             ):
                 return children
 
+        # Fallback geométrico: separación central inclinada.
+        hough_split = self._find_hough_separator(
+            gray=gray,
+        )
+        if hough_split is not None:
+            children = self._build_hough_children(
+                image=normalized_image,
+                page=page,
+                crop=crop,
+                offset_x=offset_x,
+                offset_y=offset_y,
+                split=hough_split,
+            )
+            if self._children_are_valid(
+                children=children,
+                image=normalized_image,
+                expected_count=2,
+            ):
+                return children
+
         return [page]
+
+    def _find_hough_separator(
+        self,
+        gray: np.ndarray,
+    ) -> Optional[dict]:
+        """
+        Busca una línea larga, central y aproximadamente vertical u horizontal.
+
+        Se usa como fallback cuando los perfiles por ejes no detectan el hueco
+        porque la separación entre hojas aparece inclinada por perspectiva.
+        """
+        height, width = gray.shape[:2]
+        if (
+            height < self.minimum_child_side * 2
+            or width < self.minimum_child_side * 2
+        ):
+            return None
+
+        # Realza bordes largos y reduce ruido de escritura.
+        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+        edges = cv2.Canny(blurred, 45, 135)
+
+        # Cierre ligero para unir segmentos de la separación sin fusionar texto.
+        edges = cv2.morphologyEx(
+            edges,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=1,
+        )
+
+        min_dimension = min(height, width)
+        min_line_length = int(
+            round(
+                max(height, width)
+                * self.hough_min_line_length_ratio
+            )
+        )
+        max_line_gap = int(
+            round(
+                min_dimension
+                * self.hough_max_line_gap_ratio
+            )
+        )
+
+        lines = cv2.HoughLinesP(
+            edges,
+            rho=1,
+            theta=np.pi / 180.0,
+            threshold=max(45, int(min_dimension * 0.045)),
+            minLineLength=max(80, min_line_length),
+            maxLineGap=max(8, max_line_gap),
+        )
+
+        if lines is None:
+            return None
+
+        center_x = width / 2.0
+        center_y = height / 2.0
+        candidates = []
+
+        for raw_line in lines[:, 0, :]:
+            x1, y1, x2, y2 = [float(v) for v in raw_line]
+            dx = x2 - x1
+            dy = y2 - y1
+            length = float(np.hypot(dx, dy))
+            if length <= 0:
+                continue
+
+            angle = float(
+                np.degrees(np.arctan2(dy, dx))
+            )
+            normalized_angle = abs(angle) % 180.0
+
+            # Distancia angular a vertical y horizontal.
+            distance_to_horizontal = min(
+                normalized_angle,
+                abs(180.0 - normalized_angle),
+            )
+            distance_to_vertical = abs(
+                90.0 - normalized_angle
+            )
+
+            orientation: Optional[str] = None
+            angle_distance = 999.0
+
+            if (
+                distance_to_vertical
+                <= self.hough_angle_tolerance_degrees
+            ):
+                orientation = "vertical"
+                angle_distance = distance_to_vertical
+
+            if (
+                distance_to_horizontal
+                <= self.hough_angle_tolerance_degrees
+                and distance_to_horizontal < angle_distance
+            ):
+                orientation = "horizontal"
+                angle_distance = distance_to_horizontal
+
+            if orientation is None:
+                continue
+
+            midpoint_x = (x1 + x2) / 2.0
+            midpoint_y = (y1 + y2) / 2.0
+
+            if orientation == "vertical":
+                center_distance = abs(
+                    midpoint_x - center_x
+                ) / max(width, 1.0)
+                span_ratio = abs(dy) / max(height, 1.0)
+            else:
+                center_distance = abs(
+                    midpoint_y - center_y
+                ) / max(height, 1.0)
+                span_ratio = abs(dx) / max(width, 1.0)
+
+            if (
+                center_distance
+                > self.hough_center_tolerance_ratio
+            ):
+                continue
+
+            centrality = 1.0 - min(
+                1.0,
+                center_distance
+                / max(
+                    self.hough_center_tolerance_ratio,
+                    1e-6,
+                ),
+            )
+            length_score = min(
+                1.0,
+                length / max(
+                    min_line_length,
+                    1.0,
+                ),
+            )
+            span_score = min(
+                1.0,
+                span_ratio / 0.58,
+            )
+            angle_score = 1.0 - min(
+                1.0,
+                angle_distance
+                / max(
+                    self.hough_angle_tolerance_degrees,
+                    1e-6,
+                ),
+            )
+
+            confidence = (
+                0.34 * length_score
+                + 0.28 * span_score
+                + 0.23 * centrality
+                + 0.15 * angle_score
+            )
+
+            candidates.append(
+                {
+                    "orientation": orientation,
+                    "line": (
+                        float(x1),
+                        float(y1),
+                        float(x2),
+                        float(y2),
+                    ),
+                    "midpoint_x": float(midpoint_x),
+                    "midpoint_y": float(midpoint_y),
+                    "angle": float(angle),
+                    "length": float(length),
+                    "confidence": float(
+                        np.clip(confidence, 0.0, 1.0)
+                    ),
+                }
+            )
+
+        if not candidates:
+            return None
+
+        best = max(
+            candidates,
+            key=lambda item: item["confidence"],
+        )
+
+        if (
+            best["confidence"]
+            < self.hough_minimum_confidence
+        ):
+            return None
+
+        return best
+
+    def _build_hough_children(
+        self,
+        image: np.ndarray,
+        page: DetectedPage,
+        crop: np.ndarray,
+        offset_x: int,
+        offset_y: int,
+        split: dict,
+    ) -> List[DetectedPage]:
+        """
+        Convierte una línea inclinada en dos regiones poligonales.
+
+        Para mantener compatibilidad con DetectedPage, cada lado se convierte
+        finalmente en su rectángulo envolvente seguro dentro de la región padre.
+        """
+        height, width = crop.shape[:2]
+        x1, y1, x2, y2 = split["line"]
+
+        # Normaliza la dirección para que la línea atraviese la región completa.
+        if split["orientation"] == "vertical":
+            if abs(y2 - y1) < 1e-6:
+                return []
+
+            slope_x_per_y = (x2 - x1) / (y2 - y1)
+            x_top = x1 + (0.0 - y1) * slope_x_per_y
+            x_bottom = x1 + (
+                (height - 1.0) - y1
+            ) * slope_x_per_y
+
+            split_margin = max(
+                3,
+                int(round(width * 0.008)),
+            )
+
+            left_polygon = np.array(
+                [
+                    [0.0, 0.0],
+                    [
+                        np.clip(
+                            x_top - split_margin,
+                            0,
+                            width - 1,
+                        ),
+                        0.0,
+                    ],
+                    [
+                        np.clip(
+                            x_bottom - split_margin,
+                            0,
+                            width - 1,
+                        ),
+                        float(height - 1),
+                    ],
+                    [0.0, float(height - 1)],
+                ],
+                dtype=np.float32,
+            )
+            right_polygon = np.array(
+                [
+                    [
+                        np.clip(
+                            x_top + split_margin,
+                            0,
+                            width - 1,
+                        ),
+                        0.0,
+                    ],
+                    [float(width - 1), 0.0],
+                    [
+                        float(width - 1),
+                        float(height - 1),
+                    ],
+                    [
+                        np.clip(
+                            x_bottom + split_margin,
+                            0,
+                            width - 1,
+                        ),
+                        float(height - 1),
+                    ],
+                ],
+                dtype=np.float32,
+            )
+            polygons = [
+                left_polygon,
+                right_polygon,
+            ]
+        else:
+            if abs(x2 - x1) < 1e-6:
+                return []
+
+            slope_y_per_x = (y2 - y1) / (x2 - x1)
+            y_left = y1 + (0.0 - x1) * slope_y_per_x
+            y_right = y1 + (
+                (width - 1.0) - x1
+            ) * slope_y_per_x
+
+            split_margin = max(
+                3,
+                int(round(height * 0.008)),
+            )
+
+            top_polygon = np.array(
+                [
+                    [0.0, 0.0],
+                    [float(width - 1), 0.0],
+                    [
+                        float(width - 1),
+                        np.clip(
+                            y_right - split_margin,
+                            0,
+                            height - 1,
+                        ),
+                    ],
+                    [
+                        0.0,
+                        np.clip(
+                            y_left - split_margin,
+                            0,
+                            height - 1,
+                        ),
+                    ],
+                ],
+                dtype=np.float32,
+            )
+            bottom_polygon = np.array(
+                [
+                    [
+                        0.0,
+                        np.clip(
+                            y_left + split_margin,
+                            0,
+                            height - 1,
+                        ),
+                    ],
+                    [
+                        float(width - 1),
+                        np.clip(
+                            y_right + split_margin,
+                            0,
+                            height - 1,
+                        ),
+                    ],
+                    [
+                        float(width - 1),
+                        float(height - 1),
+                    ],
+                    [0.0, float(height - 1)],
+                ],
+                dtype=np.float32,
+            )
+            polygons = [
+                top_polygon,
+                bottom_polygon,
+            ]
+
+        pages: List[DetectedPage] = []
+
+        for child_index, polygon in enumerate(
+            polygons,
+            start=1,
+        ):
+            x, y, child_width, child_height = cv2.boundingRect(
+                polygon.astype(np.int32)
+            )
+
+            if (
+                child_width < self.minimum_child_side
+                or child_height < self.minimum_child_side
+            ):
+                continue
+
+            local_crop = self._safe_crop(
+                image=crop,
+                x=x,
+                y=y,
+                width=child_width,
+                height=child_height,
+            )
+            if local_crop is None:
+                continue
+
+            global_x = int(offset_x + x)
+            global_y = int(offset_y + y)
+
+            # Esquinas aproximadas del polígono real en coordenadas globales.
+            global_polygon = polygon.copy()
+            global_polygon[:, 0] += float(offset_x)
+            global_polygon[:, 1] += float(offset_y)
+
+            parent_confidence = float(
+                getattr(page, "confidence", 0.70) or 0.70
+            )
+            child_confidence = float(
+                np.clip(
+                    0.55 * parent_confidence
+                    + 0.45 * float(
+                        split["confidence"]
+                    ),
+                    0.0,
+                    1.0,
+                )
+            )
+
+            metadata = dict(
+                getattr(page, "metadata", {}) or {}
+            )
+            metadata.update(
+                {
+                    "split_from_parent": True,
+                    "parent_page_id": getattr(
+                        page,
+                        "page_id",
+                        None,
+                    ),
+                    "split_method": (
+                        "hough_inclined_"
+                        + str(split["orientation"])
+                    ),
+                    "split_confidence": float(
+                        split["confidence"]
+                    ),
+                    "split_child_index": child_index,
+                    "separator_angle": float(
+                        split["angle"]
+                    ),
+                    "separator_line": [
+                        float(v)
+                        for v in split["line"]
+                    ],
+                    "perspective_corrected": False,
+                }
+            )
+
+            pages.append(
+                DetectedPage(
+                    page_id=0,
+                    corners=[
+                        (
+                            float(point[0]),
+                            float(point[1]),
+                        )
+                        for point in global_polygon
+                    ],
+                    bounding_box=(
+                        float(global_x),
+                        float(global_y),
+                        float(child_width),
+                        float(child_height),
+                    ),
+                    width=float(child_width),
+                    height=float(child_height),
+                    center_x=float(
+                        global_x + child_width / 2.0
+                    ),
+                    center_y=float(
+                        global_y + child_height / 2.0
+                    ),
+                    area=float(
+                        cv2.contourArea(
+                            polygon.astype(np.float32)
+                        )
+                    ),
+                    confidence=child_confidence,
+                    page_number=None,
+                    cropped_image=local_crop,
+                    metadata=metadata,
+                )
+            )
+
+        return pages
 
     def _build_split_evidence(
         self,
