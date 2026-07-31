@@ -55,6 +55,48 @@ ALLOWED_IMAGE_TYPES = {
     "image/bmp",
 }
 
+RUBRIC_EXTENSIONS = {".json", ".xlsx", ".xls"}
+
+
+def _rubric_directories() -> list[Path]:
+    """Devuelve ubicaciones probables de la carpeta de rúbricas sin importar el cwd."""
+    module_path = Path(__file__).resolve()
+    candidates = [
+        Path.cwd() / "rubrics",
+        module_path.parents[2] / "rubrics",
+        module_path.parents[1] / "rubrics",
+    ]
+    unique: list[Path] = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return unique
+
+
+def _available_rubrics() -> list[Dict[str, str]]:
+    """Lista rúbricas guardadas que Smart Capture puede seleccionar."""
+    found: Dict[str, Dict[str, str]] = {}
+    for directory in _rubric_directories():
+        if not directory.exists() or not directory.is_dir():
+            continue
+        for path in sorted(directory.iterdir(), key=lambda p: p.name.lower()):
+            if not path.is_file() or path.suffix.lower() not in RUBRIC_EXTENSIONS:
+                continue
+            filename = path.name
+            label = path.stem.replace("_", " ").replace("-", " ").strip()
+            found.setdefault(filename, {
+                "filename": filename,
+                "label": label or filename,
+            })
+    return sorted(found.values(), key=lambda item: item["label"].lower())
+
+
+def _valid_rubric_filename(filename: str) -> bool:
+    selected = Path(str(filename or "")).name
+    return bool(selected) and any(
+        item["filename"] == selected for item in _available_rubrics()
+    )
+
 _capture_assistant: Optional[CaptureAssistant] = None
 
 # Sesiones temporales de captura. Conservan los recortes entre la revisión
@@ -75,13 +117,20 @@ def _cleanup_capture_sessions() -> None:
         _CAPTURE_SESSIONS.pop(token, None)
 
 
-def _store_capture_session(result: Any, filename: str) -> str:
+def _store_capture_session(
+    result: Any,
+    filename: str,
+    exam_name: str,
+    rubric_filename: str,
+) -> str:
     _cleanup_capture_sessions()
     token = uuid.uuid4().hex
     _CAPTURE_SESSIONS[token] = {
         "created_at": time.time(),
         "result": result,
         "filename": filename,
+        "exam_name": str(exam_name or "").strip(),
+        "rubric_filename": Path(str(rubric_filename or "")).name,
     }
     return token
 
@@ -720,6 +769,40 @@ def _mobile_css() -> str:
             font-weight: 900;
         }
 
+        .field-label {
+            display: block;
+            margin: 14px 0 7px;
+            color: var(--text);
+            font-size: .9rem;
+            font-weight: 800;
+        }
+
+        .text-input, .select-input {
+            width: 100%;
+            min-height: 52px;
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 12px 14px;
+            background: white;
+            color: var(--text);
+            font-size: 1rem;
+        }
+
+        .text-input:focus, .select-input:focus {
+            outline: 3px solid #dbeafe;
+            border-color: var(--blue);
+        }
+
+        .session-summary {
+            display: grid;
+            gap: 8px;
+            padding: 13px;
+            margin: 12px 0;
+            border-radius: 14px;
+            background: #eff6ff;
+            color: var(--blue-dark);
+        }
+
         .camera-input {
             position: absolute;
             width: 1px;
@@ -872,16 +955,39 @@ def _mobile_css() -> str:
     """
 
 
-def _capture_home_html() -> str:
+def _capture_home_html(rubrics: list[Dict[str, str]]) -> str:
+    if rubrics:
+        rubric_options = "".join(
+            f'<option value="{escape(item["filename"], quote=True)}">'
+            f'{escape(item["label"])} · {escape(item["filename"])}</option>'
+            for item in rubrics
+        )
+        rubric_control = f"""
+        <label class="field-label" for="rubricFilename">Rúbrica</label>
+        <select id="rubricFilename" class="select-input" name="rubric_filename" required>
+            <option value="">Selecciona una rúbrica guardada</option>
+            {rubric_options}
+        </select>
+        """
+        rubric_notice = ""
+        can_submit = "true"
+    else:
+        rubric_control = """
+        <label class="field-label">Rúbrica</label>
+        <div class="notice warning">
+            No encontramos rúbricas guardadas en la carpeta <strong>rubrics</strong>.
+            Sube o registra una rúbrica desde Evalia antes de iniciar Smart Capture.
+        </div>
+        """
+        rubric_notice = '<a class="secondary-button" href="/">Ir a Evalia</a>'
+        can_submit = "false"
+
     return f"""
     <!doctype html>
     <html lang="es">
     <head>
         <meta charset="utf-8">
-        <meta
-            name="viewport"
-            content="width=device-width, initial-scale=1, viewport-fit=cover"
-        >
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
         <meta name="theme-color" content="#1d4ed8">
         <title>Captura inteligente · Evalia</title>
         {_mobile_css()}
@@ -894,25 +1000,32 @@ def _capture_home_html() -> str:
             </div>
 
             <section class="card">
-                <h1>Fotografía las pruebas</h1>
+                <h1>Prepara la corrección</h1>
                 <p>
-                    Pon las hojas sobre una superficie plana. Evalia revisará
-                    automáticamente la calidad y detectará cada página antes
-                    de iniciar el OCR.
+                    Indica la evaluación y elige una rúbrica guardada. Evalia
+                    mantendrá esta selección durante toda la captura.
                 </p>
 
-                <div class="steps">
-                    <div class="step"><span>1</span> Ilumina bien las hojas.</div>
-                    <div class="step"><span>2</span> Incluye todos los bordes.</div>
-                    <div class="step"><span>3</span> Evita sombras y movimiento.</div>
-                </div>
+                <form id="captureForm" action="/captura/analizar" method="post" enctype="multipart/form-data">
+                    <label class="field-label" for="examName">Evaluación</label>
+                    <input
+                        id="examName"
+                        class="text-input"
+                        type="text"
+                        name="exam_name"
+                        maxlength="120"
+                        placeholder="Ej.: Certamen 1 de Psicolingüística"
+                        required
+                    >
 
-                <form
-                    id="captureForm"
-                    action="/captura/analizar"
-                    method="post"
-                    enctype="multipart/form-data"
-                >
+                    {rubric_control}
+
+                    <div class="steps">
+                        <div class="step"><span>1</span> Ilumina bien las hojas.</div>
+                        <div class="step"><span>2</span> Incluye todos los bordes.</div>
+                        <div class="step"><span>3</span> Evita sombras y movimiento.</div>
+                    </div>
+
                     <input
                         id="capturePhoto"
                         class="camera-input"
@@ -923,20 +1036,10 @@ def _capture_home_html() -> str:
                         required
                     >
 
-                    <label class="primary-button" for="capturePhoto">
-                        📷 Tomar fotografía
-                    </label>
+                    <label class="primary-button" for="capturePhoto">📷 Tomar fotografía</label>
+                    <p id="fileName" class="file-name">Aún no has tomado una fotografía.</p>
 
-                    <p id="fileName" class="file-name">
-                        Aún no has tomado una fotografía.
-                    </p>
-
-                    <button
-                        id="analyzeButton"
-                        class="primary-button"
-                        type="submit"
-                        disabled
-                    >
+                    <button id="analyzeButton" class="primary-button" type="submit" disabled>
                         Analizar fotografía
                     </button>
 
@@ -949,11 +1052,10 @@ def _capture_home_html() -> str:
                     En el teléfono se abrirá preferentemente la cámara trasera.
                     También puedes seleccionar una imagen ya existente.
                 </p>
+                {rubric_notice}
             </section>
 
-            <a class="secondary-button" href="/ocr">
-                Volver al OCR tradicional
-            </a>
+            <a class="secondary-button" href="/ocr">Volver al OCR tradicional</a>
         </main>
 
         <script>
@@ -962,32 +1064,49 @@ def _capture_home_html() -> str:
             const button = document.getElementById("analyzeButton");
             const form = document.getElementById("captureForm");
             const loading = document.getElementById("loading");
+            const examName = document.getElementById("examName");
+            const rubricFilename = document.getElementById("rubricFilename");
+            const rubricsAvailable = {can_submit};
+
+            function updateButtonState() {{
+                const hasFile = Boolean(input.files && input.files[0]);
+                const hasExam = Boolean(examName.value.trim());
+                const hasRubric = Boolean(rubricFilename && rubricFilename.value);
+                button.disabled = !(rubricsAvailable && hasFile && hasExam && hasRubric);
+            }}
 
             input.addEventListener("change", () => {{
                 const file = input.files && input.files[0];
                 if (!file) {{
                     fileName.textContent = "Aún no has tomado una fotografía.";
-                    button.disabled = true;
+                    updateButtonState();
                     return;
                 }}
-
                 const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
                 fileName.textContent = `${{file.name}} · ${{sizeMb}} MB`;
-                button.disabled = false;
+                updateButtonState();
             }});
+            examName.addEventListener("input", updateButtonState);
+            if (rubricFilename) rubricFilename.addEventListener("change", updateButtonState);
 
             form.addEventListener("submit", () => {{
                 button.disabled = true;
                 button.textContent = "Procesando…";
                 loading.style.display = "block";
             }});
+            updateButtonState();
         </script>
     </body>
     </html>
     """
 
-
-def _result_html(result: Any, filename: str, capture_token: str) -> str:
+def _result_html(
+    result: Any,
+    filename: str,
+    capture_token: str,
+    exam_name: str,
+    rubric_filename: str,
+) -> str:
     quality = _quality_state(result)
     pages = _detected_pages(result)
     organization = _organization(result)
@@ -1065,6 +1184,10 @@ def _result_html(result: Any, filename: str, capture_token: str) -> str:
             <section class="card">
                 <h1>Revisa la captura</h1>
                 <p>{escape(filename)}</p>
+                <div class="session-summary">
+                    <div><strong>Evaluación:</strong> {escape(exam_name)}</div>
+                    <div><strong>Rúbrica:</strong> {escape(rubric_filename)}</div>
+                </div>
 
                 <div class="quality {quality['color']}">
                     <strong>
@@ -1133,7 +1256,12 @@ def _result_html(result: Any, filename: str, capture_token: str) -> str:
 
 
 
-def _ocr_results_html(filename: str, results: list) -> str:
+def _ocr_results_html(
+    filename: str,
+    results: list,
+    exam_name: str,
+    rubric_filename: str,
+) -> str:
     cards = []
     successful = 0
 
@@ -1197,6 +1325,10 @@ def _ocr_results_html(filename: str, results: list) -> str:
             <section class="card">
                 <h1>OCR terminado</h1>
                 <p>{escape(filename)}</p>
+                <div class="session-summary">
+                    <div><strong>Evaluación:</strong> {escape(exam_name)}</div>
+                    <div><strong>Rúbrica preparada:</strong> {escape(rubric_filename)}</div>
+                </div>
                 <div class="quality {'green' if successful == total and total else 'yellow'}">
                     <strong>{successful} de {total} hoja(s) con texto reconocido</strong>
                     <p>Revisa el contenido antes de continuar con la evaluación.</p>
@@ -1271,15 +1403,38 @@ def register_capture_routes(app: FastAPI) -> None:
 
         @app.get("/captura", response_class=HTMLResponse)
         async def capture_home() -> HTMLResponse:
-            return HTMLResponse(_capture_home_html())
+            return HTMLResponse(_capture_home_html(_available_rubrics()))
 
     if "/captura/analizar" not in existing_paths:
 
         @app.post("/captura/analizar", response_class=HTMLResponse)
         async def analyze_capture(
             capture_photo: UploadFile = File(...),
+            exam_name: str = Form(...),
+            rubric_filename: str = Form(...),
         ) -> HTMLResponse:
             try:
+                exam_name = str(exam_name or "").strip()
+                rubric_filename = Path(str(rubric_filename or "")).name
+
+                if not exam_name:
+                    return HTMLResponse(
+                        _error_html(
+                            "Falta la evaluación",
+                            "Escribe el nombre de la evaluación antes de tomar la fotografía.",
+                        ),
+                        status_code=400,
+                    )
+
+                if not _valid_rubric_filename(rubric_filename):
+                    return HTMLResponse(
+                        _error_html(
+                            "Rúbrica no disponible",
+                            "La rúbrica seleccionada ya no existe o no está registrada. Vuelve a seleccionarla.",
+                        ),
+                        status_code=400,
+                    )
+
                 if not capture_photo or not capture_photo.filename:
                     return HTMLResponse(
                         _error_html(
@@ -1334,6 +1489,8 @@ def register_capture_routes(app: FastAPI) -> None:
                 capture_token = _store_capture_session(
                     result=result,
                     filename=capture_photo.filename,
+                    exam_name=exam_name,
+                    rubric_filename=rubric_filename,
                 )
 
                 return HTMLResponse(
@@ -1341,6 +1498,8 @@ def register_capture_routes(app: FastAPI) -> None:
                         result=result,
                         filename=capture_photo.filename,
                         capture_token=capture_token,
+                        exam_name=exam_name,
+                        rubric_filename=rubric_filename,
                     )
                 )
 
@@ -1376,7 +1535,18 @@ def register_capture_routes(app: FastAPI) -> None:
 
             result = session.get("result")
             filename = str(session.get("filename") or "captura")
+            exam_name = str(session.get("exam_name") or "Evaluación")
+            rubric_filename = Path(str(session.get("rubric_filename") or "")).name
             pages = _detected_pages(result)
+
+            if not _valid_rubric_filename(rubric_filename):
+                return HTMLResponse(
+                    _error_html(
+                        "Rúbrica no disponible",
+                        "La rúbrica asociada a esta captura ya no está disponible. Inicia nuevamente la sesión.",
+                    ),
+                    status_code=400,
+                )
 
             if not pages:
                 return HTMLResponse(
@@ -1461,8 +1631,9 @@ def register_capture_routes(app: FastAPI) -> None:
                     _ocr_results_html(
                         filename=filename,
                         results=ocr_results,
+                        exam_name=exam_name,
+                        rubric_filename=rubric_filename,
                     )
                 )
             finally:
                 shutil.rmtree(temp_dir, ignore_errors=True)
-
