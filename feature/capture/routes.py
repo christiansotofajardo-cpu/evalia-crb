@@ -24,6 +24,10 @@ import base64
 import inspect
 import json
 import mimetypes
+import shutil
+import tempfile
+import time
+import uuid
 from html import escape
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
@@ -31,10 +35,12 @@ from typing import Any, Dict, Iterable, Optional
 import cv2
 import numpy as np
 
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse
 
 from .capture_assistant import CaptureAssistant
+from feature.ocr.service import run_ocr_on_image
 
 
 MAX_CAPTURE_BYTES = 20 * 1024 * 1024  # 20 MB
@@ -50,6 +56,66 @@ ALLOWED_IMAGE_TYPES = {
 }
 
 _capture_assistant: Optional[CaptureAssistant] = None
+
+# Sesiones temporales de captura. Conservan los recortes entre la revisión
+# docente y la confirmación que inicia el OCR. Se eliminan automáticamente.
+_CAPTURE_SESSIONS: Dict[str, Dict[str, Any]] = {}
+_CAPTURE_SESSION_TTL_SECONDS = 15 * 60
+
+
+def _cleanup_capture_sessions() -> None:
+    """Elimina sesiones antiguas para no acumular imágenes en memoria."""
+    now = time.time()
+    expired = [
+        token
+        for token, payload in _CAPTURE_SESSIONS.items()
+        if now - float(payload.get("created_at", 0)) > _CAPTURE_SESSION_TTL_SECONDS
+    ]
+    for token in expired:
+        _CAPTURE_SESSIONS.pop(token, None)
+
+
+def _store_capture_session(result: Any, filename: str) -> str:
+    _cleanup_capture_sessions()
+    token = uuid.uuid4().hex
+    _CAPTURE_SESSIONS[token] = {
+        "created_at": time.time(),
+        "result": result,
+        "filename": filename,
+    }
+    return token
+
+
+def _extract_crop(page: Any) -> Optional[np.ndarray]:
+    """Obtiene y normaliza el recorte de una página detectada."""
+    crop = _get_value(
+        page,
+        "cropped_image",
+        "crop",
+        "page_image",
+        "image",
+        default=None,
+    )
+    if not isinstance(crop, np.ndarray) or crop.size == 0:
+        return None
+
+    image = crop
+    if image.dtype != np.uint8:
+        image = np.nan_to_num(image, nan=0.0, posinf=255.0, neginf=0.0)
+        if float(np.min(image)) >= 0.0 and float(np.max(image)) <= 1.0:
+            image = image * 255.0
+        image = np.clip(image, 0, 255).astype(np.uint8)
+
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    elif image.ndim == 3 and image.shape[2] == 1:
+        image = cv2.cvtColor(image[:, :, 0], cv2.COLOR_GRAY2BGR)
+    elif image.ndim == 3 and image.shape[2] == 4:
+        image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+    elif image.ndim != 3 or image.shape[2] != 3:
+        return None
+
+    return np.ascontiguousarray(image)
 
 
 def _get_capture_assistant() -> CaptureAssistant:
@@ -921,7 +987,7 @@ def _capture_home_html() -> str:
     """
 
 
-def _result_html(result: Any, filename: str) -> str:
+def _result_html(result: Any, filename: str, capture_token: str) -> str:
     quality = _quality_state(result)
     pages = _detected_pages(result)
     organization = _organization(result)
@@ -1024,18 +1090,20 @@ def _result_html(result: Any, filename: str) -> str:
             <section class="card">
                 <h2>Confirmación docente</h2>
                 <p>
-                    En esta primera integración confirmamos que la fotografía,
-                    la detección y la organización funcionan desde el teléfono.
-                    El enlace con el OCR se incorpora en el siguiente paso.
+                    Confirma la organización para enviar cada hoja recortada al
+                    OCR de Evalia. El procesamiento puede tardar algunos segundos.
                 </p>
 
-                <button
-                    class="primary-button"
-                    type="button"
-                    onclick="alert('Captura confirmada. El siguiente paso será enviarla al OCR de Evalia.')"
-                >
-                    Confirmar organización
-                </button>
+                <form id="ocrForm" action="/captura/procesar-ocr" method="post">
+                    <input type="hidden" name="capture_token"
+                           value="{escape(capture_token, quote=True)}">
+                    <button id="ocrButton" class="primary-button" type="submit">
+                        Confirmar y ejecutar OCR
+                    </button>
+                    <div id="ocrLoading" class="loading">
+                        Procesando las hojas con OCR… No cierres esta ventana.
+                    </div>
+                </form>
 
                 <a class="secondary-button" href="/captura">
                     Tomar otra fotografía
@@ -1047,10 +1115,102 @@ def _result_html(result: Any, filename: str) -> str:
                 <pre>{raw_json}</pre>
             </details>
         </main>
+        <script>
+            const ocrForm = document.getElementById("ocrForm");
+            const ocrButton = document.getElementById("ocrButton");
+            const ocrLoading = document.getElementById("ocrLoading");
+            if (ocrForm) {{
+                ocrForm.addEventListener("submit", () => {{
+                    ocrButton.disabled = true;
+                    ocrButton.textContent = "Procesando OCR…";
+                    ocrLoading.style.display = "block";
+                }});
+            }}
+        </script>
     </body>
     </html>
     """
 
+
+
+def _ocr_results_html(filename: str, results: list) -> str:
+    cards = []
+    successful = 0
+
+    for item in results:
+        student_number = item.get("student_number", "—")
+        page_number = item.get("page_number", "—")
+        ocr = item.get("ocr", {}) or {}
+        text = str(ocr.get("text", "") or "").strip()
+        engine = str(ocr.get("engine", "desconocido") or "desconocido")
+        confidence = ocr.get("confidence")
+        seconds = ocr.get("seconds")
+        message = str(ocr.get("message", "") or "")
+        error = str(item.get("error", "") or "")
+
+        if text:
+            successful += 1
+
+        meta = [f"Motor: {escape(engine)}"]
+        if confidence is not None:
+            meta.append(f"Confianza: {_percent(confidence)}")
+        if seconds is not None:
+            meta.append(f"Tiempo: {escape(str(seconds))} s")
+
+        state_class = "green" if text else "yellow"
+        state_title = "OCR completado" if text else "Revisión necesaria"
+        detail = error or message
+        text_html = escape(text) if text else "El OCR no produjo texto útil para esta hoja."
+
+        cards.append(f"""
+        <section class="card">
+            <h2>Estudiante {escape(str(student_number))} · Hoja {escape(str(page_number))}</h2>
+            <div class="quality {state_class}">
+                <strong>{state_title}</strong>
+                <p>{' · '.join(meta)}</p>
+                {f'<p>{escape(detail)}</p>' if detail else ''}
+            </div>
+            <details open>
+                <summary>Texto reconocido</summary>
+                <pre>{text_html}</pre>
+            </details>
+        </section>
+        """)
+
+    total = len(results)
+    return f"""
+    <!doctype html>
+    <html lang="es">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+        <meta name="theme-color" content="#1d4ed8">
+        <title>OCR multipágina · Evalia</title>
+        {_mobile_css()}
+    </head>
+    <body>
+        <main class="mobile-shell">
+            <div class="brand">
+                <strong>Evalia</strong>
+                <span class="badge">OCR multipágina</span>
+            </div>
+            <section class="card">
+                <h1>OCR terminado</h1>
+                <p>{escape(filename)}</p>
+                <div class="quality {'green' if successful == total and total else 'yellow'}">
+                    <strong>{successful} de {total} hoja(s) con texto reconocido</strong>
+                    <p>Revisa el contenido antes de continuar con la evaluación.</p>
+                </div>
+            </section>
+            {''.join(cards)}
+            <section class="card">
+                <a class="primary-button" href="/captura">Procesar otra fotografía</a>
+                <a class="secondary-button" href="/ocr">Ir al OCR tradicional</a>
+            </section>
+        </main>
+    </body>
+    </html>
+    """
 
 def _error_html(title: str, message: str, detail: str = "") -> str:
     detail_html = (
@@ -1171,10 +1331,16 @@ def register_capture_routes(app: FastAPI) -> None:
                 if inspect.isawaitable(result):
                     result = await result
 
+                capture_token = _store_capture_session(
+                    result=result,
+                    filename=capture_photo.filename,
+                )
+
                 return HTMLResponse(
                     _result_html(
                         result=result,
                         filename=capture_photo.filename,
+                        capture_token=capture_token,
                     )
                 )
 
@@ -1188,4 +1354,115 @@ def register_capture_routes(app: FastAPI) -> None:
                     ),
                     status_code=500,
                 )
+
+    if "/captura/procesar-ocr" not in existing_paths:
+
+        @app.post("/captura/procesar-ocr", response_class=HTMLResponse)
+        async def process_capture_ocr(
+            capture_token: str = Form(...),
+        ) -> HTMLResponse:
+            _cleanup_capture_sessions()
+            session = _CAPTURE_SESSIONS.pop(capture_token, None)
+
+            if session is None:
+                return HTMLResponse(
+                    _error_html(
+                        "La captura expiró",
+                        "La revisión estuvo abierta demasiado tiempo o el servidor se reinició. "
+                        "Toma nuevamente la fotografía.",
+                    ),
+                    status_code=410,
+                )
+
+            result = session.get("result")
+            filename = str(session.get("filename") or "captura")
+            pages = _detected_pages(result)
+
+            if not pages:
+                return HTMLResponse(
+                    _error_html(
+                        "No hay hojas para procesar",
+                        "La captura confirmada no contiene páginas detectadas.",
+                    ),
+                    status_code=400,
+                )
+
+            temp_dir = Path(tempfile.mkdtemp(prefix="evalia_capture_"))
+            ocr_results = []
+
+            try:
+                for index, page in enumerate(pages, start=1):
+                    page_number = _get_value(
+                        page,
+                        "page_number",
+                        "number",
+                        "page",
+                        "index",
+                        default=index,
+                    )
+                    student_number = _get_value(
+                        page,
+                        "student_number",
+                        "student_id",
+                        "student",
+                        "group_id",
+                        default=index,
+                    )
+
+                    crop = _extract_crop(page)
+                    if crop is None:
+                        ocr_results.append({
+                            "student_number": student_number,
+                            "page_number": page_number,
+                            "ocr": {},
+                            "error": "El detector no entregó un recorte utilizable.",
+                        })
+                        continue
+
+                    image_path = temp_dir / f"student_{index}_page_{page_number}.jpg"
+                    written = cv2.imwrite(
+                        str(image_path),
+                        crop,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 95],
+                    )
+                    if not written:
+                        ocr_results.append({
+                            "student_number": student_number,
+                            "page_number": page_number,
+                            "ocr": {},
+                            "error": "No fue posible guardar temporalmente el recorte.",
+                        })
+                        continue
+
+                    try:
+                        ocr = await run_in_threadpool(run_ocr_on_image, image_path)
+                        if not isinstance(ocr, dict):
+                            ocr = {
+                                "text": str(ocr or ""),
+                                "confidence": 0.0,
+                                "engine": "unknown",
+                                "message": "El servicio OCR devolvió un formato no estándar.",
+                            }
+                        ocr_results.append({
+                            "student_number": student_number,
+                            "page_number": page_number,
+                            "ocr": ocr,
+                            "error": "",
+                        })
+                    except Exception as exc:
+                        ocr_results.append({
+                            "student_number": student_number,
+                            "page_number": page_number,
+                            "ocr": {},
+                            "error": f"OCR falló para esta hoja: {exc}",
+                        })
+
+                return HTMLResponse(
+                    _ocr_results_html(
+                        filename=filename,
+                        results=ocr_results,
+                    )
+                )
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
