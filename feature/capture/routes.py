@@ -35,7 +35,7 @@ from typing import Any, Dict, Iterable, Optional
 import cv2
 import numpy as np
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse
 
@@ -104,6 +104,10 @@ _capture_assistant: Optional[CaptureAssistant] = None
 _CAPTURE_SESSIONS: Dict[str, Dict[str, Any]] = {}
 _CAPTURE_SESSION_TTL_SECONDS = 15 * 60
 
+# Sesiones temporales entre OCR, revisión docente y evaluación final.
+_EVALUATION_SESSIONS: Dict[str, Dict[str, Any]] = {}
+_EVALUATION_SESSION_TTL_SECONDS = 30 * 60
+
 
 def _cleanup_capture_sessions() -> None:
     """Elimina sesiones antiguas para no acumular imágenes en memoria."""
@@ -115,6 +119,58 @@ def _cleanup_capture_sessions() -> None:
     ]
     for token in expired:
         _CAPTURE_SESSIONS.pop(token, None)
+
+
+def _cleanup_evaluation_sessions() -> None:
+    """Elimina sesiones de revisión/evaluación que superaron su tiempo útil."""
+    now = time.time()
+    expired = [
+        token
+        for token, payload in _EVALUATION_SESSIONS.items()
+        if now - float(payload.get("created_at", 0)) > _EVALUATION_SESSION_TTL_SECONDS
+    ]
+    for token in expired:
+        _EVALUATION_SESSIONS.pop(token, None)
+
+
+def _store_evaluation_session(
+    *,
+    filename: str,
+    exam_name: str,
+    rubric_filename: str,
+    rubric: Dict[str, Any],
+    students: list,
+) -> str:
+    _cleanup_evaluation_sessions()
+    token = uuid.uuid4().hex
+    _EVALUATION_SESSIONS[token] = {
+        "created_at": time.time(),
+        "filename": str(filename or "captura"),
+        "exam_name": str(exam_name or "Evaluación"),
+        "rubric_filename": Path(str(rubric_filename or "")).name,
+        "rubric": rubric,
+        "students": students,
+    }
+    return token
+
+
+def _evaluation_services(app: FastAPI) -> Dict[str, Any]:
+    """Obtiene el puente de servicios registrado por main.py."""
+    services = getattr(getattr(app, "state", None), "evalia_services", None)
+    if not isinstance(services, dict):
+        raise RuntimeError(
+            "El puente de evaluación no está disponible. "
+            "Verifica que main.py registre app.state.evalia_services "
+            "antes de llamar register_capture_routes(app)."
+        )
+    return services
+
+
+def _required_service(services: Dict[str, Any], name: str):
+    service = services.get(name)
+    if not callable(service):
+        raise RuntimeError(f"Falta el servicio de evaluación requerido: {name}")
+    return service
 
 
 def _store_capture_session(
@@ -1256,56 +1312,90 @@ def _result_html(
 
 
 
-def _ocr_results_html(
+def _ocr_review_html(
+    *,
     filename: str,
-    results: list,
+    students: list,
     exam_name: str,
     rubric_filename: str,
+    rubric: Dict[str, Any],
+    evaluation_token: str,
+    display_item_type,
 ) -> str:
-    cards = []
-    successful = 0
+    student_cards = []
+    questions = rubric.get("questions", []) or []
 
-    for item in results:
-        student_number = item.get("student_number", "—")
-        page_number = item.get("page_number", "—")
-        ocr = item.get("ocr", {}) or {}
-        text = str(ocr.get("text", "") or "").strip()
-        engine = str(ocr.get("engine", "desconocido") or "desconocido")
-        confidence = ocr.get("confidence")
-        seconds = ocr.get("seconds")
-        message = str(ocr.get("message", "") or "")
-        error = str(item.get("error", "") or "")
+    for student_index, student in enumerate(students):
+        student_number = student.get("student_number", student_index + 1)
+        page_number = student.get("page_number", student_index + 1)
+        ocr = student.get("ocr", {}) or {}
+        raw_text = str(ocr.get("text", "") or "").strip()
+        segmentation = student.get("segmentation", {}) or {}
+        segments = student.get("segments", {}) or {}
+        error = str(student.get("error", "") or "")
+        seg_conf = segmentation.get("confidence")
+        seg_mode = segmentation.get("mode", "desconocido")
 
-        if text:
-            successful += 1
+        question_fields = []
+        for question in questions:
+            qid = str(question.get("id", ""))
+            prompt = str(question.get("prompt", "") or "")
+            item_label = display_item_type(question.get("item_type", ""))
+            answer = str(segments.get(qid, "") or "")
+            field_name = f"answer__{student_index}__{qid}"
+            question_fields.append(f"""
+            <div class="mini-card" style="display:block;">
+                <strong>{escape(qid)} · {escape(str(item_label))} · {escape(str(question.get("max_score", "")))} pts</strong>
+                {f'<p>{escape(prompt)}</p>' if prompt else ''}
+                <textarea
+                    class="text-input"
+                    name="{escape(field_name, quote=True)}"
+                    rows="5"
+                    style="margin-top:10px;min-height:120px;"
+                >{escape(answer)}</textarea>
+            </div>
+            """)
 
-        meta = [f"Motor: {escape(engine)}"]
-        if confidence is not None:
-            meta.append(f"Confianza: {_percent(confidence)}")
-        if seconds is not None:
-            meta.append(f"Tiempo: {escape(str(seconds))} s")
+        state_class = "green" if raw_text and not error else "yellow"
+        seg_text = (
+            f"Segmentación: {escape(str(seg_mode))}"
+            + (f" · Confianza: {_percent(seg_conf)}" if seg_conf is not None else "")
+        )
 
-        state_class = "green" if text else "yellow"
-        state_title = "OCR completado" if text else "Revisión necesaria"
-        detail = error or message
-        text_html = escape(text) if text else "El OCR no produjo texto útil para esta hoja."
-
-        cards.append(f"""
+        student_cards.append(f"""
         <section class="card">
             <h2>Estudiante {escape(str(student_number))} · Hoja {escape(str(page_number))}</h2>
             <div class="quality {state_class}">
-                <strong>{state_title}</strong>
-                <p>{' · '.join(meta)}</p>
-                {f'<p>{escape(detail)}</p>' if detail else ''}
+                <strong>{'OCR y segmentación preparados' if raw_text else 'Revisión manual necesaria'}</strong>
+                <p>{seg_text}</p>
+                {f'<p>{escape(error)}</p>' if error else ''}
             </div>
-            <details open>
-                <summary>Texto reconocido</summary>
-                <pre>{text_html}</pre>
+
+            <label class="field-label" for="studentName{student_index}">Nombre del estudiante</label>
+            <input
+                id="studentName{student_index}"
+                class="text-input"
+                type="text"
+                name="student_name__{student_index}"
+                value="{escape(str(student.get('student_name', '') or ''), quote=True)}"
+                placeholder="Nombre detectado o corregido por el docente"
+            >
+
+            <details>
+                <summary>Ver texto OCR bruto</summary>
+                <textarea
+                    class="text-input"
+                    name="raw_text__{student_index}"
+                    rows="7"
+                    style="margin-top:10px;min-height:150px;"
+                >{escape(raw_text)}</textarea>
             </details>
+
+            <h2 style="margin-top:18px;">Respuestas por pregunta</h2>
+            {''.join(question_fields)}
         </section>
         """)
 
-    total = len(results)
     return f"""
     <!doctype html>
     <html lang="es">
@@ -1313,36 +1403,166 @@ def _ocr_results_html(
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
         <meta name="theme-color" content="#1d4ed8">
-        <title>OCR multipágina · Evalia</title>
+        <title>Revisión OCR · Evalia</title>
         {_mobile_css()}
     </head>
     <body>
         <main class="mobile-shell">
             <div class="brand">
                 <strong>Evalia</strong>
-                <span class="badge">OCR multipágina</span>
+                <span class="badge">Revisión antes de evaluar</span>
             </div>
+
             <section class="card">
-                <h1>OCR terminado</h1>
+                <h1>Revisa las respuestas</h1>
                 <p>{escape(filename)}</p>
                 <div class="session-summary">
                     <div><strong>Evaluación:</strong> {escape(exam_name)}</div>
-                    <div><strong>Rúbrica preparada:</strong> {escape(rubric_filename)}</div>
+                    <div><strong>Rúbrica:</strong> {escape(rubric_filename)}</div>
+                    <div><strong>Estudiantes/hojas:</strong> {len(students)}</div>
                 </div>
-                <div class="quality {'green' if successful == total and total else 'yellow'}">
-                    <strong>{successful} de {total} hoja(s) con texto reconocido</strong>
-                    <p>Revisa el contenido antes de continuar con la evaluación.</p>
+                <div class="notice neutral">
+                    Corrige nombres o respuestas cuando el OCR no haya quedado exacto.
+                    Evalia no calificará automáticamente un texto vacío.
+                </div>
+            </section>
+
+            <form id="evaluationForm" action="/captura/evaluar" method="post">
+                <input type="hidden" name="evaluation_token"
+                       value="{escape(evaluation_token, quote=True)}">
+                {''.join(student_cards)}
+                <section class="card">
+                    <button id="evaluateButton" class="primary-button" type="submit">
+                        Confirmar y evaluar
+                    </button>
+                    <div id="evaluateLoading" class="loading">
+                        Aplicando la rúbrica y generando resultados…
+                    </div>
+                    <a class="secondary-button" href="/captura">Cancelar y comenzar otra captura</a>
+                </section>
+            </form>
+        </main>
+        <script>
+            const form = document.getElementById("evaluationForm");
+            const button = document.getElementById("evaluateButton");
+            const loading = document.getElementById("evaluateLoading");
+            form.addEventListener("submit", () => {{
+                button.disabled = true;
+                button.textContent = "Evaluando…";
+                loading.style.display = "block";
+            }});
+        </script>
+    </body>
+    </html>
+    """
+
+
+def _evaluation_results_html(
+    *,
+    filename: str,
+    exam_name: str,
+    rubric_filename: str,
+    results: list,
+) -> str:
+    cards = []
+    valid_results = [item for item in results if not item.get("error")]
+
+    for index, item in enumerate(results, start=1):
+        name = str(item.get("student_name") or f"Estudiante {index}")
+        error = str(item.get("error", "") or "")
+
+        if error:
+            cards.append(f"""
+            <section class="card">
+                <h2>{escape(name)}</h2>
+                <div class="quality yellow">
+                    <strong>No fue posible evaluar</strong>
+                    <p>{escape(error)}</p>
+                </div>
+            </section>
+            """)
+            continue
+
+        question_rows = []
+        for question in item.get("questions", []) or []:
+            question_rows.append(f"""
+            <div class="mini-card" style="display:block;">
+                <strong>
+                    {escape(str(question.get('question_id', '')))}
+                    · {escape(str(question.get('score', 0)))} /
+                    {escape(str(question.get('max_score', 0)))} pts
+                </strong>
+                <p><strong>Estado:</strong> {escape(str(question.get('status', '')))}
+                   · <strong>Confianza:</strong> {_percent(question.get('confidence'))}</p>
+                <p>{escape(str(question.get('feedback', '') or ''))}</p>
+                <details>
+                    <summary>Respuesta evaluada</summary>
+                    <pre>{escape(str(question.get('answer', '') or ''))}</pre>
+                </details>
+            </div>
+            """)
+
+        cards.append(f"""
+        <section class="card">
+            <h2>{escape(name)}</h2>
+            <div class="quality green">
+                <strong>
+                    {escape(str(item.get('total_score', 0)))} /
+                    {escape(str(item.get('max_score', 0)))} pts
+                </strong>
+                <p>
+                    {escape(str(item.get('percentage', 0)))}%
+                    · {escape(str(item.get('performance_level', '')))}
+                </p>
+            </div>
+            {''.join(question_rows)}
+        </section>
+        """)
+
+    average = 0.0
+    if valid_results:
+        average = round(
+            sum(float(item.get("percentage", 0) or 0) for item in valid_results)
+            / len(valid_results),
+            2,
+        )
+
+    return f"""
+    <!doctype html>
+    <html lang="es">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+        <meta name="theme-color" content="#1d4ed8">
+        <title>Resultados · Evalia</title>
+        {_mobile_css()}
+    </head>
+    <body>
+        <main class="mobile-shell">
+            <div class="brand">
+                <strong>Evalia</strong>
+                <span class="badge">Evaluación completada</span>
+            </div>
+            <section class="card">
+                <h1>Resultados finales</h1>
+                <p>{escape(filename)}</p>
+                <div class="session-summary">
+                    <div><strong>Evaluación:</strong> {escape(exam_name)}</div>
+                    <div><strong>Rúbrica:</strong> {escape(rubric_filename)}</div>
+                    <div><strong>Evaluados:</strong> {len(valid_results)} de {len(results)}</div>
+                    <div><strong>Promedio del grupo:</strong> {average}%</div>
                 </div>
             </section>
             {''.join(cards)}
             <section class="card">
                 <a class="primary-button" href="/captura">Procesar otra fotografía</a>
-                <a class="secondary-button" href="/ocr">Ir al OCR tradicional</a>
+                <a class="secondary-button" href="/">Volver a Evalia</a>
             </section>
         </main>
     </body>
     </html>
     """
+
 
 def _error_html(title: str, message: str, detail: str = "") -> str:
     detail_html = (
@@ -1627,13 +1847,226 @@ def register_capture_routes(app: FastAPI) -> None:
                             "error": f"OCR falló para esta hoja: {exc}",
                         })
 
+                services = _evaluation_services(app)
+                load_rubric = _required_service(services, "load_selected_rubric")
+                validate_rubric = _required_service(services, "validate_rubric_integrity")
+                segment_text = _required_service(services, "segment_ocr_text_by_questions")
+                display_item_type = _required_service(services, "display_item_type")
+
+                rubric = load_rubric(rubric_filename)
+                issues = validate_rubric(rubric)
+                if issues:
+                    return HTMLResponse(
+                        _error_html(
+                            "Rúbrica con problemas",
+                            "La rúbrica seleccionada debe corregirse antes de evaluar.",
+                            "; ".join(str(issue) for issue in issues),
+                        ),
+                        status_code=400,
+                    )
+
+                students = []
+                for index, item in enumerate(ocr_results):
+                    ocr = item.get("ocr", {}) or {}
+                    raw_text = str(ocr.get("text", "") or "").strip()
+                    segments, segmentation = segment_text(raw_text, rubric)
+                    students.append({
+                        **item,
+                        "student_name": "",
+                        "segments": segments,
+                        "segmentation": segmentation,
+                    })
+
+                evaluation_token = _store_evaluation_session(
+                    filename=filename,
+                    exam_name=exam_name,
+                    rubric_filename=rubric_filename,
+                    rubric=rubric,
+                    students=students,
+                )
+
                 return HTMLResponse(
-                    _ocr_results_html(
+                    _ocr_review_html(
                         filename=filename,
-                        results=ocr_results,
+                        students=students,
                         exam_name=exam_name,
                         rubric_filename=rubric_filename,
+                        rubric=rubric,
+                        evaluation_token=evaluation_token,
+                        display_item_type=display_item_type,
                     )
                 )
             finally:
                 shutil.rmtree(temp_dir, ignore_errors=True)
+
+    if "/captura/evaluar" not in existing_paths:
+
+        @app.post("/captura/evaluar", response_class=HTMLResponse)
+        async def evaluate_capture(request: Request) -> HTMLResponse:
+            _cleanup_evaluation_sessions()
+            form = await request.form()
+            evaluation_token = str(form.get("evaluation_token", "") or "")
+            session = _EVALUATION_SESSIONS.pop(evaluation_token, None)
+
+            if session is None:
+                return HTMLResponse(
+                    _error_html(
+                        "La revisión expiró",
+                        "La sesión de evaluación ya no está disponible. "
+                        "Vuelve a procesar la fotografía.",
+                    ),
+                    status_code=410,
+                )
+
+            try:
+                services = _evaluation_services(app)
+                score_answer = _required_service(services, "score_answer")
+                semantic_diagnosis = _required_service(services, "semantic_diagnosis")
+                cognitive_level = _required_service(
+                    services,
+                    "cognitive_level_from_score",
+                )
+                performance_level = _required_service(
+                    services,
+                    "performance_level",
+                )
+                segment_text = _required_service(
+                    services,
+                    "segment_ocr_text_by_questions",
+                )
+
+                rubric = session.get("rubric", {}) or {}
+                questions = rubric.get("questions", []) or []
+                total_score = (
+                    float(rubric.get("total_score", 0) or 0)
+                    or sum(float(q.get("max_score", 0) or 0) for q in questions)
+                    or 1.0
+                )
+
+                evaluation_results = []
+                for student_index, student in enumerate(
+                    session.get("students", []) or []
+                ):
+                    student_name = str(
+                        form.get(f"student_name__{student_index}", "")
+                        or ""
+                    ).strip()
+                    if not student_name:
+                        student_name = (
+                            f"Estudiante "
+                            f"{student.get('student_number', student_index + 1)}"
+                        )
+
+                    raw_text = str(
+                        form.get(f"raw_text__{student_index}", "")
+                        or ""
+                    ).strip()
+                    fallback_segments, fallback_info = segment_text(
+                        raw_text,
+                        rubric,
+                    )
+
+                    answers: Dict[str, str] = {}
+                    for question in questions:
+                        qid = str(question.get("id", ""))
+                        direct = str(
+                            form.get(
+                                f"answer__{student_index}__{qid}",
+                                "",
+                            )
+                            or ""
+                        ).strip()
+                        answers[qid] = (
+                            direct
+                            or str(fallback_segments.get(qid, "") or "").strip()
+                        )
+
+                    nonempty_answers = [
+                        answer for answer in answers.values() if answer.strip()
+                    ]
+                    if not nonempty_answers:
+                        evaluation_results.append({
+                            "student_name": student_name,
+                            "error": (
+                                "No hay respuestas evaluables. "
+                                "Evalia no asignó cero porque el problema puede "
+                                "provenir del OCR o de la segmentación."
+                            ),
+                            "segmentation": fallback_info,
+                        })
+                        continue
+
+                    total = 0.0
+                    question_results = []
+                    for question in questions:
+                        qid = str(question.get("id", ""))
+                        answer = answers.get(qid, "")
+                        score, confidence, feedback, status = score_answer(
+                            answer,
+                            question,
+                        )
+                        diagnosis = semantic_diagnosis(
+                            answer,
+                            question,
+                            score=score,
+                            confidence=confidence,
+                            status=status,
+                        )
+                        level = cognitive_level(
+                            score,
+                            question.get("max_score", 1),
+                            confidence,
+                            diagnosis,
+                        )
+                        total += float(score)
+
+                        question_results.append({
+                            "question_id": qid,
+                            "answer": answer,
+                            "score": score,
+                            "max_score": question.get("max_score", 0),
+                            "confidence": confidence,
+                            "status": status,
+                            "feedback": feedback,
+                            "cognitive_level": level,
+                            "diagnosis": diagnosis,
+                        })
+
+                    percentage = round((total / total_score) * 100, 2)
+                    evaluation_results.append({
+                        "student_name": student_name,
+                        "student_number": student.get(
+                            "student_number",
+                            student_index + 1,
+                        ),
+                        "total_score": round(total, 2),
+                        "max_score": total_score,
+                        "percentage": percentage,
+                        "performance_level": performance_level(percentage),
+                        "questions": question_results,
+                        "segmentation": fallback_info,
+                    })
+
+                return HTMLResponse(
+                    _evaluation_results_html(
+                        filename=str(session.get("filename") or "captura"),
+                        exam_name=str(
+                            session.get("exam_name") or "Evaluación"
+                        ),
+                        rubric_filename=str(
+                            session.get("rubric_filename") or ""
+                        ),
+                        results=evaluation_results,
+                    )
+                )
+
+            except Exception as exc:
+                return HTMLResponse(
+                    _error_html(
+                        "No pudimos completar la evaluación",
+                        "Evalia detuvo el proceso de forma segura.",
+                        str(exc),
+                    ),
+                    status_code=500,
+                )
+
