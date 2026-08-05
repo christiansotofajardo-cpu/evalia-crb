@@ -52,7 +52,10 @@ logger = logging.getLogger("evalia")
 
 app = FastAPI(title="Evalia OCR-MVP", version=APP_VERSION)
 
-register_capture_routes(app)
+# Smart Capture se registra al final del archivo, después de que el motor
+# de rúbricas, segmentación y evaluación haya sido definido. Esto permite
+# exponer esas dependencias mediante app.state sin importar main.py desde
+# feature.capture.routes y evita una importación circular.
 
 SEMANTIC_CACHE: Dict[str, Any] = {}
 
@@ -3741,4 +3744,26 @@ async def test_smart_capture_detection(file: UploadFile = File(...)):
         content=response,
     )
 
+# ============================================================
+# PUENTE SMART CAPTURE → EVALUACIÓN CRB
+# ============================================================
+# Las rutas móviles pueden reutilizar el motor que ya vive en main.py sin
+# importar este módulo directamente. feature.capture.routes debe obtener
+# estas funciones desde request.app.state.evalia_services.
+
+app.state.evalia_services = {
+    "get_available_rubrics": get_available_rubrics,
+    "load_selected_rubric": load_selected_rubric,
+    "validate_rubric_integrity": validate_rubric_integrity,
+    "segment_ocr_text_by_questions": segment_ocr_text_by_questions,
+    "score_answer": score_answer,
+    "semantic_diagnosis": semantic_diagnosis,
+    "cognitive_level_from_score": cognitive_level_from_score,
+    "performance_level": performance_level,
+    "display_item_type": display_item_type,
+    "build_traceability_row": build_traceability_row,
+}
+
+# Debe ejecutarse una sola vez y después de definir todas las dependencias.
+register_capture_routes(app)
 
