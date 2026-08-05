@@ -798,6 +798,91 @@ async def load_uploaded_rubric(rubric_file: UploadFile):
     raise ValueError("La rúbrica debe estar en formato .json, .xlsx o .xls.")
 
 
+ACTIVE_EVALUATION_PATH = OUTPUT_DIR / "active_evaluation.json"
+
+
+def _safe_slug(value: str, fallback: str = "rubrica") -> str:
+    """Genera un nombre de archivo estable y seguro para rúbricas persistentes."""
+    normalized = unicodedata.normalize("NFD", str(value or ""))
+    normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    normalized = re.sub(r"[^a-zA-Z0-9_-]+", "_", normalized).strip("_").lower()
+    return normalized[:80] or fallback
+
+
+def persist_rubric(rubric: Dict[str, Any], preferred_name: str = "") -> Dict[str, Any]:
+    """
+    Guarda una rúbrica validada como JSON reutilizable en /rubrics.
+    Así queda disponible tanto para OCR tradicional como para Smart Capture.
+    """
+    display_name = (
+        str(preferred_name or "").strip()
+        or str(rubric.get("_rubric_display_name") or "").strip()
+        or str(rubric.get("name") or rubric.get("title") or "").strip()
+        or "Rúbrica Evalia"
+    )
+    filename = f"{_safe_slug(display_name)}.json"
+    destination = RUBRICS_DIR / filename
+
+    payload = make_json_safe(dict(rubric))
+    payload["name"] = payload.get("name") or display_name
+    payload["_rubric_filename"] = filename
+    payload["_rubric_display_name"] = display_name
+
+    destination.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    log_event("rubric_persisted", filename=filename, display_name=display_name)
+    return {
+        "filename": filename,
+        "name": display_name,
+        "path": destination,
+        "rubric": payload,
+    }
+
+
+def save_active_evaluation(
+    exam_name: str,
+    rubric_filename: str,
+    course: str = "",
+    exam_date: str = "",
+) -> Dict[str, Any]:
+    """Registra el contexto vigente para que computador y celular compartan evaluación."""
+    payload = {
+        "exam_name": str(exam_name or "").strip() or "Evaluación",
+        "rubric_filename": Path(str(rubric_filename or "")).name,
+        "course": str(course or "").strip(),
+        "exam_date": str(exam_date or "").strip(),
+        "updated_at": time.time(),
+    }
+    ACTIVE_EVALUATION_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    app.state.active_evaluation = payload
+    log_event(
+        "active_evaluation_saved",
+        exam_name=payload["exam_name"],
+        rubric_filename=payload["rubric_filename"],
+    )
+    return payload
+
+
+def get_active_evaluation() -> Dict[str, Any]:
+    current = getattr(app.state, "active_evaluation", None)
+    if isinstance(current, dict):
+        return current
+    if ACTIVE_EVALUATION_PATH.exists():
+        try:
+            payload = json.loads(ACTIVE_EVALUATION_PATH.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                app.state.active_evaluation = payload
+                return payload
+        except Exception:
+            pass
+    return {}
+
+
 # ============================================================
 # MOTOR CRB
 # ============================================================
@@ -2801,6 +2886,15 @@ def hidden_input(name, value):
 
 @app.get("/ocr", response_class=HTMLResponse)
 def ocr_home():
+    available_rubrics = get_available_rubrics()
+    active_evaluation = get_active_evaluation()
+    active_filename = str(active_evaluation.get("rubric_filename", ""))
+    saved_options = "".join(
+        f'<option value="{escape(r["filename"], quote=True)}" '
+        f'{"selected" if r["filename"] == active_filename else ""}>'
+        f'{escape(r["name"])} · {escape(r["filename"])}</option>'
+        for r in available_rubrics
+    )
     return HTMLResponse(f"""
     <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Evalia OCR v1.5</title>{base_css()}
     <style>
@@ -2816,20 +2910,26 @@ def ocr_home():
       {shell_topbar("Evalia OCR v1.5", "Inteligencia evaluativa explicable")}
       <section class="hero"><div class="hero-inner">
         <h1>Evaluación desde imágenes manuscritas</h1>
-        <p class="lead">Sube una rúbrica, identifica al estudiante y carga fotos de sus hojas. Esta versión muestra explícitamente si los archivos quedaron registrados antes de procesar.</p>
+        <p class="lead">Prepara una evaluación una sola vez: selecciona una rúbrica guardada o sube una nueva. Evalia la dejará disponible también para Smart Capture.</p>
         <form id="ocrForm" action="/ocr/process" enctype="multipart/form-data" method="post">
           <div class="panel">
-            <label class="field-label">Curso</label><input name="course" placeholder="Ej.: Psicolingüística" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
-            <label class="field-label">Certamen / evaluación</label><input name="exam_name" placeholder="Ej.: Certamen 1" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
-            <label class="field-label">Fecha</label><input name="exam_date" placeholder="2026-05-08" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
+            <label class="field-label">Curso</label><input name="course" value="{escape(str(active_evaluation.get('course','')), quote=True)}" placeholder="Ej.: Psicolingüística" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
+            <label class="field-label">Certamen / evaluación</label><input name="exam_name" value="{escape(str(active_evaluation.get('exam_name','')), quote=True)}" placeholder="Ej.: Certamen 1" required style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
+            <label class="field-label">Fecha</label><input name="exam_date" value="{escape(str(active_evaluation.get('exam_date','')), quote=True)}" placeholder="2026-05-08" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
             <label class="field-label">ID estudiante</label><input name="student_id" required placeholder="Ej.: A01" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
             <label class="field-label">Nombre estudiante</label><input name="student_name" required placeholder="Nombre completo" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
 
-            <label class="field-label">Rúbrica Excel/JSON</label>
+            <label class="field-label">Rúbrica guardada</label>
+            <select id="savedRubric" name="rubric_filename" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;background:white;">
+              <option value="">Seleccionar una rúbrica guardada</option>
+              {saved_options}
+            </select>
+
+            <label class="field-label">O subir una nueva rúbrica Excel/JSON</label>
             <div class="upload-box" id="rubricDrop">
-              <input id="rubricInput" name="rubric_file" type="file" accept=".xlsx,.xls,.json" required>
-              <div class="helper-note">Selecciona o arrastra aquí la rúbrica. Formatos: .xlsx, .xls, .json</div>
-              <div id="rubricStatus" class="file-status warn">Ninguna rúbrica seleccionada todavía.</div>
+              <input id="rubricInput" name="rubric_file" type="file" accept=".xlsx,.xls,.json">
+              <div class="helper-note">Si subes una nueva, Evalia la validará, convertirá a JSON y guardará en la biblioteca de rúbricas.</div>
+              <div id="rubricStatus" class="file-status warn">Puedes usar una rúbrica guardada o subir una nueva.</div>
             </div>
 
             <label>Cantidad de páginas del certamen</label>
@@ -2881,6 +2981,7 @@ Selecciona o arrastra una o más fotos/escaneos...
     </main></div>
     <script>
       const rubricInput = document.getElementById('rubricInput');
+      const savedRubric = document.getElementById('savedRubric');
       const imageInput = document.getElementById('imageInput');
       const rubricStatus = document.getElementById('rubricStatus');
       const imageStatus = document.getElementById('imageStatus');
@@ -2906,9 +3007,10 @@ Selecciona o arrastra una o más fotos/escaneos...
       form.addEventListener('submit', (e) => {{
         updateFileStatus(rubricInput, rubricStatus, 'rubrica');
         updateFileStatus(imageInput, imageStatus, 'imagenes');
-        if(!rubricInput.files.length || !imageInput.files.length){{
+        const hasRubric = Boolean((savedRubric && savedRubric.value) || rubricInput.files.length);
+        if(!hasRubric || !imageInput.files.length){{
           e.preventDefault();
-          alert('Falta seleccionar la rúbrica o al menos una imagen del estudiante.');
+          alert('Falta seleccionar/subir la rúbrica o al menos una imagen del estudiante.');
           return false;
         }}
         progressNote.style.display = 'block';
@@ -2928,20 +3030,45 @@ async def ocr_process(
     exam_date: str = Form(""),
     student_id: str = Form(""),
     student_name: str = Form(""),
-    rubric_file: UploadFile = File(...),
+    rubric_filename: str = Form(""),
+    rubric_file: Optional[UploadFile] = File(None),
     image_files: List[UploadFile] = File(...),
     manual_raw_text: str = Form("")
 ):
     try:
-        if not rubric_file or not rubric_file.filename:
-            return safe_error_page("Falta rúbrica", "No se recibió ningún archivo de rúbrica. Selecciona o arrastra un Excel/JSON.")
         valid_images = [img for img in image_files if img is not None and img.filename]
         if not valid_images and not str(manual_raw_text or "").strip():
             return safe_error_page("Faltan imágenes", "No se recibió ninguna imagen del estudiante ni texto manual de respaldo.")
-        rubric = await load_uploaded_rubric(rubric_file)
-        issues = validate_rubric_integrity(rubric)
-        if issues:
-            return safe_error_page("Rúbrica con problemas", "La rúbrica debe corregirse antes de evaluar.", "; ".join(issues))
+
+        selected_filename = Path(str(rubric_filename or "")).name
+        if rubric_file is not None and rubric_file.filename:
+            rubric = await load_uploaded_rubric(rubric_file)
+            issues = validate_rubric_integrity(rubric)
+            if issues:
+                return safe_error_page("Rúbrica con problemas", "La rúbrica debe corregirse antes de evaluar.", "; ".join(issues))
+            persisted = persist_rubric(
+                rubric,
+                preferred_name=exam_name or rubric.get("_rubric_display_name", ""),
+            )
+            selected_filename = persisted["filename"]
+            rubric = persisted["rubric"]
+        elif selected_filename:
+            rubric = load_selected_rubric(selected_filename)
+            issues = validate_rubric_integrity(rubric)
+            if issues:
+                return safe_error_page("Rúbrica con problemas", "La rúbrica guardada debe corregirse antes de evaluar.", "; ".join(issues))
+        else:
+            return safe_error_page(
+                "Falta rúbrica",
+                "Selecciona una rúbrica guardada o sube un archivo Excel/JSON.",
+            )
+
+        save_active_evaluation(
+            exam_name=exam_name,
+            rubric_filename=selected_filename,
+            course=course,
+            exam_date=exam_date,
+        )
 
         session_id = safe_session_id(student_id, student_name, exam_name)
         saved_rubric = OUTPUT_DIR / f"ocr_session_{session_id}_rubric.json"
@@ -3762,6 +3889,9 @@ app.state.evalia_services = {
     "performance_level": performance_level,
     "display_item_type": display_item_type,
     "build_traceability_row": build_traceability_row,
+    "persist_rubric": persist_rubric,
+    "save_active_evaluation": save_active_evaluation,
+    "get_active_evaluation": get_active_evaluation,
 }
 
 # Debe ejecutarse una sola vez y después de definir todas las dependencias.
