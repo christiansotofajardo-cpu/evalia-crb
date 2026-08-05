@@ -2895,8 +2895,25 @@ def ocr_home():
         f'{escape(r["name"])} · {escape(r["filename"])}</option>'
         for r in available_rubrics
     )
+
+    active_card = ""
+    if active_evaluation and active_filename:
+        active_card = f"""
+        <div class="active-card">
+          <strong>Evaluación preparada</strong>
+          <div><b>Curso:</b> {escape(str(active_evaluation.get('course','') or '—'))}</div>
+          <div><b>Evaluación:</b> {escape(str(active_evaluation.get('exam_name','') or '—'))}</div>
+          <div><b>Fecha:</b> {escape(str(active_evaluation.get('exam_date','') or '—'))}</div>
+          <div><b>Rúbrica activa:</b> {escape(active_filename)}</div>
+          <div class="mode-grid">
+            <a class="mode-button primary-mode" href="/captura">Capturar varios estudiantes</a>
+            <a class="mode-button" href="#individualFlow">Un estudiante con varias páginas</a>
+          </div>
+        </div>
+        """
+
     return HTMLResponse(f"""
-    <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Evalia OCR v1.5</title>{base_css()}
+    <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Evalia OCR v1.6</title>{base_css()}
     <style>
       .upload-box{{border:2px dashed #93c5fd;background:#f8fbff;border-radius:18px;padding:16px;margin:8px 0 16px 0;cursor:pointer;transition:.15s;}}
       .upload-box:hover{{background:#eef6ff;border-color:#2563eb;}}
@@ -2905,123 +2922,163 @@ def ocr_home():
       .file-status.warn{{display:block;background:#fff7ed;border-color:#fed7aa;color:#9a3412;}}
       .helper-note{{font-size:12px;color:#475569;margin-top:4px;}}
       .progress-note{{display:none;margin-top:12px;padding:12px;border-radius:14px;background:#eff6ff;border:1px solid #bfdbfe;color:#1e3a8a;font-weight:700;}}
+      .active-card{{margin:18px 0;padding:18px;border-radius:18px;background:#ecfdf5;border:1px solid #86efac;color:#065f46;display:grid;gap:6px;}}
+      .mode-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px;}}
+      .mode-button{{display:block;text-align:center;text-decoration:none;padding:14px;border-radius:14px;background:#e2e8f0;color:#172033;font-weight:800;}}
+      .primary-mode{{background:#1d4ed8;color:white;}}
+      .section-title{{margin-top:0;}}
+      .divider{{height:1px;background:#dbe4f0;margin:24px 0;}}
+      @media(max-width:700px){{.mode-grid{{grid-template-columns:1fr;}}}}
     </style></head>
     <body><div class="page"><main class="shell">
-      {shell_topbar("Evalia OCR v1.5", "Inteligencia evaluativa explicable")}
+      {shell_topbar("Evalia OCR v1.6", "Inteligencia evaluativa explicable")}
       <section class="hero"><div class="hero-inner">
-        <h1>Evaluación desde imágenes manuscritas</h1>
-        <p class="lead">Prepara una evaluación una sola vez: selecciona una rúbrica guardada o sube una nueva. Evalia la dejará disponible también para Smart Capture.</p>
-        <form id="ocrForm" action="/ocr/process" enctype="multipart/form-data" method="post">
+        <h1>Preparar evaluación manuscrita</h1>
+        <p class="lead">Primero registra una evaluación y su rúbrica. Después elige si corregirás un estudiante con varias páginas o varios estudiantes mediante Smart Capture.</p>
+
+        {active_card}
+
+        <form id="prepareForm" action="/ocr/prepare" enctype="multipart/form-data" method="post">
           <div class="panel">
+            <h2 class="section-title">1. Preparar evaluación y rúbrica</h2>
             <label class="field-label">Curso</label><input name="course" value="{escape(str(active_evaluation.get('course','')), quote=True)}" placeholder="Ej.: Psicolingüística" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
             <label class="field-label">Certamen / evaluación</label><input name="exam_name" value="{escape(str(active_evaluation.get('exam_name','')), quote=True)}" placeholder="Ej.: Certamen 1" required style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
             <label class="field-label">Fecha</label><input name="exam_date" value="{escape(str(active_evaluation.get('exam_date','')), quote=True)}" placeholder="2026-05-08" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
-            <label class="field-label">ID estudiante</label><input name="student_id" required placeholder="Ej.: A01" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
-            <label class="field-label">Nombre estudiante</label><input name="student_name" required placeholder="Nombre completo" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
 
             <label class="field-label">Rúbrica guardada</label>
-            <select id="savedRubric" name="rubric_filename" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;background:white;">
+            <select id="prepareSavedRubric" name="rubric_filename" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;background:white;">
               <option value="">Seleccionar una rúbrica guardada</option>
               {saved_options}
             </select>
 
             <label class="field-label">O subir una nueva rúbrica Excel/JSON</label>
-            <div class="upload-box" id="rubricDrop">
-              <input id="rubricInput" name="rubric_file" type="file" accept=".xlsx,.xls,.json">
-              <div class="helper-note">Si subes una nueva, Evalia la validará, convertirá a JSON y guardará en la biblioteca de rúbricas.</div>
-              <div id="rubricStatus" class="file-status warn">Puedes usar una rúbrica guardada o subir una nueva.</div>
+            <div class="upload-box">
+              <input id="prepareRubricInput" name="rubric_file" type="file" accept=".xlsx,.xls,.json">
+              <div class="helper-note">La nueva rúbrica será validada, convertida a JSON y guardada para OCR y Smart Capture.</div>
+              <div id="prepareRubricStatus" class="file-status warn">Selecciona una rúbrica guardada o sube una nueva.</div>
             </div>
+            <div class="actions"><button id="prepareBtn" type="submit">Guardar evaluación y continuar</button></div>
+            <div id="prepareProgress" class="progress-note">Registrando evaluación y rúbrica...</div>
+          </div>
+        </form>
 
-            <label>Cantidad de páginas del certamen</label>
+        <div class="divider"></div>
 
-<select id="numPages" onchange="generatePageInputs()">
-  <option value="1">1 página</option>
-  <option value="2">2 páginas</option>
-  <option value="3">3 páginas</option>
-  <option value="4" selected>4 páginas</option>
-  <option value="5">5 páginas</option>
-  <option value="6">6 páginas</option>
-</select>
+        <form id="individualFlow" action="/ocr/process" enctype="multipart/form-data" method="post">
+          <div class="panel">
+            <h2 class="section-title">2. Vía individual: un estudiante con varias páginas</h2>
+            <p class="helper-note">Usa esta sección solo cuando todas las imágenes pertenecen al mismo estudiante.</p>
+            <input type="hidden" name="course" value="{escape(str(active_evaluation.get('course','')), quote=True)}">
+            <input type="hidden" name="exam_name" value="{escape(str(active_evaluation.get('exam_name','')), quote=True)}">
+            <input type="hidden" name="exam_date" value="{escape(str(active_evaluation.get('exam_date','')), quote=True)}">
+            <input type="hidden" name="rubric_filename" value="{escape(active_filename, quote=True)}">
 
-<br><br>
+            <label class="field-label">ID estudiante</label><input name="student_id" required placeholder="Ej.: A01" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
+            <label class="field-label">Nombre estudiante</label><input name="student_name" required placeholder="Nombre completo" style="width:100%;padding:12px;border-radius:14px;border:1px solid #d1d5db;">
 
-<div id="pageInputsContainer"></div>
-<label>Imágenes de hojas del estudiante</label>
-
-<label>Página 1</label>
-<input name="image_files" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp" required><br><br>
-
-<label>Página 2</label>
-<input name="image_files" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp" required><br><br>
-
-<label>Página 3</label>
-<input name="image_files" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp" required><br><br>
-
-<label>Página 4</label>
-<input name="image_files" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp" required><br><br>
-
-<p class="hint">
-Selecciona o arrastra una o más fotos/escaneos...
-</p>
-<div id="pageInputs"></div>
-  <p class="hint">Selecciona o arrastra una o más fotos/escaneos. Formatos recomendados: PNG/JPG.</p>
-  <div id="imageStatus" class="status warn">Ninguna imagen seleccionada todavía.</div>
-</div>
+            <label class="field-label">Imágenes del estudiante</label>
+            <div class="upload-box">
+              <input id="individualImages" name="image_files" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/tiff,image/bmp" multiple required>
+              <div class="helper-note">Selecciona todas las páginas del mismo estudiante en una sola operación.</div>
+              <div id="individualImageStatus" class="file-status warn">Ninguna imagen seleccionada todavía.</div>
+            </div>
 
             <details style="margin:10px 0 14px 0;">
               <summary style="cursor:pointer;font-weight:800;color:#334155;">Opcional: pegar texto manual si OCR falla</summary>
-              <textarea name="manual_raw_text" rows="5" placeholder="Puedes pegar aquí una transcripción manual completa. Si Tesseract no está instalado en Render, Evalia usará este texto como respaldo." style="width:100%;margin-top:8px;padding:12px;border-radius:14px;border:1px solid #d1d5db;"></textarea>
+              <textarea name="manual_raw_text" rows="5" placeholder="Pega aquí una transcripción manual completa." style="width:100%;margin-top:8px;padding:12px;border-radius:14px;border:1px solid #d1d5db;"></textarea>
             </details>
 
-            <div class="actions"><button id="submitBtn" type="submit">Procesar OCR y revisar</button><a class="button secondary" href="/">Volver a Excel</a></div>
-            <div id="progressNote" class="progress-note">Archivos recibidos en el navegador. Enviando a Evalia para OCR/segmentación...</div>
+            <div class="actions"><button id="individualBtn" type="submit" {'' if active_filename else 'disabled'}>Procesar OCR y revisar</button><a class="button secondary" href="/captura">Ir a Smart Capture grupal</a></div>
+            <div id="individualProgress" class="progress-note">Enviando páginas del estudiante a OCR...</div>
           </div>
         </form>
       </div></section>{footer_altiora()}
     </main></div>
     <script>
-      const rubricInput = document.getElementById('rubricInput');
-      const savedRubric = document.getElementById('savedRubric');
-      const imageInput = document.getElementById('imageInput');
-      const rubricStatus = document.getElementById('rubricStatus');
-      const imageStatus = document.getElementById('imageStatus');
-      const form = document.getElementById('ocrForm');
-      const progressNote = document.getElementById('progressNote');
-      const submitBtn = document.getElementById('submitBtn');
       function bytesToMB(n){{ return (n/1024/1024).toFixed(2) + ' MB'; }}
-      function updateFileStatus(input, box, label){{
+      function showFiles(input, box, prefix){{
         const files = Array.from(input.files || []);
-        if(!files.length){{
-          box.className = 'file-status warn';
-          box.style.display = 'block';
-          box.textContent = label === 'rubrica' ? 'Ninguna rúbrica seleccionada todavía.' : 'Ninguna imagen seleccionada todavía.';
-          return;
-        }}
-        box.className = 'file-status';
         box.style.display = 'block';
-        const names = files.map(f => f.name + ' (' + bytesToMB(f.size) + ')').join(' · ');
-        box.textContent = (label === 'rubrica' ? 'Rúbrica registrada: ' : files.length + ' imagen(es) registrada(s): ') + names;
+        if(!files.length){{ box.className='file-status warn'; box.textContent='Ningún archivo seleccionado todavía.'; return; }}
+        box.className='file-status';
+        box.textContent = prefix + files.map(f => f.name + ' (' + bytesToMB(f.size) + ')').join(' · ');
       }}
-      rubricInput.addEventListener('change', () => updateFileStatus(rubricInput, rubricStatus, 'rubrica'));
-      imageInput.addEventListener('change', () => updateFileStatus(imageInput, imageStatus, 'imagenes'));
-      form.addEventListener('submit', (e) => {{
-        updateFileStatus(rubricInput, rubricStatus, 'rubrica');
-        updateFileStatus(imageInput, imageStatus, 'imagenes');
-        const hasRubric = Boolean((savedRubric && savedRubric.value) || rubricInput.files.length);
-        if(!hasRubric || !imageInput.files.length){{
-          e.preventDefault();
-          alert('Falta seleccionar/subir la rúbrica o al menos una imagen del estudiante.');
-          return false;
-        }}
-        progressNote.style.display = 'block';
-        submitBtn.disabled = true;
-        submitBtn.textContent = 'Procesando...';
+
+      const prepareForm=document.getElementById('prepareForm');
+      const prepareSaved=document.getElementById('prepareSavedRubric');
+      const prepareRubric=document.getElementById('prepareRubricInput');
+      const prepareStatus=document.getElementById('prepareRubricStatus');
+      const prepareBtn=document.getElementById('prepareBtn');
+      const prepareProgress=document.getElementById('prepareProgress');
+      prepareRubric.addEventListener('change',()=>showFiles(prepareRubric,prepareStatus,'Rúbrica seleccionada: '));
+      prepareForm.addEventListener('submit',(e)=>{{
+        if(!(prepareSaved.value || prepareRubric.files.length)){{e.preventDefault();alert('Selecciona una rúbrica guardada o sube una nueva.');return;}}
+        prepareBtn.disabled=true;prepareBtn.textContent='Guardando...';prepareProgress.style.display='block';
       }});
-      updateFileStatus(rubricInput, rubricStatus, 'rubrica');
-      updateFileStatus(imageInput, imageStatus, 'imagenes');
+
+      const individualForm=document.getElementById('individualFlow');
+      const individualImages=document.getElementById('individualImages');
+      const individualStatus=document.getElementById('individualImageStatus');
+      const individualBtn=document.getElementById('individualBtn');
+      const individualProgress=document.getElementById('individualProgress');
+      individualImages.addEventListener('change',()=>showFiles(individualImages,individualStatus,individualImages.files.length+' página(s): '));
+      individualForm.addEventListener('submit',()=>{{individualBtn.disabled=true;individualBtn.textContent='Procesando...';individualProgress.style.display='block';}});
     </script>
     </body></html>
     """)
+
+
+@app.post("/ocr/prepare", response_class=HTMLResponse)
+async def ocr_prepare_evaluation(
+    course: str = Form(""),
+    exam_name: str = Form(""),
+    exam_date: str = Form(""),
+    rubric_filename: str = Form(""),
+    rubric_file: Optional[UploadFile] = File(None),
+):
+    try:
+        selected_filename = Path(str(rubric_filename or "")).name
+        if rubric_file is not None and rubric_file.filename:
+            rubric = await load_uploaded_rubric(rubric_file)
+            issues = validate_rubric_integrity(rubric)
+            if issues:
+                return safe_error_page("Rúbrica con problemas", "La rúbrica debe corregirse antes de registrarla.", "; ".join(issues))
+            persisted = persist_rubric(
+                rubric,
+                preferred_name=rubric.get("_rubric_display_name", "") or Path(rubric_file.filename).stem,
+            )
+            selected_filename = persisted["filename"]
+        elif selected_filename:
+            rubric = load_selected_rubric(selected_filename)
+            issues = validate_rubric_integrity(rubric)
+            if issues:
+                return safe_error_page("Rúbrica con problemas", "La rúbrica guardada debe corregirse antes de usarla.", "; ".join(issues))
+        else:
+            return safe_error_page("Falta rúbrica", "Selecciona una rúbrica guardada o sube un archivo Excel/JSON.")
+
+        active = save_active_evaluation(
+            exam_name=exam_name,
+            rubric_filename=selected_filename,
+            course=course,
+            exam_date=exam_date,
+        )
+        return HTMLResponse(f"""
+        <!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Evaluación preparada · Evalia</title>{base_css()}</head>
+        <body><div class="page"><main class="shell">{shell_topbar("Evaluación preparada", "Rúbrica compartida")}
+        <section class="hero"><div class="hero-inner"><div class="result-card">
+          <h1>Evaluación lista</h1>
+          <div class="success"><strong>{escape(active.get('exam_name','Evaluación'))}</strong><br>
+          Rúbrica activa: {escape(active.get('rubric_filename',''))}</div>
+          <p class="lead">Ahora elige cómo ingresar las pruebas. Ambas vías usarán la misma evaluación y rúbrica.</p>
+          <div class="actions">
+            <a class="button" href="/captura">Capturar varios estudiantes</a>
+            <a class="button secondary" href="/ocr#individualFlow">Un estudiante con varias páginas</a>
+          </div>
+        </div></div></section>{footer_altiora()}</main></div></body></html>
+        """)
+    except Exception as exc:
+        return safe_error_page("No se pudo preparar la evaluación", "Evalia detuvo el registro de forma segura.", str(exc))
+
 
 @app.post("/ocr/process", response_class=HTMLResponse)
 async def ocr_process(
@@ -3896,4 +3953,3 @@ app.state.evalia_services = {
 
 # Debe ejecutarse una sola vez y después de definir todas las dependencias.
 register_capture_routes(app)
-
