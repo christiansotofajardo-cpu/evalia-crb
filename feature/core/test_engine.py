@@ -112,3 +112,8 @@ def test_evalia_core_pipeline():
     assert result.traceability["assessment_id"] == "demo_assessment"
     assert result.traceability["task_id"] == "task_1"
     assert result.traceability["core_version"] == "2.0-baseline"
+
+
+if __name__ == "__main__":
+    test_evalia_core_pipeline()
+    print("✅ Evalia Core 2.0 pipeline test passed.")
