@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import List
+from typing import Dict, List, Tuple
 
-from .models import EvaluationInput, RepresentationResult
+from .models import Criterion, EvaluationInput, RepresentationResult
 
 
 def _normalize_text(text: str) -> str:
     """
-    Normalización liviana para el baseline explicable.
-    No reemplaza el futuro motor semántico multilingüe.
+    Normalización liviana para el baseline semántico.
     """
     text = str(text or "").strip().lower()
     text = unicodedata.normalize("NFD", text)
@@ -24,8 +23,7 @@ def _normalize_text(text: str) -> str:
 
 def _response_profile(text: str) -> str:
     """
-    Perfil muy simple de longitud.
-    Servirá como baseline y luego podrá enriquecerse.
+    Perfil básico de extensión de respuesta.
     """
     words = re.findall(r"\b\w+\b", str(text or ""))
 
@@ -40,61 +38,98 @@ def _response_profile(text: str) -> str:
     return "extended"
 
 
-def _criterion_terms(data: EvaluationInput) -> List[str]:
+def _criterion_variants(criterion: Criterion) -> List[str]:
     """
-    Obtiene conceptos esperados desde el AssessmentSpec.
+    Agrupa todas las formas válidas de evidenciar un mismo criterio.
+
+    Importante:
+    una descripción y sus variantes semánticas representan
+    el mismo concepto evaluativo, no conceptos independientes.
     """
-    spec = data.task.assessment_spec
+    variants: List[str] = []
 
-    if spec is None:
-        return []
+    if criterion.description:
+        variants.append(criterion.description)
 
-    terms: List[str] = []
+    variants.extend(criterion.semantic_variants)
+    variants.extend(criterion.accepted_values)
 
-    for criterion in spec.criteria:
-        if criterion.description:
-            terms.append(criterion.description)
+    return list(
+        dict.fromkeys(
+            value.strip()
+            for value in variants
+            if str(value).strip()
+        )
+    )
 
-        terms.extend(criterion.semantic_variants)
-        terms.extend(criterion.accepted_values)
 
-    return [
-        term.strip()
-        for term in terms
-        if str(term).strip()
-    ]
+def _match_criterion(
+    criterion: Criterion,
+    normalized_answer: str,
+) -> Tuple[bool, List[str]]:
+    """
+    Busca evidencia para un criterio usando cualquiera
+    de sus realizaciones semánticas aceptadas.
+    """
+    matched_variants: List[str] = []
+
+    for variant in _criterion_variants(criterion):
+        normalized_variant = _normalize_text(variant)
+
+        if normalized_variant and normalized_variant in normalized_answer:
+            matched_variants.append(variant)
+
+    return bool(matched_variants), matched_variants
 
 
 def represent(data: EvaluationInput) -> RepresentationResult:
     """
-    Primera capa de representación de Evalia Core 2.0.
+    Capa de representación semántica de Evalia Core 2.0.
 
-    Convierte una respuesta en evidencia estructurada básica.
-    Este baseline será reemplazable por motores más avanzados.
+    La unidad de análisis es ahora el criterio conceptual,
+    no cada variante lingüística por separado.
     """
+
     response_text = str(data.response.text or "").strip()
     normalized_answer = _normalize_text(response_text)
 
-    expected_terms = _criterion_terms(data)
+    spec = data.task.assessment_spec
 
-    detected: List[str] = []
-    missing: List[str] = []
+    detected_concepts: List[str] = []
+    missing_concepts: List[str] = []
+    evidence_spans: List[Dict[str, object]] = []
 
-    for term in expected_terms:
-        normalized_term = _normalize_text(term)
+    total_criteria = 0
+    detected_criteria = 0
 
-        if normalized_term and normalized_term in normalized_answer:
-            detected.append(term)
-        else:
-            missing.append(term)
+    if spec is not None:
+        total_criteria = len(spec.criteria)
 
-    unique_expected = list(dict.fromkeys(expected_terms))
-    unique_detected = list(dict.fromkeys(detected))
-    unique_missing = list(dict.fromkeys(missing))
+        for criterion in spec.criteria:
+            matched, matched_variants = _match_criterion(
+                criterion,
+                normalized_answer,
+            )
+
+            if matched:
+                detected_criteria += 1
+                detected_concepts.append(criterion.description)
+
+                evidence_spans.append(
+                    {
+                        "criterion_id": criterion.id,
+                        "concept": criterion.description,
+                        "matched_variants": matched_variants,
+                        "match_type": "semantic_variant_match",
+                    }
+                )
+
+            else:
+                missing_concepts.append(criterion.description)
 
     coverage = (
-        len(unique_detected) / len(unique_expected)
-        if unique_expected
+        detected_criteria / total_criteria
+        if total_criteria
         else 0.0
     )
 
@@ -109,16 +144,17 @@ def represent(data: EvaluationInput) -> RepresentationResult:
 
     return RepresentationResult(
         language=language,
-        concepts_detected=unique_detected,
-        concepts_missing=unique_missing,
+        concepts_detected=list(dict.fromkeys(detected_concepts)),
+        concepts_missing=list(dict.fromkeys(missing_concepts)),
         conceptual_relations=[],
         contradictions=[],
         conceptual_coverage=round(coverage, 3),
         response_profile=_response_profile(response_text),
-        evidence_spans=[],
+        evidence_spans=evidence_spans,
         metadata={
-            "mode": "baseline_rule_based",
-            "expected_terms_count": len(unique_expected),
-            "detected_terms_count": len(unique_detected),
+            "mode": "criterion_centered_semantic_baseline",
+            "criteria_total": total_criteria,
+            "criteria_detected": detected_criteria,
+            "coverage_unit": "criterion",
         },
     )
