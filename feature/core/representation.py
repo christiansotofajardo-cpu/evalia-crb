@@ -5,11 +5,13 @@ import unicodedata
 from typing import Dict, List, Tuple
 
 from .models import Criterion, EvaluationInput, RepresentationResult
+from .semantic import semantic_compare
 
 
 def _normalize_text(text: str) -> str:
     """
-    Normalización liviana para el baseline semántico.
+    Normalización liviana para perfiles y compatibilidad interna.
+    La comparación semántica principal se delega a semantic.py.
     """
     text = str(text or "").strip().lower()
     text = unicodedata.normalize("NFD", text)
@@ -40,11 +42,7 @@ def _response_profile(text: str) -> str:
 
 def _criterion_variants(criterion: Criterion) -> List[str]:
     """
-    Agrupa todas las formas válidas de evidenciar un mismo criterio.
-
-    Importante:
-    una descripción y sus variantes semánticas representan
-    el mismo concepto evaluativo, no conceptos independientes.
+    Agrupa todas las realizaciones aceptables de un mismo criterio.
     """
     variants: List[str] = []
 
@@ -63,35 +61,90 @@ def _criterion_variants(criterion: Criterion) -> List[str]:
     )
 
 
+def _semantic_threshold(
+    data: EvaluationInput,
+) -> float:
+    """
+    Obtiene el umbral semántico desde AssessmentSpec cuando existe.
+
+    Permite adaptar Evalia a distintos dominios y tipos de tarea.
+    """
+    spec = data.task.assessment_spec
+
+    if spec is None:
+        return 0.75
+
+    policy = spec.scoring_policy or {}
+
+    try:
+        threshold = float(
+            policy.get("semantic_threshold", 0.75)
+        )
+    except (TypeError, ValueError):
+        threshold = 0.75
+
+    return max(0.0, min(1.0, threshold))
+
+
 def _match_criterion(
     criterion: Criterion,
-    normalized_answer: str,
-) -> Tuple[bool, List[str]]:
+    response_text: str,
+    threshold: float,
+) -> Tuple[bool, List[Dict[str, object]]]:
     """
-    Busca evidencia para un criterio usando cualquiera
-    de sus realizaciones semánticas aceptadas.
+    Evalúa todas las realizaciones de un criterio usando
+    el matcher semántico desacoplado.
+
+    Devuelve evidencia estructurada y conserva el mejor match.
     """
-    matched_variants: List[str] = []
+    matches: List[Dict[str, object]] = []
 
     for variant in _criterion_variants(criterion):
-        normalized_variant = _normalize_text(variant)
+        semantic_match = semantic_compare(
+            response_text=response_text,
+            reference_text=variant,
+            threshold=threshold,
+        )
 
-        if normalized_variant and normalized_variant in normalized_answer:
-            matched_variants.append(variant)
+        matches.append(
+            {
+                "variant": variant,
+                "matched": semantic_match.matched,
+                "similarity": semantic_match.similarity,
+                "evidence": semantic_match.evidence,
+                "method": semantic_match.method,
+                "metadata": semantic_match.metadata,
+            }
+        )
 
-    return bool(matched_variants), matched_variants
+    positive_matches = [
+        item
+        for item in matches
+        if bool(item["matched"])
+    ]
+
+    positive_matches.sort(
+        key=lambda item: float(item["similarity"]),
+        reverse=True,
+    )
+
+    return bool(positive_matches), positive_matches
 
 
 def represent(data: EvaluationInput) -> RepresentationResult:
     """
-    Capa de representación semántica de Evalia Core 2.0.
+    Representación semántica de Evalia Core 2.0.
 
-    La unidad de análisis es ahora el criterio conceptual,
-    no cada variante lingüística por separado.
+    Cada criterio constituye una unidad conceptual.
+    Sus descripciones, variantes y valores aceptados funcionan
+    como realizaciones alternativas del mismo significado.
+
+    La detección concreta queda delegada al motor semántico,
+    permitiendo sustituir el baseline por embeddings, LLM
+    o motores híbridos sin modificar esta capa.
     """
 
     response_text = str(data.response.text or "").strip()
-    normalized_answer = _normalize_text(response_text)
 
     spec = data.task.assessment_spec
 
@@ -102,30 +155,47 @@ def represent(data: EvaluationInput) -> RepresentationResult:
     total_criteria = 0
     detected_criteria = 0
 
+    threshold = _semantic_threshold(data)
+
     if spec is not None:
         total_criteria = len(spec.criteria)
 
         for criterion in spec.criteria:
-            matched, matched_variants = _match_criterion(
-                criterion,
-                normalized_answer,
+            matched, matches = _match_criterion(
+                criterion=criterion,
+                response_text=response_text,
+                threshold=threshold,
             )
 
             if matched:
                 detected_criteria += 1
-                detected_concepts.append(criterion.description)
+                detected_concepts.append(
+                    criterion.description
+                )
+
+                best_match = matches[0]
 
                 evidence_spans.append(
                     {
                         "criterion_id": criterion.id,
                         "concept": criterion.description,
-                        "matched_variants": matched_variants,
-                        "match_type": "semantic_variant_match",
+                        "matched_variants": [
+                            item["variant"]
+                            for item in matches
+                        ],
+                        "best_variant": best_match["variant"],
+                        "best_similarity": best_match["similarity"],
+                        "evidence": best_match["evidence"],
+                        "match_method": best_match["method"],
+                        "semantic_threshold": threshold,
+                        "matches": matches,
                     }
                 )
 
             else:
-                missing_concepts.append(criterion.description)
+                missing_concepts.append(
+                    criterion.description
+                )
 
     coverage = (
         detected_criteria / total_criteria
@@ -144,17 +214,24 @@ def represent(data: EvaluationInput) -> RepresentationResult:
 
     return RepresentationResult(
         language=language,
-        concepts_detected=list(dict.fromkeys(detected_concepts)),
-        concepts_missing=list(dict.fromkeys(missing_concepts)),
+        concepts_detected=list(
+            dict.fromkeys(detected_concepts)
+        ),
+        concepts_missing=list(
+            dict.fromkeys(missing_concepts)
+        ),
         conceptual_relations=[],
         contradictions=[],
         conceptual_coverage=round(coverage, 3),
-        response_profile=_response_profile(response_text),
+        response_profile=_response_profile(
+            response_text
+        ),
         evidence_spans=evidence_spans,
         metadata={
-            "mode": "criterion_centered_semantic_baseline",
+            "mode": "pluggable_semantic_representation",
             "criteria_total": total_criteria,
             "criteria_detected": detected_criteria,
             "coverage_unit": "criterion",
+            "semantic_threshold": threshold,
         },
     )
