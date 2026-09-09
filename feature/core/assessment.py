@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 from .models import (
     AssessmentResult,
+    Criterion,
     CriterionJudgment,
     DiagnosisResult,
     EvaluationInput,
@@ -11,44 +12,56 @@ from .models import (
 )
 
 
-def _criterion_max_score(data: EvaluationInput) -> float:
-    """
-    Distribuye el puntaje máximo de la tarea según los pesos
-    definidos en el AssessmentSpec.
-    """
-    spec = data.task.assessment_spec
-
-    if spec is None or not spec.criteria:
-        return float(data.task.max_score or 0.0)
-
-    total_weight = sum(
-        max(float(criterion.weight or 0.0), 0.0)
-        for criterion in spec.criteria
-    )
-
-    return total_weight or float(data.task.max_score or 0.0)
-
-
-def _criterion_detected(
-    criterion_description: str,
+def _criterion_evidence_map(
     representation: RepresentationResult,
-) -> bool:
+) -> Dict[str, List[str]]:
     """
-    Baseline simple:
-    considera satisfecho un criterio si su descripción o alguna evidencia
-    equivalente aparece entre los conceptos detectados.
+    Organiza la evidencia detectada por criterion_id.
+
+    representation.evidence_spans actúa como puente entre
+    la representación semántica y el juicio evaluativo.
     """
-    target = str(criterion_description or "").strip().lower()
+    evidence_map: Dict[str, List[str]] = {}
 
-    if not target:
-        return False
+    for item in representation.evidence_spans:
+        criterion_id = str(item.get("criterion_id", "")).strip()
 
-    detected = {
-        str(value or "").strip().lower()
-        for value in representation.concepts_detected
-    }
+        if not criterion_id:
+            continue
 
-    return target in detected
+        matched_variants = item.get("matched_variants", [])
+
+        if not isinstance(matched_variants, list):
+            matched_variants = []
+
+        evidence_map[criterion_id] = [
+            str(value)
+            for value in matched_variants
+            if str(value).strip()
+        ]
+
+    return evidence_map
+
+
+def _criterion_max_score(
+    criterion: Criterion,
+    total_weight: float,
+    task_max_score: float,
+) -> float:
+    """
+    Calcula el puntaje máximo asignable a cada criterio
+    a partir de su peso relativo.
+    """
+    weight = max(float(criterion.weight or 0.0), 0.0)
+
+    if total_weight <= 0.0:
+        return 0.0
+
+    return (
+        float(task_max_score or 0.0)
+        * weight
+        / total_weight
+    )
 
 
 def assess(
@@ -56,29 +69,23 @@ def assess(
     representation: RepresentationResult,
 ) -> Tuple[AssessmentResult, DiagnosisResult]:
     """
-    Segunda capa de Evalia Core 2.0.
+    Convierte la evidencia semántica estructurada
+    en un juicio evaluativo.
 
-    Convierte la evidencia representada en un juicio evaluativo básico.
-    Este baseline será reemplazable por motores semánticos y de scoring
-    más sofisticados sin cambiar el contrato externo.
+    El scoring trabaja sobre criterios conceptuales,
+    no sobre coincidencias textuales independientes.
     """
     spec = data.task.assessment_spec
 
     if spec is None or not spec.criteria:
-        score = (
-            float(data.task.max_score)
-            if representation.conceptual_coverage >= 0.8
-            else 0.0
-        )
-
         diagnosis = DiagnosisResult(
             strengths=[],
             gaps=[],
             misconceptions=[],
             error_type=(
-                "insufficient_specification"
-                if representation.response_profile != "empty"
-                else "empty_response"
+                "empty_response"
+                if representation.response_profile == "empty"
+                else "insufficient_specification"
             ),
             error_severity="high",
             metadata={
@@ -88,7 +95,7 @@ def assess(
 
         return (
             AssessmentResult(
-                score=round(score, 3),
+                score=0.0,
                 max_score=float(data.task.max_score or 0.0),
                 criterion_judgments=[],
                 metadata={
@@ -101,7 +108,12 @@ def assess(
     total_weight = sum(
         max(float(criterion.weight or 0.0), 0.0)
         for criterion in spec.criteria
-    ) or 1.0
+    )
+
+    if total_weight <= 0.0:
+        total_weight = float(len(spec.criteria)) or 1.0
+
+    evidence_map = _criterion_evidence_map(representation)
 
     criterion_judgments: List[CriterionJudgment] = []
     strengths: List[str] = []
@@ -110,15 +122,13 @@ def assess(
     total_score = 0.0
 
     for criterion in spec.criteria:
-        satisfied = _criterion_detected(
-            criterion.description,
-            representation,
-        )
+        evidence = evidence_map.get(criterion.id, [])
+        satisfied = bool(evidence)
 
-        criterion_max = (
-            float(data.task.max_score)
-            * max(float(criterion.weight or 0.0), 0.0)
-            / total_weight
+        criterion_max = _criterion_max_score(
+            criterion=criterion,
+            total_weight=total_weight,
+            task_max_score=float(data.task.max_score or 0.0),
         )
 
         criterion_score = criterion_max if satisfied else 0.0
@@ -128,46 +138,61 @@ def assess(
         else:
             gaps.append(criterion.description)
 
+        criterion_confidence = (
+            0.90
+            if satisfied
+            else max(
+                0.0,
+                1.0 - representation.conceptual_coverage,
+            )
+        )
+
         criterion_judgments.append(
             CriterionJudgment(
                 criterion_id=criterion.id,
                 satisfied=satisfied,
                 score=round(criterion_score, 3),
                 max_score=round(criterion_max, 3),
-                confidence=(
-                    representation.conceptual_coverage
-                    if satisfied
-                    else 1.0 - representation.conceptual_coverage
-                ),
-                evidence=[
-                    value
-                    for value in representation.concepts_detected
-                    if str(value).strip().lower()
-                    == str(criterion.description).strip().lower()
-                ],
+                confidence=round(criterion_confidence, 3),
+                evidence=evidence,
                 reason=(
-                    "criterion_detected"
+                    "criterion_supported_by_evidence"
                     if satisfied
-                    else "criterion_not_detected"
+                    else "criterion_without_detected_evidence"
                 ),
                 metadata={
                     "required": criterion.required,
                     "weight": criterion.weight,
+                    "evidence_count": len(evidence),
                 },
             )
         )
 
         total_score += criterion_score
 
+    required_gaps = [
+        criterion.description
+        for criterion in spec.criteria
+        if criterion.required
+        and criterion.id not in evidence_map
+    ]
+
     if representation.response_profile == "empty":
         error_type = "empty_response"
         severity = "high"
+
+    elif required_gaps:
+        error_type = "missing_required_concepts"
+        severity = "high"
+
     elif gaps and strengths:
         error_type = "incomplete_response"
         severity = "medium"
+
     elif gaps and not strengths:
         error_type = "insufficient_evidence"
         severity = "high"
+
     else:
         error_type = "no_evident_error"
         severity = "low"
@@ -179,22 +204,26 @@ def assess(
         error_type=error_type,
         error_severity=severity,
         metadata={
+            "mode": "criterion_centered_assessment",
             "criteria_total": len(spec.criteria),
             "criteria_satisfied": len(strengths),
-            "mode": "baseline_rule_based",
+            "required_gaps": required_gaps,
         },
     )
 
     return (
         AssessmentResult(
             score=round(
-                min(total_score, float(data.task.max_score or 0.0)),
+                min(
+                    total_score,
+                    float(data.task.max_score or 0.0),
+                ),
                 3,
             ),
             max_score=float(data.task.max_score or 0.0),
             criterion_judgments=criterion_judgments,
             metadata={
-                "mode": "baseline_rule_based",
+                "mode": "criterion_centered_assessment",
                 "criterion_weight_total": round(total_weight, 3),
             },
         ),
