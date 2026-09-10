@@ -1,101 +1,72 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from difflib import SequenceMatcher
+from typing import Any, Dict, Optional, Protocol
 import re
 import unicodedata
-from dataclasses import dataclass, field
-from difflib import SequenceMatcher
-from typing import Any, Dict, List, Protocol
 
+
+# ============================================================
+# Normalization utilities
+# ============================================================
 
 def normalize_semantic_text(text: str) -> str:
-    """
-    Normalización lingüística básica y agnóstica al dominio.
-    """
-    text = str(text or "").strip().lower()
-    text = unicodedata.normalize("NFD", text)
-    text = "".join(
-        character
-        for character in text
-        if unicodedata.category(character) != "Mn"
-    )
-    text = re.sub(r"[^\w\s]", " ", text)
+    """Normalize text for transparent lexical comparison."""
+    text = text or ""
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.lower().strip()
     text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    return text
 
 
-def _tokens(text: str) -> List[str]:
-    """
-    Tokenización mínima para el baseline.
-    """
-    return [
-        token
-        for token in normalize_semantic_text(text).split()
-        if token
-    ]
+def _tokens(text: str) -> set[str]:
+    normalized = normalize_semantic_text(text)
+    return set(re.findall(r"\b\w+\b", normalized))
 
 
-def _token_overlap(text_a: str, text_b: str) -> float:
-    """
-    Similaridad por cobertura léxica.
-    No pretende representar significado profundo.
-    """
-    tokens_a = set(_tokens(text_a))
-    tokens_b = set(_tokens(text_b))
+def _token_overlap(a: str, b: str) -> float:
+    tokens_a = _tokens(a)
+    tokens_b = _tokens(b)
 
     if not tokens_a or not tokens_b:
         return 0.0
 
-    intersection = tokens_a.intersection(tokens_b)
+    intersection = len(tokens_a & tokens_b)
+    union = len(tokens_a | tokens_b)
 
-    return len(intersection) / min(
-        len(tokens_a),
-        len(tokens_b),
-    )
+    return intersection / union if union else 0.0
 
 
-def _sequence_similarity(text_a: str, text_b: str) -> float:
-    """
-    Similaridad superficial entre secuencias normalizadas.
-    """
-    normalized_a = normalize_semantic_text(text_a)
-    normalized_b = normalize_semantic_text(text_b)
+def _sequence_similarity(a: str, b: str) -> float:
+    a_norm = normalize_semantic_text(a)
+    b_norm = normalize_semantic_text(b)
 
-    if not normalized_a or not normalized_b:
+    if not a_norm or not b_norm:
         return 0.0
 
-    return SequenceMatcher(
-        None,
-        normalized_a,
-        normalized_b,
-    ).ratio()
+    return SequenceMatcher(None, a_norm, b_norm).ratio()
 
+
+# ============================================================
+# Semantic result contract
+# ============================================================
 
 @dataclass
 class SemanticMatch:
-    """
-    Contrato común para cualquier motor semántico de Evalia.
-    """
-
-    matched: bool
     similarity: float
-    evidence: str = ""
-    reference: str = ""
-    method: str = ""
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    matched: bool
+    method: str
+    evidence: str
+    metadata: Dict[str, Any]
 
+
+# ============================================================
+# Semantic matcher interface
+# ============================================================
 
 class SemanticMatcher(Protocol):
-    """
-    Interfaz que deberá respetar cualquier motor semántico.
-
-    Ejemplos futuros:
-    - embeddings;
-    - modelos multilingües;
-    - LLM;
-    - motores híbridos;
-    - modelos locales.
-    """
-
     def compare(
         self,
         response_text: str,
@@ -105,17 +76,18 @@ class SemanticMatcher(Protocol):
         ...
 
 
+# ============================================================
+# Transparent lexical baseline
+# ============================================================
+
 class BaselineSemanticMatcher:
     """
-    Motor inicial, transparente y sin dependencias externas.
+    Transparent lexical baseline.
 
-    Importante:
-    este matcher todavía NO constituye comprensión semántica profunda.
-    Su función es establecer el contrato arquitectónico que luego
-    podrá ser implementado por motores mucho más potentes.
+    This matcher is intentionally NOT a deep semantic model.
+    It combines explicit substring matching, token overlap,
+    and character-sequence similarity.
     """
-
-    name = "baseline_lexical_similarity"
 
     def compare(
         self,
@@ -124,87 +96,187 @@ class BaselineSemanticMatcher:
         threshold: float = 0.75,
     ) -> SemanticMatch:
 
-        normalized_response = normalize_semantic_text(response_text)
-        normalized_reference = normalize_semantic_text(reference_text)
+        response_norm = normalize_semantic_text(response_text)
+        reference_norm = normalize_semantic_text(reference_text)
 
-        if not normalized_response or not normalized_reference:
+        if not response_norm or not reference_norm:
             return SemanticMatch(
-                matched=False,
                 similarity=0.0,
+                matched=False,
+                method="empty_input",
                 evidence="",
-                reference=reference_text,
-                method=self.name,
                 metadata={
+                    "semantic_model": False,
                     "threshold": threshold,
-                    "empty_input": True,
                 },
             )
 
-        # Coincidencia explícita: evidencia fuerte y totalmente explicable.
-        if normalized_reference in normalized_response:
+        # High-precision explicit evidence
+        if reference_norm in response_norm:
             return SemanticMatch(
-                matched=True,
                 similarity=1.0,
-                evidence=reference_text,
-                reference=reference_text,
+                matched=True,
                 method="explicit_reference_match",
+                evidence=reference_text,
                 metadata={
+                    "semantic_model": False,
                     "threshold": threshold,
                 },
             )
 
-        token_score = _token_overlap(
-            normalized_response,
-            normalized_reference,
-        )
+        token_score = _token_overlap(response_text, reference_text)
+        sequence_score = _sequence_similarity(response_text, reference_text)
 
-        sequence_score = _sequence_similarity(
-            normalized_response,
-            normalized_reference,
-        )
-
-        # Baseline híbrido superficial.
-        similarity = (
-            0.65 * token_score
-            + 0.35 * sequence_score
-        )
-
-        similarity = max(
-            0.0,
-            min(1.0, similarity),
-        )
+        similarity = (0.65 * token_score) + (0.35 * sequence_score)
+        similarity = max(0.0, min(1.0, similarity))
 
         return SemanticMatch(
+            similarity=similarity,
             matched=similarity >= threshold,
-            similarity=round(similarity, 3),
-            evidence=response_text if similarity >= threshold else "",
-            reference=reference_text,
-            method=self.name,
+            method="baseline_lexical_similarity",
+            evidence=reference_text if similarity >= threshold else "",
             metadata={
-                "threshold": threshold,
-                "token_overlap": round(token_score, 3),
-                "sequence_similarity": round(sequence_score, 3),
                 "semantic_model": False,
+                "threshold": threshold,
+                "token_overlap": token_score,
+                "sequence_similarity": sequence_score,
             },
         )
 
 
-DEFAULT_SEMANTIC_MATCHER = BaselineSemanticMatcher()
+# ============================================================
+# Multilingual embedding matcher
+# ============================================================
+
+class EmbeddingSemanticMatcher:
+    """
+    Real semantic matcher based on multilingual sentence embeddings.
+
+    The model is loaded lazily so Evalia can still operate with
+    the lexical baseline if sentence-transformers is unavailable.
+
+    Default model:
+        sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+
+    Supports multilingual semantic comparison, including Spanish
+    and English.
+    """
+
+    def __init__(
+        self,
+        model_name: str = (
+            "sentence-transformers/"
+            "paraphrase-multilingual-MiniLM-L12-v2"
+        ),
+    ):
+        self.model_name = model_name
+        self._model = None
+
+    def _load_model(self):
+        if self._model is not None:
+            return self._model
+
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:
+            raise RuntimeError(
+                "EmbeddingSemanticMatcher requires the "
+                "'sentence-transformers' package."
+            ) from exc
+
+        self._model = SentenceTransformer(self.model_name)
+        return self._model
+
+    def compare(
+        self,
+        response_text: str,
+        reference_text: str,
+        threshold: float = 0.60,
+    ) -> SemanticMatch:
+
+        response_text = (response_text or "").strip()
+        reference_text = (reference_text or "").strip()
+
+        if not response_text or not reference_text:
+            return SemanticMatch(
+                similarity=0.0,
+                matched=False,
+                method="empty_input",
+                evidence="",
+                metadata={
+                    "semantic_model": True,
+                    "model": self.model_name,
+                    "threshold": threshold,
+                },
+            )
+
+        # Preserve exact evidence when available.
+        response_norm = normalize_semantic_text(response_text)
+        reference_norm = normalize_semantic_text(reference_text)
+
+        if reference_norm in response_norm:
+            return SemanticMatch(
+                similarity=1.0,
+                matched=True,
+                method="explicit_reference_match",
+                evidence=reference_text,
+                metadata={
+                    "semantic_model": True,
+                    "model": self.model_name,
+                    "threshold": threshold,
+                },
+            )
+
+        model = self._load_model()
+
+        embeddings = model.encode(
+            [response_text, reference_text],
+            normalize_embeddings=True,
+        )
+
+        # With normalized embeddings, dot product = cosine similarity.
+        similarity = float(embeddings[0] @ embeddings[1])
+
+        # Cosine similarity can theoretically be negative.
+        similarity = max(0.0, min(1.0, similarity))
+
+        return SemanticMatch(
+            similarity=similarity,
+            matched=similarity >= threshold,
+            method="multilingual_embedding_similarity",
+            evidence=reference_text if similarity >= threshold else "",
+            metadata={
+                "semantic_model": True,
+                "model": self.model_name,
+                "threshold": threshold,
+                "cosine_similarity": similarity,
+            },
+        )
+
+
+# ============================================================
+# Default engine and public entry point
+# ============================================================
+
+DEFAULT_SEMANTIC_MATCHER: SemanticMatcher = BaselineSemanticMatcher()
 
 
 def semantic_compare(
     response_text: str,
     reference_text: str,
     threshold: float = 0.75,
-    matcher: SemanticMatcher = DEFAULT_SEMANTIC_MATCHER,
+    matcher: Optional[SemanticMatcher] = None,
 ) -> SemanticMatch:
     """
-    Punto de entrada común para comparación semántica.
+    Public semantic comparison interface.
 
-    El resto de Evalia podrá utilizar esta función sin saber
-    qué modelo concreto existe por debajo.
+    The rest of Evalia should call this function rather than
+    depending directly on a specific semantic engine.
     """
-    return matcher.compare(
+
+    engine = matcher or DEFAULT_SEMANTIC_MATCHER
+
+    return engine.compare(
         response_text=response_text,
         reference_text=reference_text,
         threshold=threshold,
