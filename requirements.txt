@@ -13,3 +13,5 @@ pillow
 
 numpy
 opencv-python-headless
+
+sentence-transformers
