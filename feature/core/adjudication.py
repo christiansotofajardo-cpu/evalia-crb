@@ -11,7 +11,7 @@ from .semantic import (
 
 
 # ============================================================
-# Data model
+# RESULT CONTRACT
 # ============================================================
 
 @dataclass
@@ -20,7 +20,6 @@ class AdjudicationResult:
     score: float
     confidence: float
     rationale: str
-
     evidence: str = ""
     contradiction: bool = False
     partial: bool = False
@@ -40,7 +39,7 @@ class SemanticAdjudicator(Protocol):
 
 
 # ============================================================
-# Helpers
+# CONSTANTS
 # ============================================================
 
 NEGATION_MARKERS = {
@@ -66,24 +65,48 @@ NEGATION_MARKERS = {
 }
 
 
-GENERIC_CONCEPTUAL_CONFLICTS: Sequence[Tuple[Sequence[str], Sequence[str]]] = (
+GENERIC_CONCEPTUAL_CONFLICTS: Sequence[
+    Tuple[Sequence[str], Sequence[str]]
+] = (
     (
         ("temporal", "temporalmente", "temporary", "temporarily"),
-        ("permanente", "permanent", "largo plazo", "long term", "long-term"),
+        (
+            "permanente",
+            "permanently",
+            "permanent",
+            "largo plazo",
+            "long term",
+            "long-term",
+        ),
     ),
     (
-        ("aumenta", "incrementa", "increase", "increases"),
-        ("disminuye", "reduce", "decrease", "decreases", "reduces"),
+        ("aumenta", "incrementa", "aumentar", "increase", "increases"),
+        (
+            "disminuye",
+            "reduce",
+            "disminuir",
+            "decrease",
+            "decreases",
+            "reduces",
+        ),
     ),
     (
-        ("antes", "before", "previo", "previous"),
-        ("despues", "después", "after", "posterior"),
+        ("antes", "previo", "previamente", "before", "previous"),
+        ("despues", "después", "posterior", "after"),
     ),
     (
         ("causa", "produce", "provoca", "causes", "produces"),
-        ("previene", "impide", "prevents", "inhibits"),
+        ("previene", "impide", "inhibe", "prevents", "inhibits"),
     ),
 )
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _bounded(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
 
 
 def _tokens(text: str) -> List[str]:
@@ -91,8 +114,14 @@ def _tokens(text: str) -> List[str]:
     return [token for token in normalized.split() if token]
 
 
-def _bounded(value: float) -> float:
-    return max(0.0, min(1.0, value))
+def _contains_phrase(text: str, phrase: str) -> bool:
+    normalized_text = normalize_semantic_text(text)
+    normalized_phrase = normalize_semantic_text(phrase)
+
+    if not normalized_text or not normalized_phrase:
+        return False
+
+    return normalized_phrase in normalized_text
 
 
 def _contains_negation(text: str) -> bool:
@@ -100,20 +129,14 @@ def _contains_negation(text: str) -> bool:
     return any(marker in tokens for marker in NEGATION_MARKERS)
 
 
-def _negation_mismatch(response: str, reference: str) -> bool:
-    response_negated = _contains_negation(response)
-    reference_negated = _contains_negation(reference)
-    return response_negated != reference_negated
+def _negation_mismatch(
+    response_text: str,
+    reference_text: str,
+) -> bool:
+    response_negation = _contains_negation(response_text)
+    reference_negation = _contains_negation(reference_text)
 
-
-def _contains_phrase(text: str, phrase: str) -> bool:
-    normalized_text = normalize_semantic_text(text)
-    normalized_phrase = normalize_semantic_text(phrase)
-
-    if not normalized_phrase:
-        return False
-
-    return normalized_phrase in normalized_text
+    return response_negation != reference_negation
 
 
 def _declared_incompatible_concepts(
@@ -121,19 +144,27 @@ def _declared_incompatible_concepts(
     context: Optional[Dict[str, Any]],
 ) -> List[str]:
     """
-    Detect misconceptions explicitly declared by the assessment specification.
+    Detect concepts explicitly declared as incompatible with
+    the expected answer.
 
-    Expected context example:
+    Supported context keys:
 
-    context = {
-        "incompatible_concepts": [
-            "memoria de largo plazo",
-            "almacenamiento permanente"
-        ]
-    }
+        incompatible_concepts
+        forbidden_concepts
+        misconception_patterns
 
-    This is intentionally specification-driven rather than hard-coded
-    to one academic domain.
+    Example:
+
+        context={
+            "incompatible_concepts": [
+                "memoria de largo plazo",
+                "recuerdos de largo plazo",
+                "almacenamiento permanente",
+            ]
+        }
+
+    The evaluator does not invent domain-specific misconceptions.
+    They are supplied by the assessment specification.
     """
 
     if not context:
@@ -156,11 +187,11 @@ def _declared_incompatible_concepts(
                 if isinstance(value, str) and value.strip():
                     candidates.append(value.strip())
 
-    detected = [
-        concept
-        for concept in candidates
-        if _contains_phrase(response_text, concept)
-    ]
+    detected: List[str] = []
+
+    for concept in candidates:
+        if _contains_phrase(response_text, concept):
+            detected.append(concept)
 
     return detected
 
@@ -170,61 +201,103 @@ def _generic_conceptual_conflicts(
     reference_text: str,
 ) -> List[Dict[str, Any]]:
     """
-    Conservative generic conflict detector.
+    Detect a small set of conservative conceptual oppositions.
 
-    It only reports a conflict when one side of an opposition appears
-    in the reference and the opposite side appears in the response.
+    A conflict is reported only when:
+    - one pole appears in the reference; and
+    - the opposite pole appears in the response.
+
+    This layer is intentionally small and transparent.
     """
 
     conflicts: List[Dict[str, Any]] = []
 
     for side_a, side_b in GENERIC_CONCEPTUAL_CONFLICTS:
-        reference_has_a = any(
-            _contains_phrase(reference_text, phrase)
-            for phrase in side_a
-        )
-        reference_has_b = any(
-            _contains_phrase(reference_text, phrase)
-            for phrase in side_b
-        )
 
-        response_has_a = any(
-            _contains_phrase(response_text, phrase)
+        reference_a = [
+            phrase
             for phrase in side_a
-        )
-        response_has_b = any(
-            _contains_phrase(response_text, phrase)
-            for phrase in side_b
-        )
+            if _contains_phrase(reference_text, phrase)
+        ]
 
-        if reference_has_a and response_has_b:
+        reference_b = [
+            phrase
+            for phrase in side_b
+            if _contains_phrase(reference_text, phrase)
+        ]
+
+        response_a = [
+            phrase
+            for phrase in side_a
+            if _contains_phrase(response_text, phrase)
+        ]
+
+        response_b = [
+            phrase
+            for phrase in side_b
+            if _contains_phrase(response_text, phrase)
+        ]
+
+        if reference_a and response_b:
             conflicts.append(
                 {
-                    "reference_side": list(side_a),
-                    "response_side": list(side_b),
+                    "reference_terms": reference_a,
+                    "response_terms": response_b,
+                    "type": "conceptual_opposition",
                 }
             )
 
-        elif reference_has_b and response_has_a:
+        elif reference_b and response_a:
             conflicts.append(
                 {
-                    "reference_side": list(side_b),
-                    "response_side": list(side_a),
+                    "reference_terms": reference_b,
+                    "response_terms": response_a,
+                    "type": "conceptual_opposition",
                 }
             )
 
     return conflicts
 
 
+def _base_metadata(
+    *,
+    adjudicator: str,
+    similarity: Optional[float] = None,
+    semantic_method: Optional[str] = None,
+    polarity_conflict: bool = False,
+    misconception_detected: bool = False,
+    task_type: Optional[str] = None,
+    language: str = "auto",
+) -> Dict[str, Any]:
+
+    metadata: Dict[str, Any] = {
+        "semantic_reasoning": True,
+        "adjudicator": adjudicator,
+        "polarity_conflict": polarity_conflict,
+        "misconception_detected": misconception_detected,
+        "task_type": task_type,
+        "language": language,
+        "deep_nli": False,
+        "calibrated": False,
+    }
+
+    if similarity is not None:
+        metadata["semantic_similarity"] = float(similarity)
+
+    if semantic_method is not None:
+        metadata["semantic_method"] = semantic_method
+
+    return metadata
+
+
 # ============================================================
-# Baseline adjudicator
+# BASELINE ADJUDICATOR
 # ============================================================
 
 class BaselineAdjudicator:
     """
-    Conservative placeholder adjudicator.
-
-    Useful when a semantic model is unavailable.
+    Conservative adjudicator for environments where the
+    semantic embedding model is unavailable.
     """
 
     def judge(
@@ -244,10 +317,15 @@ class BaselineAdjudicator:
                 relation="insufficient_evidence",
                 score=0.0,
                 confidence=1.0,
-                rationale="The response is empty.",
+                rationale="The response contains no evaluable evidence.",
+                evidence=response_text,
                 metadata={
                     "adjudicator": "baseline",
+                    "semantic_reasoning": False,
+                    "deep_nli": False,
                     "calibrated": False,
+                    "task_type": task_type,
+                    "language": language,
                 },
             )
 
@@ -260,7 +338,11 @@ class BaselineAdjudicator:
                 evidence=response_text,
                 metadata={
                     "adjudicator": "baseline",
+                    "semantic_reasoning": False,
+                    "deep_nli": False,
                     "calibrated": False,
+                    "task_type": task_type,
+                    "language": language,
                 },
             )
 
@@ -275,29 +357,44 @@ class BaselineAdjudicator:
             evidence=response_text,
             metadata={
                 "adjudicator": "baseline",
+                "semantic_reasoning": False,
+                "deep_nli": False,
                 "calibrated": False,
+                "task_type": task_type,
+                "language": language,
             },
         )
 
 
 # ============================================================
-# Hybrid conceptual adjudicator
+# HYBRID CONCEPTUAL ADJUDICATOR
 # ============================================================
 
 class HybridConceptualAdjudicator:
     """
-    Hybrid conceptual adjudicator v2.
+    Evalia hybrid conceptual adjudicator v2.
 
     Combines:
 
     1. multilingual semantic similarity;
     2. explicit polarity / negation conflict;
-    3. assessment-specification driven misconception detection;
-    4. conservative generic conceptual conflict detection.
+    3. specification-driven misconception detection;
+    4. conservative generic conceptual conflict detection;
+    5. structured adjudication relations.
 
-    This is NOT deep natural-language inference.
+    Current relation space:
 
-    Thresholds and confidence values remain heuristic and
+        correct
+        partially_correct
+        misconception
+        contradictory
+        irrelevant
+        insufficient_evidence
+        undetermined
+
+    Important:
+    This is not deep natural-language inference.
+    Confidence values and thresholds are heuristic and
     are not empirically calibrated probabilities.
     """
 
@@ -340,7 +437,7 @@ class HybridConceptualAdjudicator:
         reference = reference_text.strip()
 
         # ----------------------------------------------------
-        # 1. Evidence sufficiency
+        # 1. EMPTY RESPONSE
         # ----------------------------------------------------
 
         if not response:
@@ -348,17 +445,20 @@ class HybridConceptualAdjudicator:
                 relation="insufficient_evidence",
                 score=0.0,
                 confidence=1.0,
-                rationale="The response contains no evaluable evidence.",
+                rationale=(
+                    "The response contains no evaluable evidence."
+                ),
                 evidence=response_text,
-                metadata={
-                    "semantic_reasoning": True,
-                    "adjudicator": "hybrid_v2",
-                    "deep_nli": False,
-                    "calibrated": False,
-                    "task_type": task_type,
-                    "language": language,
-                },
+                metadata=_base_metadata(
+                    adjudicator="hybrid_v2",
+                    task_type=task_type,
+                    language=language,
+                ),
             )
+
+        # ----------------------------------------------------
+        # 2. VERY SHORT RESPONSE
+        # ----------------------------------------------------
 
         if len(_tokens(response)) < 3:
             return AdjudicationResult(
@@ -370,18 +470,15 @@ class HybridConceptualAdjudicator:
                     "conceptual judgment."
                 ),
                 evidence=response_text,
-                metadata={
-                    "semantic_reasoning": True,
-                    "adjudicator": "hybrid_v2",
-                    "deep_nli": False,
-                    "calibrated": False,
-                    "task_type": task_type,
-                    "language": language,
-                },
+                metadata=_base_metadata(
+                    adjudicator="hybrid_v2",
+                    task_type=task_type,
+                    language=language,
+                ),
             )
 
         # ----------------------------------------------------
-        # 2. Semantic relevance
+        # 3. SEMANTIC SIMILARITY
         # ----------------------------------------------------
 
         semantic_result = self.semantic_matcher.compare(
@@ -391,19 +488,21 @@ class HybridConceptualAdjudicator:
         )
 
         similarity = float(semantic_result.similarity)
+        semantic_method = semantic_result.method
 
         # ----------------------------------------------------
-        # 3. Polarity conflict
+        # 4. EXPLICIT POLARITY CONTRADICTION
         # ----------------------------------------------------
 
         polarity_conflict = _negation_mismatch(
-            response=response,
-            reference=reference,
+            response_text=response,
+            reference_text=reference,
         )
 
         if (
             polarity_conflict
-            and similarity >= self.contradiction_relevance_threshold
+            and similarity
+            >= self.contradiction_relevance_threshold
         ):
             confidence = _bounded(
                 0.70 + (0.30 * similarity)
@@ -414,41 +513,63 @@ class HybridConceptualAdjudicator:
                 score=0.0,
                 confidence=confidence,
                 rationale=(
-                    "The response is semantically related to the reference "
-                    "but presents an opposing explicit polarity."
+                    "The response is semantically related to the "
+                    "reference but presents an opposing explicit "
+                    "polarity."
                 ),
                 evidence=response_text,
                 contradiction=True,
                 partial=False,
-                metadata={
-                    "semantic_reasoning": True,
-                    "adjudicator": "hybrid_v2",
-                    "semantic_similarity": similarity,
-                    "semantic_method": semantic_result.method,
-                    "polarity_conflict": True,
-                    "misconception_detected": False,
-                    "deep_nli": False,
-                    "calibrated": False,
-                    "task_type": task_type,
-                    "language": language,
-                },
+                metadata=_base_metadata(
+                    adjudicator="hybrid_v2",
+                    similarity=similarity,
+                    semantic_method=semantic_method,
+                    polarity_conflict=True,
+                    misconception_detected=False,
+                    task_type=task_type,
+                    language=language,
+                ),
             )
 
         # ----------------------------------------------------
-        # 4. Declared misconceptions
+        # 5. DECLARED MISCONCEPTIONS
         # ----------------------------------------------------
 
-        declared_misconceptions = _declared_incompatible_concepts(
-            response_text=response,
-            context=context,
+        declared_misconceptions = (
+            _declared_incompatible_concepts(
+                response_text=response,
+                context=context,
+            )
         )
 
         if (
             declared_misconceptions
-            and similarity >= self.misconception_relevance_threshold
+            and similarity
+            >= self.misconception_relevance_threshold
         ):
             confidence = _bounded(
                 0.68 + (0.28 * similarity)
+            )
+
+            metadata = _base_metadata(
+                adjudicator="hybrid_v2",
+                similarity=similarity,
+                semantic_method=semantic_method,
+                polarity_conflict=False,
+                misconception_detected=True,
+                task_type=task_type,
+                language=language,
+            )
+
+            metadata.update(
+                {
+                    "misconception_source": (
+                        "assessment_specification"
+                    ),
+                    "detected_incompatible_concepts": (
+                        declared_misconceptions
+                    ),
+                }
             )
 
             return AdjudicationResult(
@@ -456,33 +577,18 @@ class HybridConceptualAdjudicator:
                 score=0.0,
                 confidence=confidence,
                 rationale=(
-                    "The response is semantically related to the target "
-                    "concept but contains a concept explicitly declared "
-                    "as incompatible with the expected answer."
+                    "The response is semantically related to the "
+                    "target concept but contains a concept explicitly "
+                    "declared as incompatible with the expected answer."
                 ),
                 evidence=", ".join(declared_misconceptions),
                 contradiction=False,
                 partial=False,
-                metadata={
-                    "semantic_reasoning": True,
-                    "adjudicator": "hybrid_v2",
-                    "semantic_similarity": similarity,
-                    "semantic_method": semantic_result.method,
-                    "polarity_conflict": False,
-                    "misconception_detected": True,
-                    "misconception_source": "assessment_specification",
-                    "detected_incompatible_concepts": (
-                        declared_misconceptions
-                    ),
-                    "deep_nli": False,
-                    "calibrated": False,
-                    "task_type": task_type,
-                    "language": language,
-                },
+                metadata=metadata,
             )
 
         # ----------------------------------------------------
-        # 5. Generic conceptual conflicts
+        # 6. GENERIC CONCEPTUAL CONFLICT
         # ----------------------------------------------------
 
         generic_conflicts = _generic_conceptual_conflicts(
@@ -492,10 +598,30 @@ class HybridConceptualAdjudicator:
 
         if (
             generic_conflicts
-            and similarity >= self.misconception_relevance_threshold
+            and similarity
+            >= self.misconception_relevance_threshold
         ):
             confidence = _bounded(
                 0.62 + (0.25 * similarity)
+            )
+
+            metadata = _base_metadata(
+                adjudicator="hybrid_v2",
+                similarity=similarity,
+                semantic_method=semantic_method,
+                polarity_conflict=False,
+                misconception_detected=True,
+                task_type=task_type,
+                language=language,
+            )
+
+            metadata.update(
+                {
+                    "misconception_source": (
+                        "generic_conceptual_conflict"
+                    ),
+                    "conceptual_conflicts": generic_conflicts,
+                }
             )
 
             return AdjudicationResult(
@@ -503,31 +629,18 @@ class HybridConceptualAdjudicator:
                 score=0.0,
                 confidence=confidence,
                 rationale=(
-                    "The response is semantically related to the target "
-                    "but contains a conceptual relation that conflicts "
-                    "with the reference."
+                    "The response is semantically related to the "
+                    "target but contains a conceptual relation that "
+                    "conflicts with the reference."
                 ),
                 evidence=response_text,
                 contradiction=False,
                 partial=False,
-                metadata={
-                    "semantic_reasoning": True,
-                    "adjudicator": "hybrid_v2",
-                    "semantic_similarity": similarity,
-                    "semantic_method": semantic_result.method,
-                    "polarity_conflict": False,
-                    "misconception_detected": True,
-                    "misconception_source": "generic_conceptual_conflict",
-                    "conceptual_conflicts": generic_conflicts,
-                    "deep_nli": False,
-                    "calibrated": False,
-                    "task_type": task_type,
-                    "language": language,
-                },
+                metadata=metadata,
             )
 
         # ----------------------------------------------------
-        # 6. Irrelevant response
+        # 7. IRRELEVANT
         # ----------------------------------------------------
 
         if similarity < self.irrelevant_threshold:
@@ -540,26 +653,23 @@ class HybridConceptualAdjudicator:
                 score=0.0,
                 confidence=confidence,
                 rationale=(
-                    "The response shows insufficient semantic relation "
-                    "to the expected content."
+                    "The response shows insufficient semantic "
+                    "relation to the expected content."
                 ),
                 evidence=response_text,
-                metadata={
-                    "semantic_reasoning": True,
-                    "adjudicator": "hybrid_v2",
-                    "semantic_similarity": similarity,
-                    "semantic_method": semantic_result.method,
-                    "polarity_conflict": False,
-                    "misconception_detected": False,
-                    "deep_nli": False,
-                    "calibrated": False,
-                    "task_type": task_type,
-                    "language": language,
-                },
+                contradiction=False,
+                partial=False,
+                metadata=_base_metadata(
+                    adjudicator="hybrid_v2",
+                    similarity=similarity,
+                    semantic_method=semantic_method,
+                    task_type=task_type,
+                    language=language,
+                ),
             )
 
         # ----------------------------------------------------
-        # 7. Undetermined zone
+        # 8. UNDETERMINED
         # ----------------------------------------------------
 
         if similarity < self.partial_threshold:
@@ -568,27 +678,24 @@ class HybridConceptualAdjudicator:
                 score=0.0,
                 confidence=0.50,
                 rationale=(
-                    "The response is related to the target but does not "
-                    "provide enough evidence for a stable conceptual "
-                    "classification."
+                    "The response is related to the target but "
+                    "does not provide enough evidence for a stable "
+                    "conceptual classification."
                 ),
                 evidence=response_text,
-                metadata={
-                    "semantic_reasoning": True,
-                    "adjudicator": "hybrid_v2",
-                    "semantic_similarity": similarity,
-                    "semantic_method": semantic_result.method,
-                    "polarity_conflict": False,
-                    "misconception_detected": False,
-                    "deep_nli": False,
-                    "calibrated": False,
-                    "task_type": task_type,
-                    "language": language,
-                },
+                contradiction=False,
+                partial=False,
+                metadata=_base_metadata(
+                    adjudicator="hybrid_v2",
+                    similarity=similarity,
+                    semantic_method=semantic_method,
+                    task_type=task_type,
+                    language=language,
+                ),
             )
 
         # ----------------------------------------------------
-        # 8. Partial correspondence
+        # 9. PARTIALLY CORRECT
         # ----------------------------------------------------
 
         if similarity < self.correct_threshold:
@@ -601,29 +708,24 @@ class HybridConceptualAdjudicator:
                 score=0.5,
                 confidence=confidence,
                 rationale=(
-                    "The response provides meaningful semantic support "
-                    "but does not reach the conservative threshold for "
-                    "full conceptual correspondence."
+                    "The response provides meaningful semantic "
+                    "support but does not reach the conservative "
+                    "threshold for full conceptual correspondence."
                 ),
                 evidence=response_text,
                 contradiction=False,
                 partial=True,
-                metadata={
-                    "semantic_reasoning": True,
-                    "adjudicator": "hybrid_v2",
-                    "semantic_similarity": similarity,
-                    "semantic_method": semantic_result.method,
-                    "polarity_conflict": False,
-                    "misconception_detected": False,
-                    "deep_nli": False,
-                    "calibrated": False,
-                    "task_type": task_type,
-                    "language": language,
-                },
+                metadata=_base_metadata(
+                    adjudicator="hybrid_v2",
+                    similarity=similarity,
+                    semantic_method=semantic_method,
+                    task_type=task_type,
+                    language=language,
+                ),
             )
 
         # ----------------------------------------------------
-        # 9. Correct
+        # 10. CORRECT
         # ----------------------------------------------------
 
         confidence = _bounded(
@@ -636,33 +738,32 @@ class HybridConceptualAdjudicator:
             confidence=confidence,
             rationale=(
                 "The response shows strong semantic correspondence "
-                "with the reference and no explicit conceptual conflict "
-                "was detected."
+                "with the reference and no explicit conceptual "
+                "conflict was detected."
             ),
             evidence=response_text,
             contradiction=False,
             partial=False,
-            metadata={
-                "semantic_reasoning": True,
-                "adjudicator": "hybrid_v2",
-                "semantic_similarity": similarity,
-                "semantic_method": semantic_result.method,
-                "polarity_conflict": False,
-                "misconception_detected": False,
-                "deep_nli": False,
-                "calibrated": False,
-                "task_type": task_type,
-                "language": language,
-            },
+            metadata=_base_metadata(
+                adjudicator="hybrid_v2",
+                similarity=similarity,
+                semantic_method=semantic_method,
+                task_type=task_type,
+                language=language,
+            ),
         )
 
 
 # ============================================================
-# Public API
+# DEFAULT ENGINE
 # ============================================================
 
 DEFAULT_ADJUDICATOR = HybridConceptualAdjudicator()
 
+
+# ============================================================
+# PUBLIC API
+# ============================================================
 
 def adjudicate(
     response_text: str,
@@ -672,6 +773,12 @@ def adjudicate(
     context: Optional[Dict[str, Any]] = None,
     engine: Optional[SemanticAdjudicator] = None,
 ) -> AdjudicationResult:
+    """
+    Public conceptual adjudication API.
+
+    This function intentionally hides the adjudicator
+    implementation from the rest of Evalia Core.
+    """
 
     adjudicator = engine or DEFAULT_ADJUDICATOR
 
