@@ -112,12 +112,24 @@ def test_evalia_core_pipeline():
     assert result.adjudication
     assert "relation" in result.adjudication
     assert "confidence" in result.adjudication
+    assert "criterion_evidence" in result.representation.metadata
+    assert result.representation.metadata["criterion_evidence"]
+    assert {"matched", "best_similarity", "threshold_margin", "matches"} <= result.representation.metadata["criterion_evidence"][0].keys()
 
     assert result.traceability["assessment_id"] == "demo_assessment"
     assert result.traceability["task_id"] == "task_1"
     assert result.traceability["core_version"] == "2.0-baseline"
 
 
+def test_unmatched_criterion_preserves_evidence():
+    spec = AssessmentSpec(id="unmatched_spec", language="es", criteria=[Criterion(id="missing", description="fotosíntesis", required=True)])
+    task = Task(id="unmatched_task", prompt="Explica la fotosíntesis.", assessment_spec=spec)
+    response = ResponseInput(text="La memoria de trabajo mantiene información temporalmente.", source="text", source_confidence=1.0)
+    data = EvaluationInput(assessment_id="unmatched_assessment", task=task, response=response, language="es", domain="education")
+    result = evaluate(data)
+    assert result.representation.metadata["criterion_evidence"][0]["matched"] is False
+    assert result.representation.metadata["criterion_evidence"][0]["matches"]
 if __name__ == "__main__":
     test_evalia_core_pipeline()
+    test_unmatched_criterion_preserves_evidence()
     print("✅ Evalia Core 2.0 pipeline test passed.")

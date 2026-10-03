@@ -128,7 +128,7 @@ def _match_criterion(
         reverse=True,
     )
 
-    return bool(positive_matches), positive_matches
+    return bool(positive_matches), sorted(matches, key=lambda item: float(item["similarity"]), reverse=True)
 
 
 def represent(data: EvaluationInput) -> RepresentationResult:
@@ -151,6 +151,7 @@ def represent(data: EvaluationInput) -> RepresentationResult:
     detected_concepts: List[str] = []
     missing_concepts: List[str] = []
     evidence_spans: List[Dict[str, object]] = []
+    criterion_evidence: List[Dict[str, object]] = []
 
     total_criteria = 0
     detected_criteria = 0
@@ -167,22 +168,29 @@ def represent(data: EvaluationInput) -> RepresentationResult:
                 threshold=threshold,
             )
 
+            best_match = matches[0] if matches else None
+            threshold_margin = (
+                float(best_match["similarity"]) - threshold if best_match else -threshold
+            )
+            criterion_evidence.append({
+                "criterion_id": criterion.id,
+                "matched": matched,
+                "best_similarity": float(best_match["similarity"]) if best_match else 0.0,
+                "semantic_threshold": threshold,
+                "threshold_margin": threshold_margin,
+                "matches": matches,
+            })
             if matched:
                 detected_criteria += 1
                 detected_concepts.append(
                     criterion.description
                 )
 
-                best_match = matches[0]
 
                 evidence_spans.append(
                     {
-                        "criterion_id": criterion.id,
-                        "concept": criterion.description,
-                        "matched_variants": [
-                            item["variant"]
-                            for item in matches
-                        ],
+                        "criterion_id": criterion.id, "matched": matched, "concept": criterion.description,
+                        "matched_variants": [item["variant"] for item in matches if item["matched"]],
                         "best_variant": best_match["variant"],
                         "best_similarity": best_match["similarity"],
                         "evidence": best_match["evidence"],
@@ -233,5 +241,6 @@ def represent(data: EvaluationInput) -> RepresentationResult:
             "criteria_detected": detected_criteria,
             "coverage_unit": "criterion",
             "semantic_threshold": threshold,
+            "criterion_evidence": criterion_evidence,
         },
     )
