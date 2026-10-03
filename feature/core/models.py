@@ -150,4 +150,5 @@ class EvaliaResult:
     reliability: ReliabilityResult
     delegation: DelegationResult
     feedback: FeedbackResult
+    adjudication: Dict[str, Any] = field(default_factory=dict)
     traceability: Dict[str, Any] = field(default_factory=dict)

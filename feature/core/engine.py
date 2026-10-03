@@ -1,4 +1,6 @@
 from __future__ import annotations
+from .adjudication import adjudicate
+from dataclasses import asdict
 
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -76,6 +78,21 @@ def evaluate(data: EvaluationInput) -> EvaliaResult:
 
     representation = represent(data)
 
+    spec = data.task.assessment_spec
+    conceptual_units = []
+    incompatible_concepts = []
+    if spec is not None and spec.criteria:
+        for criterion in spec.criteria:
+            conceptual_units.append({"id": criterion.id, "description": criterion.description, "variants": criterion.semantic_variants + criterion.accepted_values, "required": criterion.required, "weight": criterion.weight})
+            incompatible_concepts.extend(criterion.contradictory_values)
+    reference_text = " ".join(c.description for c in spec.criteria) if spec is not None and spec.criteria else data.task.prompt
+    adjudication_result = adjudicate(
+        response_text=data.response.text,
+        reference_text=reference_text,
+        task_type=data.task.task_type,
+        context={"conceptual_units": conceptual_units, "incompatible_concepts": incompatible_concepts},
+        language=representation.language,
+    )
     judgment, diagnosis = assess(
         data,
         representation,
@@ -125,5 +142,6 @@ def evaluate(data: EvaluationInput) -> EvaliaResult:
         reliability=reliability,
         delegation=delegation,
         feedback=feedback,
+        adjudication=asdict(adjudication_result),
         traceability=traceability,
     )
