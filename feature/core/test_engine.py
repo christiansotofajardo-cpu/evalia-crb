@@ -109,6 +109,10 @@ def test_evalia_core_pipeline():
     assert result.feedback.summary
     assert result.feedback.language == "es"
 
+    assert result.adjudication
+    assert "relation" in result.adjudication
+    assert "confidence" in result.adjudication
+
     assert result.traceability["assessment_id"] == "demo_assessment"
     assert result.traceability["task_id"] == "task_1"
     assert result.traceability["core_version"] == "2.0-baseline"
