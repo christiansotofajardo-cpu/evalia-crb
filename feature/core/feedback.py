@@ -37,6 +37,7 @@ def _summary_es(
         return "No hay evidencia suficiente para evaluar la respuesta."
 
     if delegation.decision == "HUMAN_REVIEW":
+        hint, scaffold, explanation = "", "", ""
         return (
             "La respuesta contiene evidencia evaluable, pero el juicio requiere "
             "revisión humana antes de considerarse definitivo."
@@ -62,6 +63,7 @@ def _summary_en(
         return "There is not enough evidence to evaluate the response."
 
     if delegation.decision == "HUMAN_REVIEW":
+        hint, scaffold, explanation = "", "", ""
         return (
             "The response contains assessable evidence, but the judgment requires "
             "human review before it should be considered final."
@@ -77,6 +79,23 @@ def _summary_en(
         return "The detected evidence is insufficient to satisfy the current criteria."
 
     return "Evalia generated an assessment judgment from the available evidence."
+
+
+def _build_scaffolding(gaps: list[str], language: str) -> tuple[str, str, str]:
+    if not gaps:
+        return "", "", ""
+    gap = gaps[0]
+    if language == "en":
+        return (
+            f"Think again about this aspect: {gap}.",
+            f"Identify what the task expects about {gap} and connect it explicitly to your response.",
+            f"A complete response should explicitly address this aspect: {gap}.",
+        )
+    return (
+        f"Piensa nuevamente en este aspecto: {gap}.",
+        f"Identifica qué espera la tarea sobre {gap} y relaciónalo explícitamente con tu respuesta.",
+        f"Una respuesta completa debería abordar explícitamente este aspecto: {gap}.",
+    )
 
 
 def generate_feedback(
@@ -98,6 +117,7 @@ def generate_feedback(
 
     strengths = list(diagnosis.strengths)
     gaps = list(diagnosis.gaps)
+    hint, scaffold, explanation = _build_scaffolding(gaps, language)
 
     if language == "en":
         summary = _summary_en(diagnosis, delegation)
@@ -118,6 +138,7 @@ def generate_feedback(
         )
 
     if delegation.decision == "HUMAN_REVIEW":
+        hint, scaffold, explanation = "", "", ""
         if language == "en":
             next_step = (
                 "A human evaluator should review this response before the final "
@@ -134,6 +155,9 @@ def generate_feedback(
         strengths=strengths,
         needs_improvement=gaps,
         next_step=next_step,
+        hint=hint,
+        scaffold=scaffold,
+        explanation=explanation,
         audience="learner",
         language=language,
         metadata={

@@ -3,11 +3,13 @@ from __future__ import annotations
 from .delegation import decide_delegation
 from .reliability import _threshold_margin_risk
 from .engine import evaluate
+from .feedback import generate_feedback
 from .nli import infer_conceptual_relation
 from .models import (
     AssessmentSpec,
     AssessmentResult,
     DiagnosisResult,
+    DelegationResult,
     ReliabilityResult,
     Criterion,
     EvaluationInput,
@@ -156,10 +158,22 @@ def test_configurable_delegation_policy():
     assert result.decision == "HUMAN_REVIEW"
 
 
+def test_pedagogical_scaffolding():
+    data = EvaluationInput(assessment_id="test_feedback", task=Task(id="task_feedback", prompt="Explica el proceso."), response=ResponseInput(text="Respuesta parcial."), language="es")
+    result = generate_feedback(data, RepresentationResult(language="es"), AssessmentResult(), DiagnosisResult(gaps=["la relación entre causa y efecto"]), ReliabilityResult(), DelegationResult(decision="AUTO_ACCEPT"))
+    assert result.hint
+    assert result.scaffold
+    assert result.explanation
+    assert "causa y efecto" in result.hint
+    review = generate_feedback(data, RepresentationResult(language="es"), AssessmentResult(), DiagnosisResult(gaps=["la relación entre causa y efecto"]), ReliabilityResult(), DelegationResult(decision="HUMAN_REVIEW"))
+    assert review.hint == review.scaffold == review.explanation == ""
+
+
 if __name__ == "__main__":
     test_evalia_core_pipeline()
     test_unmatched_criterion_preserves_evidence()
     test_conceptual_nli_relations()
     test_threshold_margin_uncertainty()
     test_configurable_delegation_policy()
+    test_pedagogical_scaffolding()
     print("✅ Evalia Core 2.0 pipeline test passed.")

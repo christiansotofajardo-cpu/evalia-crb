@@ -133,6 +133,9 @@ class FeedbackResult:
     strengths: List[str] = field(default_factory=list)
     needs_improvement: List[str] = field(default_factory=list)
     next_step: str = ""
+    hint: str = ""
+    scaffold: str = ""
+    explanation: str = ""
     audience: str = "learner"
     language: str = "es"
     metadata: Dict[str, Any] = field(default_factory=dict)
