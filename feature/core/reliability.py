@@ -211,6 +211,16 @@ def _semantic_evidence_risk(
     )
 
 
+def _threshold_margin_risk(representation: RepresentationResult) -> float:
+    """Estima incertidumbre por proximidad de los criterios a su umbral semántico."""
+    evidence = representation.metadata.get("criterion_evidence", [])
+    margins = [abs(float(item.get("threshold_margin", 1.0))) for item in evidence]
+    if not margins:
+        return 0.0
+    risks = [max(0.0, 1.0 - margin / 0.15) for margin in margins]
+    return _clamp(sum(risks) / len(risks))
+
+
 def estimate_reliability(
     data: EvaluationInput,
     representation: RepresentationResult,
@@ -249,6 +259,9 @@ def estimate_reliability(
         judgment
     )
 
+    threshold_margin_risk = _threshold_margin_risk(representation)
+
+
     source_risk = _source_risk(data)
     task_risk = _task_type_risk(data)
     diagnostic_risk = _diagnostic_risk(
@@ -266,10 +279,11 @@ def estimate_reliability(
     )
 
     disagreement_risk = (
-        0.30 * coverage_risk
-        + 0.30 * semantic_risk
+        0.25 * coverage_risk
+        + 0.25 * semantic_risk
+        + 0.15 * threshold_margin_risk
         + 0.15 * source_risk
-        + 0.15 * task_risk
+        + 0.10 * task_risk
         + 0.10 * diagnostic_risk
     )
 
@@ -301,6 +315,11 @@ def estimate_reliability(
     if semantic_dispersion >= 0.20:
         risk_factors.append(
             "inconsistent_semantic_evidence"
+        )
+
+    if threshold_margin_risk >= 0.50:
+        risk_factors.append(
+            "borderline_semantic_evidence"
         )
 
     if source_risk >= 0.30:
@@ -373,6 +392,7 @@ def estimate_reliability(
                 semantic_risk,
                 3,
             ),
+            "threshold_margin_risk": round(threshold_margin_risk, 3),
             "source_risk": round(
                 source_risk,
                 3,

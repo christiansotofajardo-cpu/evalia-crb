@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+from .delegation import decide_delegation
+from .reliability import _threshold_margin_risk
 from .engine import evaluate
 from .nli import infer_conceptual_relation
 from .models import (
     AssessmentSpec,
+    AssessmentResult,
+    DiagnosisResult,
+    ReliabilityResult,
     Criterion,
     EvaluationInput,
     Learner,
     ResponseInput,
+    RepresentationResult,
     Task,
 )
 
@@ -137,8 +143,23 @@ def test_conceptual_nli_relations():
     assert f("La fotosíntesis consume oxígeno.", "La fotosíntesis produce oxígeno.", 0.70, 0.75, ["consume oxígeno"]).relation == "contradiction"
 
 
+def test_threshold_margin_uncertainty():
+    near = RepresentationResult(metadata={"criterion_evidence": [{"threshold_margin": 0.01}]})
+    far = RepresentationResult(metadata={"criterion_evidence": [{"threshold_margin": 0.50}]})
+    assert _threshold_margin_risk(near) > _threshold_margin_risk(far)
+
+
+def test_configurable_delegation_policy():
+    spec = AssessmentSpec(reliability_policy={"caution_threshold": 0.10, "human_review_threshold": 0.25})
+    data = EvaluationInput(assessment_id="test_assessment", task=Task(id="test_task", prompt="Test", assessment_spec=spec), response=ResponseInput(text="Respuesta suficiente."))
+    result = decide_delegation(data, RepresentationResult(response_profile="substantive"), AssessmentResult(), DiagnosisResult(), ReliabilityResult(confidence=0.70, disagreement_risk=0.30, reliability_class="medium"))
+    assert result.decision == "HUMAN_REVIEW"
+
+
 if __name__ == "__main__":
     test_evalia_core_pipeline()
     test_unmatched_criterion_preserves_evidence()
     test_conceptual_nli_relations()
+    test_threshold_margin_uncertainty()
+    test_configurable_delegation_policy()
     print("✅ Evalia Core 2.0 pipeline test passed.")

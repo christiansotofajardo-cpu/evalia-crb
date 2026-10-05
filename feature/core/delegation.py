@@ -47,13 +47,18 @@ def decide_delegation(
                 },
             )
 
+    spec = data.task.assessment_spec
+    policy = spec.reliability_policy if spec is not None else {}
+    caution_threshold = float(policy.get("caution_threshold", 0.20))
+    human_review_threshold = float(policy.get("human_review_threshold", 0.45))
+
     risk = float(reliability.disagreement_risk)
 
-    if risk >= 0.45:
+    if risk >= human_review_threshold:
         decision = "HUMAN_REVIEW"
         reason = "high_disagreement_risk"
 
-    elif risk >= 0.20:
+    elif risk >= caution_threshold:
         decision = "ACCEPT_WITH_CAUTION"
         reason = "moderate_disagreement_risk"
 

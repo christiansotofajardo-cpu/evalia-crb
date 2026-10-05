@@ -230,6 +230,7 @@ def represent(data: EvaluationInput) -> RepresentationResult:
     if language == "auto":
         language = "unknown"
 
+    nli_contradictions = [item["criterion_id"] for item in criterion_evidence if item.get("nli", {}).get("relation") == "contradiction"]
     return RepresentationResult(
         language=language,
         concepts_detected=list(
@@ -239,7 +240,7 @@ def represent(data: EvaluationInput) -> RepresentationResult:
             dict.fromkeys(missing_concepts)
         ),
         conceptual_relations=[],
-        contradictions=[],
+        contradictions=nli_contradictions,
         conceptual_coverage=round(coverage, 3),
         response_profile=_response_profile(
             response_text
