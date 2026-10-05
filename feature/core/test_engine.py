@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .engine import evaluate
+from .nli import infer_conceptual_relation
 from .models import (
     AssessmentSpec,
     Criterion,
@@ -114,7 +115,7 @@ def test_evalia_core_pipeline():
     assert "confidence" in result.adjudication
     assert "criterion_evidence" in result.representation.metadata
     assert result.representation.metadata["criterion_evidence"]
-    assert {"matched", "best_similarity", "threshold_margin", "matches"} <= result.representation.metadata["criterion_evidence"][0].keys()
+    assert {"matched", "best_similarity", "threshold_margin", "matches", "nli"} <= result.representation.metadata["criterion_evidence"][0].keys()
 
     assert result.traceability["assessment_id"] == "demo_assessment"
     assert result.traceability["task_id"] == "task_1"
@@ -129,7 +130,15 @@ def test_unmatched_criterion_preserves_evidence():
     result = evaluate(data)
     assert result.representation.metadata["criterion_evidence"][0]["matched"] is False
     assert result.representation.metadata["criterion_evidence"][0]["matches"]
+def test_conceptual_nli_relations():
+    f = infer_conceptual_relation
+    assert f("La fotosíntesis transforma energía luminosa en energía química.", "La fotosíntesis transforma energía luminosa en energía química.", 1.0, 0.75).relation == "entailment"
+    assert f("La memoria de trabajo mantiene información temporalmente.", "La fotosíntesis transforma energía luminosa en energía química.", 0.20, 0.75).relation == "neutral"
+    assert f("La fotosíntesis consume oxígeno.", "La fotosíntesis produce oxígeno.", 0.70, 0.75, ["consume oxígeno"]).relation == "contradiction"
+
+
 if __name__ == "__main__":
     test_evalia_core_pipeline()
     test_unmatched_criterion_preserves_evidence()
+    test_conceptual_nli_relations()
     print("✅ Evalia Core 2.0 pipeline test passed.")
