@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple
 from .models import Criterion, EvaluationInput, RepresentationResult
 from .semantic import semantic_compare
 from .nli import infer_conceptual_relation
+from .refinement import refine_borderline_evidence
 
 
 def _normalize_text(text: str) -> str:
@@ -173,6 +174,12 @@ def represent(data: EvaluationInput) -> RepresentationResult:
             threshold_margin = (
                 float(best_match["similarity"]) - threshold if best_match else -threshold
             )
+            refinement = refine_borderline_evidence(
+                response_text=response_text,
+                reference_text=criterion.description,
+                original_similarity=float(best_match["similarity"]) if best_match else 0.0,
+                semantic_threshold=threshold,
+            )
             nli_result = infer_conceptual_relation(
                 response_text=response_text,
                 reference_text=criterion.description,
@@ -186,6 +193,7 @@ def represent(data: EvaluationInput) -> RepresentationResult:
                 "best_similarity": float(best_match["similarity"]) if best_match else 0.0,
                 "semantic_threshold": threshold,
                 "threshold_margin": threshold_margin,
+                "refinement": {"activated": refinement.activated, "original_similarity": refinement.original_similarity, "refined_similarity": refinement.refined_similarity, "reason": refinement.reason, "metadata": refinement.metadata},
                 "nli": {"relation": nli_result.relation, "confidence": nli_result.confidence, "evidence": nli_result.evidence, "metadata": nli_result.metadata},
                 "matches": matches,
             })

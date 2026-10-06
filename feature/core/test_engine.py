@@ -5,6 +5,7 @@ from .reliability import _threshold_margin_risk
 from .engine import evaluate
 from .feedback import generate_feedback
 from .nli import infer_conceptual_relation
+from .refinement import is_borderline, refine_borderline_evidence
 from .models import (
     AssessmentSpec,
     AssessmentResult,
@@ -169,6 +170,20 @@ def test_pedagogical_scaffolding():
     assert review.hint == review.scaffold == review.explanation == ""
 
 
+def test_refinement_selection():
+    assert is_borderline(0.05)
+    assert is_borderline(-0.10)
+    assert not is_borderline(0.30)
+    result = refine_borderline_evidence("respuesta", "criterio", 0.30, 0.75)
+    assert result.activated is False
+    assert result.refined_similarity == result.original_similarity
+    borderline = refine_borderline_evidence("La fotosíntesis transforma energía luminosa en energía química.", "La fotosíntesis convierte energía luminosa en energía química.", 0.70, 0.75)
+    assert borderline.activated is True
+    assert borderline.reason == "borderline_semantic_evidence"
+    assert 0.0 <= borderline.refined_similarity <= 1.0
+    assert borderline.metadata["method"]
+
+
 if __name__ == "__main__":
     test_evalia_core_pipeline()
     test_unmatched_criterion_preserves_evidence()
@@ -176,4 +191,5 @@ if __name__ == "__main__":
     test_threshold_margin_uncertainty()
     test_configurable_delegation_policy()
     test_pedagogical_scaffolding()
+    test_refinement_selection()
     print("✅ Evalia Core 2.0 pipeline test passed.")
