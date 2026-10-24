@@ -1,0 +1,206 @@
+
+name: Evalia 3.0 - comprobaciones tecnicas
+
+on:
+  push:
+    branches:
+      - feature/evalia-3-rubrica-universal
+    paths:
+      - "feature/core/**"
+      - ".github/workflows/evalia3-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pruebas:
+    name: Importacion, rubricas y rutas seguras
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Obtener codigo
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Comprobar sintaxis del nucleo
+        run: python -m compileall -q feature/core
+
+      - name: Probar integracion sin OCR ni APIs
+        shell: bash
+        run: |
+          python - <<'PY'
+          from unittest.mock import patch
+
+          from feature.core.rubric_v3 import (
+              compile_question,
+              RubricValidationError,
+          )
+          from feature.core.models import (
+              EvaluationInput,
+              ResponseInput,
+          )
+          from feature.core.engine import evaluate
+
+
+          def task(tipo, maximo=1, criterios=None, **extras):
+              return compile_question({
+                  "id": "P1",
+                  "enunciado": "Pregunta de prueba",
+                  "tipo": tipo,
+                  "maximo": maximo,
+                  "aprobada": True,
+                  "criterios": criterios or [],
+                  **extras,
+              }, assessment_id="CI-3", domain="general")
+
+
+          def run(t, texto):
+              return evaluate(EvaluationInput(
+                  assessment_id="CI-3",
+                  task=t,
+                  response=ResponseInput(text=texto),
+                  language="es",
+              ))
+
+
+          def check(test, message):
+              if not test:
+                  raise AssertionError(message)
+              print("OK:", message)
+
+
+          # 1. Respetar los puntos del profesor.
+          t = task("abierta", maximo=3, criterios=[
+              {
+                  "id": "C1",
+                  "descripcion": "Primera idea",
+                  "puntos": 2,
+              },
+              {
+                  "id": "C2",
+                  "descripcion": "Segunda idea",
+                  "puntos": 1,
+              },
+          ])
+          check(
+              [c.weight for c in t.assessment_spec.criteria]
+              == [2, 1],
+              "La rubrica conserva 2+1 puntos",
+          )
+
+          # 2. Rechazar rubricas inconsistentes.
+          try:
+              task("abierta", maximo=4, criterios=[
+                  {
+                      "id": "C1",
+                      "descripcion": "Idea",
+                      "puntos": 2,
+                  },
+              ])
+          except RubricValidationError:
+              print("OK: Pauta incompatible rechazada")
+          else:
+              raise AssertionError(
+                  "Se acepto una pauta incorrecta"
+              )
+
+          # 3. V/F debe corregirse por clave exacta.
+          with patch(
+              "feature.core.engine.represent",
+              side_effect=AssertionError(
+                  "No se debe usar el motor semantico"
+              ),
+          ):
+              correct = run(
+                  task("verdadero_falso", clave="V"), "V"
+              )
+              incorrect = run(
+                  task("verdadero_falso", clave="V"), "F"
+              )
+
+          check(
+              correct.judgment.score == 1
+              and incorrect.judgment.score == 0,
+              "V/F utiliza la clave exacta",
+          )
+
+          # 4. Las notas no son definitivas.
+          check(
+              correct.traceability[
+                  "final_grade_authorized"
+              ] is False
+              and correct.delegation.decision
+              not in {"AUTO_ACCEPT", "ACCEPT_WITH_CAUTION"},
+              "La nota v3 sigue siendo provisional",
+          )
+
+          # 5. Completar: respuesta aprobada.
+          completion = run(
+              task(
+                  "completar",
+                  respuesta_esperada="fonema",
+              ),
+              "fonema",
+          )
+          check(
+              completion.judgment.score == 1,
+              "Completar utiliza respuesta aprobada",
+          )
+
+          # 6. Matematicas requieren validador.
+          numeric = run(
+              task("numerica", criterios=[
+                  {
+                      "id": "C1",
+                      "descripcion": "Resultado correcto",
+                      "puntos": 1,
+                  },
+              ]),
+              "5",
+          )
+          check(
+              numeric.judgment.score == 0
+              and numeric.judgment.metadata[
+                  "unscored_criteria"
+              ] == ["C1"]
+              and numeric.traceability[
+                  "final_grade_authorized"
+              ] is False,
+              "Matematicas queda pendiente de validar",
+          )
+
+          # 7. Fallo semantico: revision humana.
+          with patch(
+              "feature.core.engine.represent",
+              side_effect=RuntimeError("Modelo ausente"),
+          ):
+              pending = run(
+                  task("abierta", criterios=[
+                      {
+                          "id": "C1",
+                          "descripcion": "Explicacion causal",
+                          "puntos": 1,
+                      },
+                  ]),
+                  "Respuesta potencialmente correcta",
+              )
+
+          check(
+              pending.judgment.metadata[
+                  "unscored_criteria"
+              ] == ["C1"]
+              and pending.delegation.decision
+              == "HUMAN_REVIEW",
+              "Modelo ausente exige revision humana",
+          )
+
+          print(
+              "Pruebas tecnicas Evalia 3.0 completadas."
+          )
+          PY
