@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - feature/evalia-3-rubrica-universal
+      - feature/evalia-3-1-ajustes-semanticos
     paths:
       - "feature/core/**"
       - ".github/workflows/evalia3-tests.yml"
