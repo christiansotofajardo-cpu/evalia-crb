@@ -162,12 +162,44 @@ def compile_question(
             raise RubricValidationError(f"{c_id}: evidencia aceptada y contradictoria se solapan.")
         if not isinstance(item.get("obligatorio", False), bool):
             raise RubricValidationError(f"{c_id}.obligatorio debe ser verdadero o falso.")
+
+        # Los observables son criterios atomicos aprobados por el docente,
+        # no una expansion automatica de la descripcion general.
+        observables = item.get("observables", [])
+        if not isinstance(observables, list):
+            raise RubricValidationError(f"{c_id}.observables debe ser una lista.")
+        parsed_observables = []
+        for oi, obs in enumerate(observables, 1):
+            if not isinstance(obs, Mapping):
+                raise RubricValidationError(f"{c_id}: observable inválido.")
+            obs_desc = _require_text(obs.get("descripcion"), "observable.descripcion")
+            obs_variants = _strings(obs.get("variantes"), "observable.variantes")
+            obs_peso = _points(obs.get("peso", 1), "observable.peso")
+            parsed_observables.append({
+                "id": f"{c_id}_U{oi}", "description": obs_desc,
+                "variants": obs_variants,
+                "required": True, "weight": float(obs_peso),
+            })
+
+        credit = item.get("credito_por_unidad", False)
+        if not isinstance(credit, bool):
+            raise RubricValidationError(f"{c_id}.credito_por_unidad debe ser booleano.")
+        if credit and len(parsed_observables) < 2:
+            raise RubricValidationError(
+                f"{c_id}: el crédito proporcional exige al menos dos observables."
+            )
+
         criteria.append(Criterion(
             id=c_id, description=description, weight=float(points),
             required=item.get("obligatorio", False),
             semantic_variants=variants, accepted_values=accepted,
             contradictory_values=contradictory,
-            metadata={"explicit_points": str(points), "rubric_version": VERSION},
+            metadata={
+                "explicit_points": str(points), "rubric_version": VERSION,
+                "observables": parsed_observables,
+                "credito_por_unidad": credit,
+                "observables_aprobados": bool(parsed_observables),
+            },
         ))
         sum_points += points
 
