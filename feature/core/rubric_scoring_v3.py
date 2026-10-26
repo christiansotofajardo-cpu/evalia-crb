@@ -1,7 +1,7 @@
 
 from __future__ import annotations
 
-"""Evalia 3.0: puntuación orientada por rúbrica (NO calificación certificada).
+"""Evalia 3.1: puntuación orientada por rúbrica (NO calificación certificada).
 
 No utiliza similitud semántica como puntos ni equipara similitud con confianza.
 Una decisión semántica no verificada implica revisión; no genera crédito
@@ -156,19 +156,63 @@ def assess_v3(
             )
             if contradiction or nli_conflict or relation in {'contradictory', 'misconception'}:
                 status, reason = 'unresolved', 'conceptual_conflict_needs_review'
-            elif relation == 'correct':
-                score, status, reason = point_max, 'correct', 'conceptual_judgment_correct'
-                evidence = [str(_adjudication_property(a, 'evidence', response))]
-            elif relation == 'partially_correct':
-                # La categoría "parcial" no autoriza regalar el 50%.
-                # Debe existir una regla aprobada para otorgar puntos parciales.
-                fraction = criterion.metadata.get('partial_credit_fraction')
-                fraction = _finite_nonnegative(fraction)
-                if fraction is not None and 0.0 < fraction < 1.0 and is_v3:
-                    score, status, reason = point_max * fraction, 'partial', 'teacher_authorized_partial_credit'
+            elif relation in {'correct', 'partially_correct'}:
+                # Evalia 3.1: adjudicación conceptual y crédito son decisiones
+                # distintas. Validar también la procedencia de los observables.
+                approval = bool(criterion.metadata.get('observables_aprobados'))
+                atomics = criterion.metadata.get('observables', [])
+                meta = _adjudication_property(a, 'metadata', {})
+                reported = (meta.get('conceptual_unit_results', [])
+                            if isinstance(meta, Mapping) else [])
+                expected_ids = {str(u.get('id')) for u in atomics if isinstance(u, Mapping)}
+                reported_ids = {str(u.get('id')) for u in reported if isinstance(u, Mapping)}
+                valid_units = bool(
+                    approval and atomics and isinstance(reported, list)
+                    and len(reported) == len(atomics)
+                    and reported_ids == expected_ids
+                )
+                coverage = (_finite_nonnegative(meta.get('required_conceptual_coverage'))
+                            if isinstance(meta, Mapping) and valid_units else None)
+                if coverage is not None and coverage > 1.0:
+                    coverage = None
+
+                if approval and not valid_units:
+                    # Por ejemplo: engine.py aún no envía observables separados.
+                    status, reason = 'unresolved', 'approved_observable_evidence_missing'
+                elif approval and coverage is None:
+                    status, reason = 'unresolved', 'approved_observable_coverage_missing'
+                elif approval and coverage < 1.0:
+                    if (criterion.metadata.get('credito_por_unidad') is True
+                            and is_v3 and coverage > 0.0):
+                        score = point_max * coverage
+                        status, reason = 'partial', 'teacher_authorized_unit_coverage'
+                        evidence = [str(_adjudication_property(a, 'evidence', response))]
+                    else:
+                        status, reason = 'unresolved', 'partial_credit_not_authorized'
+                elif approval and relation == 'correct':
+                    score, status, reason = point_max, 'correct', 'all_approved_observables_met'
                     evidence = [str(_adjudication_property(a, 'evidence', response))]
+                elif approval:
+                    # Si la adjudicación aún considera parcial una cobertura
+                    # aparentemente completa, no transformar en crédito pleno.
+                    status, reason = 'unresolved', 'semantic_unit_disagreement'
+                elif relation == 'correct':
+                    # No confundir similitud global con elementos enumerados.
+                    if data.task.task_type == 'enumeration':
+                        status, reason = 'unresolved', 'enumeration_needs_atomic_observables'
+                    elif 'con ejemplo' in _normalize(criterion.description):
+                        status, reason = 'unresolved', 'definition_and_example_need_independent_evidence'
+                    else:
+                        score, status, reason = point_max, 'correct', 'conceptual_judgment_correct'
+                        evidence = [str(_adjudication_property(a, 'evidence', response))]
                 else:
-                    status, reason = 'unresolved', 'partial_credit_not_specified'
+                    # Conservar política histórica explícita de crédito parcial.
+                    fraction = _finite_nonnegative(criterion.metadata.get('partial_credit_fraction'))
+                    if fraction is not None and 0.0 < fraction < 1.0 and is_v3:
+                        score, status, reason = point_max * fraction, 'partial', 'teacher_authorized_partial_credit'
+                        evidence = [str(_adjudication_property(a, 'evidence', response))]
+                    else:
+                        status, reason = 'unresolved', 'partial_credit_not_specified'
             elif relation == 'irrelevant':
                 status, reason = 'incorrect', 'evidence_irrelevant'
             else:
@@ -194,6 +238,11 @@ def assess_v3(
                 'rubric_status': status, 'criterion_points': point_max,
                 'similarity_not_calibrated': True,
                 'required': criterion.required,
+                'semantic_relation': str(_adjudication_property(a, 'relation', 'not_assessed')),
+                'evidence_units': (
+                    _adjudication_property(a, 'metadata', {}).get('conceptual_unit_results', [])
+                    if isinstance(_adjudication_property(a, 'metadata', {}), Mapping) else []
+                ),
             },
         ))
 
