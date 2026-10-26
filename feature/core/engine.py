@@ -24,7 +24,7 @@ from .representation import represent
 from .rubric_scoring_v3 import assess_v3
 
 RUBRIC_VERSION = "evalia-rubric-3.0-1"
-CORE_VERSION = "3.0-rubric-criterion-pilot"
+CORE_VERSION = "3.1-semantic-evidence-pilot"
 
 NONSEMANTIC_ROUTES = {
     "exact",
@@ -76,8 +76,10 @@ def _criterion_adjudications(
 
     for criterion in spec.criteria:
         context = {
-            "conceptual_units": [
-                {
+            "conceptual_units": (
+                list(criterion.metadata.get("observables", []))
+                if criterion.metadata.get("observables_aprobados")
+                else [{
                     "id": criterion.id,
                     "description": criterion.description,
                     "variants": (
@@ -86,8 +88,8 @@ def _criterion_adjudications(
                     ),
                     "required": True,
                     "weight": 1.0,
-                }
-            ],
+                }]
+            ),
             "incompatible_concepts": list(
                 criterion.contradictory_values
             ),
