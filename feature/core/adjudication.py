@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -201,7 +202,12 @@ def _contains_phrase(text: str, phrase: str) -> bool:
     if not normalized_text or not normalized_phrase:
         return False
 
-    return normalized_phrase in normalized_text
+    # Evita coincidencias dentro de otras palabras (p. ej. "no" en "norte").
+    import re
+    return re.search(
+        r"(?<!\w)" + re.escape(normalized_phrase) + r"(?!\w)",
+        normalized_text,
+    ) is not None
 
 
 def _contains_negation(text: str) -> bool:
@@ -368,7 +374,6 @@ def _base_metadata(
         metadata["semantic_method"] = semantic_method
 
     return metadata
-
 
 
 def _conceptual_units_from_context(
@@ -789,21 +794,36 @@ class HybridConceptualAdjudicator:
         # ----------------------------------------------------
 
         if len(_tokens(response)) < 3:
-            return AdjudicationResult(
-                relation="insufficient_evidence",
-                score=0.0,
-                confidence=0.85,
-                rationale=(
-                    "The response is too brief to support a reliable "
-                    "conceptual judgment."
-                ),
-                evidence=response_text,
-                metadata=_base_metadata(
-                    adjudicator="hybrid_v3",
-                    task_type=task_type,
-                    language=language,
-                ),
+            # La brevedad por sí sola no invalida evidencia conceptual.
+            # Sin embargo, un término aislado sin una realización expresamente
+            # autorizada no basta para calificar una explicación completa.
+            units = _conceptual_units_from_context(context)
+            choices = [reference]
+            for unit in units:
+                choices += [
+                    unit.get("description", "")
+                ] + list(unit.get("variants", []))
+            explicit = any(
+                normalize_semantic_text(response) ==
+                normalize_semantic_text(x)
+                for x in choices if x
             )
+            if not explicit:
+                return AdjudicationResult(
+                    relation="undetermined",
+                    score=0.0,
+                    confidence=0.0,
+                    rationale=(
+                        "Respuesta breve sin equivalencia autorizada; "
+                        "revisar contexto."
+                    ),
+                    evidence=response_text,
+                    metadata=_base_metadata(
+                        adjudicator="hybrid_v3",
+                        task_type=task_type,
+                        language=language,
+                    ),
+                )
 
         # ----------------------------------------------------
         # 3. SEMANTIC SIMILARITY
