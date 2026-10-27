@@ -1,7 +1,7 @@
 
 from __future__ import annotations
 
-"""Evalia 3.0: contrato universal de rúbricas revisadas por docentes.
+"""Evalia 3.2: contrato universal y control de evidencias aprobadas.
 
 Traduce una pauta simple a Task/AssessmentSpec/Criterion sin asignar notas.
 No extrae conceptos de listas de palabras ni inventa ponderaciones.
@@ -17,7 +17,8 @@ import unicodedata
 from .models import AssessmentSpec, Criterion, Task
 
 
-VERSION = "evalia-rubric-3.0-1"
+VERSION = "evalia-rubric-3.0-1"  # Mantener compatibilidad del motor 3.1.
+EVIDENCE_CONTRACT = "evalia-evidence-3.2-provisional"
 
 TYPES = {
     "abierta": ("constructed_response", "semantic"),
@@ -163,42 +164,120 @@ def compile_question(
         if not isinstance(item.get("obligatorio", False), bool):
             raise RubricValidationError(f"{c_id}.obligatorio debe ser verdadero o falso.")
 
-        # Los observables son criterios atomicos aprobados por el docente,
-        # no una expansion automatica de la descripcion general.
+        # Evidencias atomicas: solo se activan con aprobacion expresa.
+        # Las propuestas externas de Psicolinguistica permanecen inertes.
         observables = item.get("observables", [])
         if not isinstance(observables, list):
             raise RubricValidationError(f"{c_id}.observables debe ser una lista.")
-        parsed_observables = []
-        for oi, obs in enumerate(observables, 1):
-            if not isinstance(obs, Mapping):
-                raise RubricValidationError(f"{c_id}: observable inválido.")
-            obs_desc = _require_text(obs.get("descripcion"), "observable.descripcion")
-            obs_variants = _strings(obs.get("variantes"), "observable.variantes")
-            obs_peso = _points(obs.get("peso", 1), "observable.peso")
-            parsed_observables.append({
-                "id": f"{c_id}_U{oi}", "description": obs_desc,
-                "variants": obs_variants,
-                "required": True, "weight": float(obs_peso),
-            })
 
         credit = item.get("credito_por_unidad", False)
         if not isinstance(credit, bool):
             raise RubricValidationError(f"{c_id}.credito_por_unidad debe ser booleano.")
-        if credit and len(parsed_observables) < 2:
+
+        aprobacion = item.get("evidencias_aprobadas", False)
+        if not isinstance(aprobacion, bool):
+            raise RubricValidationError(f"{c_id}.evidencias_aprobadas debe ser booleano.")
+
+        if observables and not aprobacion:
             raise RubricValidationError(
-                f"{c_id}: el crédito proporcional exige al menos dos observables."
+                f"{c_id}: hay observables no aprobados expresamente por el docente."
+            )
+        if credit and not aprobacion:
+            raise RubricValidationError(
+                f"{c_id}: el credito por unidad requiere aprobacion expresa."
+            )
+        if credit and len(observables) < 2:
+            raise RubricValidationError(
+                f"{c_id}: el credito proporcional requiere dos o mas observables."
+            )
+
+        if q_type in {"verdadero_falso", "seleccion_multiple", "completar",
+                      "numerica", "procedimiento_matematico"} and observables:
+            raise RubricValidationError(
+                f"{c_id}: los observables semanticos no se habilitan en esta ruta."
+            )
+
+        parsed_observables: List[Dict[str, Any]] = []
+        seen_evidence = set()
+        used_unit_ids = set()
+
+        for oi, obs in enumerate(observables, 1):
+            if not isinstance(obs, Mapping):
+                raise RubricValidationError(f"{c_id}: observable {oi} invalido.")
+
+            unit_id = _require_text(
+                obs.get("id", f"{c_id}_U{oi}"),
+                "observable.id"
+            )
+            if unit_id in used_unit_ids:
+                raise RubricValidationError(
+                    f"{c_id}: ID observable repetido: {unit_id}."
+                )
+            used_unit_ids.add(unit_id)
+
+            obs_desc = _require_text(
+                obs.get("descripcion"),
+                "observable.descripcion"
+            )
+            obs_variants = _strings(
+                obs.get("variantes"),
+                "observable.variantes"
+            )
+            obs_accepted = _strings(
+                obs.get("aceptadas"),
+                "observable.aceptadas"
+            )
+            obs_weight = _points(
+                obs.get("peso", 1),
+                "observable.peso"
+            )
+
+            if obs.get("obligatorio", True) is not True:
+                raise RubricValidationError(
+                    f"{c_id}: los observables opcionales necesitan politica adicional."
+                )
+
+            # No acreditar dos unidades distintas por la misma formulacion exacta.
+            unit_phrases = {
+                _normalize(phrase)
+                for phrase in [obs_desc] + obs_variants + obs_accepted
+            }
+            if seen_evidence.intersection(unit_phrases):
+                raise RubricValidationError(
+                    f"{c_id}: hay evidencia duplicada entre dos observables."
+                )
+            seen_evidence.update(unit_phrases)
+
+            parsed_observables.append({
+                "id": unit_id,
+                "description": obs_desc,
+                "variants": obs_variants + obs_accepted,
+                "required": True,
+                "weight": float(obs_weight),
+            })
+
+        if not parsed_observables and aprobacion:
+            raise RubricValidationError(
+                f"{c_id}: evidencias_aprobadas no puede ser verdadero sin observables."
             )
 
         criteria.append(Criterion(
-            id=c_id, description=description, weight=float(points),
+            id=c_id,
+            description=description,
+            weight=float(points),
             required=item.get("obligatorio", False),
-            semantic_variants=variants, accepted_values=accepted,
+            semantic_variants=variants,
+            accepted_values=accepted,
             contradictory_values=contradictory,
             metadata={
-                "explicit_points": str(points), "rubric_version": VERSION,
+                "explicit_points": str(points),
+                "rubric_version": VERSION,
                 "observables": parsed_observables,
                 "credito_por_unidad": credit,
-                "observables_aprobados": bool(parsed_observables),
+                "observables_aprobados": (
+                    bool(parsed_observables) and aprobacion
+                ),
+                "evidence_contract": EVIDENCE_CONTRACT,
             },
         ))
         sum_points += points
@@ -229,13 +308,22 @@ def compile_question(
             "explicit_max_points": str(max_points),
             "teacher_approved": True,
             "automated_scoring_validated": False,
+            "evidence_contract": EVIDENCE_CONTRACT,
         },
     )
+
     return Task(
-        id=q_id, prompt=prompt, task_type=task_type,
-        max_score=float(max_points), language=language,
-        domain=domain, assessment_spec=spec,
-        metadata={"rubric_version": VERSION, "scoring_route": scoring_route},
+        id=q_id,
+        prompt=prompt,
+        task_type=task_type,
+        max_score=float(max_points),
+        language=language,
+        domain=domain,
+        assessment_spec=spec,
+        metadata={
+            "rubric_version": VERSION,
+            "scoring_route": scoring_route,
+        },
     )
 
 
@@ -243,15 +331,27 @@ def compile_assessment(assessment: Mapping[str, Any]) -> List[Task]:
     """Compila y valida el conjunto; exige ID únicos y aprobación por pregunta."""
     if not isinstance(assessment, Mapping):
         raise RubricValidationError("Se requiere una evaluación estructurada.")
+
     a_id = _require_text(assessment.get("id"), "evaluacion.id")
     domain = _require_text(assessment.get("dominio", "general"), "dominio")
     language = _require_text(assessment.get("idioma", "es"), "idioma")
     questions = assessment.get("preguntas")
+
     if not isinstance(questions, list) or not questions:
         raise RubricValidationError("La evaluación debe contener preguntas.")
-    tasks = [compile_question(q, assessment_id=a_id, domain=domain, language=language)
-             for q in questions]
+
+    tasks = [
+        compile_question(
+            q,
+            assessment_id=a_id,
+            domain=domain,
+            language=language
+        )
+        for q in questions
+    ]
+
     ids = [task.id for task in tasks]
     if len(ids) != len(set(ids)):
         raise RubricValidationError("Hay IDs de preguntas repetidos.")
+
     return tasks
