@@ -1,13 +1,15 @@
 
-name: Evalia 3.0 - comprobaciones tecnicas
+name: Evalia 3.0 y 3.2 - comprobaciones tecnicas
 
 on:
   push:
     branches:
       - feature/evalia-3-rubrica-universal
       - feature/evalia-3-1-ajustes-semanticos
+      - feature/evalia-3-2-evidencia-conceptual
     paths:
       - "feature/core/**"
+      - "rubrica_evalia_3_2_evidencias.json"
       - ".github/workflows/evalia3-tests.yml"
   workflow_dispatch:
 
@@ -203,5 +205,235 @@ jobs:
 
           print(
               "Pruebas tecnicas Evalia 3.0 completadas."
+          )
+          PY
+
+      - name: Probar rubrica y evidencias de Evalia 3.2 sin modelo externo
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from unittest.mock import patch
+
+          from feature.core.adjudication import AdjudicationResult
+          from feature.core.engine import evaluate, _criterion_adjudications
+          from feature.core.models import (
+              EvaluationInput, ResponseInput, RepresentationResult
+          )
+          from feature.core.rubric_v3 import (
+              compile_assessment, compile_question, RubricValidationError
+          )
+          from feature.core.rubric_scoring_v3 import assess_v3
+
+          path = Path('rubrica_evalia_3_2_evidencias.json')
+          rubric = json.loads(path.read_text(encoding='utf-8'))
+          tasks = {t.id: t for t in compile_assessment(rubric)}
+
+          assert len(tasks) == 34, 'Deben existir 34 preguntas'
+          assert abs(
+              sum(t.max_score for t in tasks.values()) - 70.0
+          ) < 1e-6
+          assert sum(
+              len(q['criterios']) for q in rubric['preguntas']
+          ) == 60
+          assert sum(
+              len(t.assessment_spec.criteria)
+              for t in tasks.values()
+          ) == 62
+          assert all(
+              t.assessment_spec.scoring_policy['teacher_approved']
+              for t in tasks.values()
+          )
+          print(
+              'OK: 34 preguntas, 60 criterios y 70 puntos, '
+              'aprobaciones preservadas'
+          )
+
+          # P2: equivalencia expresamente autorizada.
+          p2 = tasks['P2']
+          assert 'procesamiento' in (
+              p2.assessment_spec.criteria[0].accepted_values
+          )
+
+          r2 = evaluate(EvaluationInput(
+              assessment_id=rubric['id'],
+              task=p2,
+              response=ResponseInput(text='Procesamiento'),
+              language='es'
+          ))
+          assert r2.judgment.score == 1.0
+          assert r2.traceability[
+              'final_grade_authorized'
+          ] is False
+          print(
+              'OK: P2 acepta variante autorizada '
+              'sin embeddings; nota provisional'
+          )
+
+          # P30: tres observables independientes.
+          p30 = tasks['P30']
+          criterion = p30.assessment_spec.criteria[0]
+          units = criterion.metadata['observables']
+          ids = [u['id'] for u in units]
+
+          assert criterion.metadata[
+              'observables_aprobados'
+          ] is True
+          assert criterion.metadata[
+              'credito_por_unidad'
+          ] is True
+
+          assert len(ids) == 3
+          assert len(set(ids)) == 3
+          assert set(ids) == {
+              'P30_velocidad',
+              'P30_precision',
+              'P30_prosodia'
+          }
+          assert all(u['weight'] > 0 for u in units)
+          print(
+              'OK: P30 contiene tres observables '
+              'aprobados e independientes'
+          )
+
+          # El motor debe transmitir los observables completos.
+          captured = []
+
+          def fake_adjudicate(**kw):
+              captured.extend(
+                  kw['context']['conceptual_units']
+              )
+              return AdjudicationResult(
+                  relation='undetermined',
+                  score=0.0,
+                  confidence=0.0,
+                  rationale='Simulacion de CI'
+              )
+
+          data = EvaluationInput(
+              assessment_id=rubric['id'],
+              task=p30,
+              response=ResponseInput(
+                  text='velocidad precision prosodia'
+              ),
+              language='es'
+          )
+
+          with patch(
+              'feature.core.engine.adjudicate',
+              side_effect=fake_adjudicate
+          ):
+              _criterion_adjudications(
+                  data,
+                  RepresentationResult(language='es')
+              )
+
+          assert [u['id'] for u in captured] == ids
+          print(
+              'OK: engine transmite los tres '
+              'observables sin duplicacion'
+          )
+
+          # Comprobar puntuacion con dictamen simulado.
+          # No representa precision semantica del modelo real.
+          def synthetic(relation, included, valid=True):
+              reported = [
+                  {
+                      'id': uid,
+                      'required': True,
+                      'matched': uid in included
+                  }
+                  for uid in ids
+              ] if valid else []
+
+              return AdjudicationResult(
+                  relation=relation,
+                  score=0.0,
+                  confidence=0.7,
+                  rationale='Prueba sintetica de interfaz',
+                  evidence='respuesta de prueba',
+                  metadata={
+                      'semantic_similarity': 0.8,
+                      'required_conceptual_coverage':
+                          len(included) / 3,
+                      'conceptual_unit_results': reported
+                  }
+              )
+
+          def score(adjudication):
+              result, _ = assess_v3(
+                  data,
+                  RepresentationResult(language='es'),
+                  {criterion.id: adjudication}
+              )
+              return result
+
+          all_ids = set(ids)
+          full = score(
+              synthetic('correct', all_ids)
+          )
+          partial = score(
+              synthetic('partially_correct', set(ids[:2]))
+          )
+          missing = score(
+              synthetic('undetermined', all_ids, valid=False)
+          )
+          contradictory = score(
+              synthetic('contradictory', all_ids)
+          )
+
+          assert full.score == 3.0
+          assert not full.metadata['unscored_criteria']
+
+          assert abs(partial.score - 2.0) < 0.0001
+          assert not partial.metadata['unscored_criteria']
+
+          assert contradictory.score == 0.0
+          assert missing.score == 0.0
+          assert missing.metadata[
+              'unscored_criteria'
+          ] == [criterion.id]
+
+          print(
+              'OK: evidencia simulada total=3, '
+              'parcial=2, contradiccion=0, '
+              'indeterminada=pendiente'
+          )
+
+          # Los observables no autorizados deben bloquearse.
+          draft = {
+              'id': 'PRUEBA',
+              'tipo': 'abierta',
+              'enunciado': 'Explicar dos ideas',
+              'maximo': 2,
+              'aprobada': True,
+              'criterios': [{
+                  'id': 'C',
+                  'descripcion': 'Dos ideas',
+                  'puntos': 2,
+                  'observables': [
+                      {'descripcion': 'idea A'},
+                      {'descripcion': 'idea B'}
+                  ]
+              }]
+          }
+
+          try:
+              compile_question(
+                  draft,
+                  assessment_id='CI-3.2'
+              )
+          except RubricValidationError:
+              pass
+          else:
+              raise AssertionError(
+                  'No se deben activar observables no aprobados'
+              )
+
+          print('OK: rubricas no aprobadas rechazadas')
+          print(
+              'Pruebas contractuales Evalia 3.2 completadas; '
+              'SIN validar precision semantica'
           )
           PY
