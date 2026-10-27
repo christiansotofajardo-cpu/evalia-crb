@@ -195,6 +195,45 @@ def _flexional_overlap(
     return _bounded(matched / len(reference_roots))
 
 
+def _evidence_windows(response_text: str) -> List[str]:
+    """Return conservative local candidates in addition to the full answer.
+
+    Each conceptual unit may be stated inside a list or a short clause.
+    Preserve the full response; splitting only supplies *additional*
+    candidate evidence, never erases negation/contradiction checks.
+    No domain vocabulary is hard-coded here.
+    """
+    import re
+
+    full = response_text.strip()
+    if not full:
+        return []
+    segments = re.split(r"[,;\n]+|(?<!\w)\d+[.)]\s*", full)
+    windows = [full]
+    for segment in segments:
+        cleaned = segment.strip(" .;:()[]")
+        if not cleaned:
+            continue
+        windows.append(cleaned)
+        # Split short coordinated enumerations but do not split long
+        # explanatory sentences into decontextualized tokens.
+        if len(_tokens(cleaned)) <= 12:
+            windows.extend(
+                part.strip(" .;:()[]")
+                for part in re.split(r"\s+(?:y|e|and)\s+", cleaned)
+                if part.strip(" .;:()[]")
+            )
+
+    result: List[str] = []
+    seen = set()
+    for window in windows:
+        normalized = normalize_semantic_text(window)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(window)
+    return result
+
+
 def _contains_phrase(text: str, phrase: str) -> bool:
     normalized_text = normalize_semantic_text(text)
     normalized_phrase = normalize_semantic_text(phrase)
@@ -206,7 +245,7 @@ def _contains_phrase(text: str, phrase: str) -> bool:
     import re
     return re.search(
         r"(?<!\w)" + re.escape(normalized_phrase) + r"(?!\w)",
-        normalized_text,
+        normalized_text
     ) is not None
 
 
@@ -219,10 +258,51 @@ def _negation_mismatch(
     response_text: str,
     reference_text: str,
 ) -> bool:
-    response_negation = _contains_negation(response_text)
-    reference_negation = _contains_negation(reference_text)
+    """Flag only explicit, locally scoped polarity conflicts.
 
-    return response_negation != reference_negation
+    A rubric instruction such as "no repetir sinónimos" is NOT a
+    negation of the concept to be evaluated. Likewise, "sin errores"
+    is not a contradiction of "precisión lectora". This deliberately
+    misses some implicit contradictions; those require an actual NLI
+    verifier, not a naive negation-token comparison.
+    """
+    response = normalize_semantic_text(response_text)
+    reference = normalize_semantic_text(reference_text)
+    if not response or not reference:
+        return False
+
+    # Only consider meaningful content tokens shared across the two
+    # propositions. Do not infer content negation from task directions.
+    ignore = {
+        "para", "como", "entre", "sobre", "desde", "hasta", "donde",
+        "porque", "cual", "cuales", "cuando", "algun", "algunos",
+        "deben", "deber", "indique", "mencione", "explique", "tres",
+        "cuatro", "distintos", "diferentes", "repetir", "sinonimos",
+        "respuesta", "pregunta", "ejemplos", "contiene", "tener",
+        "lectura", "lenguaje", "palabras", "with", "that", "this",
+        "must", "should", "answer", "example", "examples",
+    }
+    shared = set(_tokens(reference_text)) & set(_tokens(response_text))
+    anchors = {w for w in shared if len(w) >= 5 and w not in ignore}
+    if not anchors:
+        return False
+
+    # Strict patterns rather than arbitrary occurrences of no/not/sin.
+    # Limit the distance between negator and shared concept; if unclear,
+    # do not announce a contradiction.
+    import re
+    scoped = re.compile(
+        r"(?<!\w)(?:no|nunca|jamas|sin|not|never|without)"
+        r"(?:\s+(?:es|son|hay|tiene|tienen|existe|presenta|presentan|"
+        r"muestra|muestran|se|observa|the|a|an|is|are|has|have|any|"
+        r"una|un|el|la|los|las|de|del|en)){0,3}"
+        r"\s+(\w+)(?!\w)"
+    )
+
+    def directly_negated(text: str) -> set[str]:
+        return {match.group(1) for match in scoped.finditer(text)} & anchors
+
+    return bool(directly_negated(response) ^ directly_negated(reference))
 
 
 def _declared_incompatible_concepts(
@@ -522,29 +602,44 @@ def _evaluate_conceptual_coverage(
 
         best_flexional_overlap = 0.0
         best_flexional_reference = ""
+        best_window = ""
+        explicitly_negated_windows: List[str] = []
 
+        # Test the full answer and short, non-overlapping candidate
+        # clauses. This improves local evidence recognition in lists.
+        # Do not accept substring fragments as teacher-approved variants.
+        windows = _evidence_windows(response_text)
         for reference in references:
-            result = semantic_matcher.compare(
-                response_text=response_text,
-                reference_text=reference,
-                threshold=unit_threshold,
-            )
+            for window in windows:
+                # A mention like "no hay prosodia" cannot earn credit
+                # simply because the authorized word is present.
+                if _negation_mismatch(window, reference):
+                    explicitly_negated_windows.append(window)
+                    continue
+                # Direct lexical matches remain explicit evidence; avoid
+                # penalizing them for unrelated words in the full answer.
+                if _contains_phrase(window, reference):
+                    similarity = 1.0
+                    method = "explicit_reference_match"
+                else:
+                    result = semantic_matcher.compare(
+                        response_text=window,
+                        reference_text=reference,
+                        threshold=unit_threshold,
+                    )
+                    similarity = float(result.similarity)
+                    method = result.method
 
-            similarity = float(result.similarity)
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_reference = reference
+                    best_method = method
+                    best_window = window
 
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_reference = reference
-                best_method = result.method
-
-            flexional_overlap = _flexional_overlap(
-                response_text=response_text,
-                reference_text=reference,
-            )
-
-            if flexional_overlap > best_flexional_overlap:
-                best_flexional_overlap = flexional_overlap
-                best_flexional_reference = reference
+                flexional_overlap = _flexional_overlap(window, reference)
+                if flexional_overlap > best_flexional_overlap:
+                    best_flexional_overlap = flexional_overlap
+                    best_flexional_reference = reference
 
         semantic_match = best_similarity >= unit_threshold
         flexional_match = best_flexional_overlap >= 0.80
@@ -574,6 +669,10 @@ def _evaluate_conceptual_coverage(
                 "matched": matched,
                 "similarity": best_similarity,
                 "best_reference": best_reference,
+                "best_evidence_window": best_window,
+                "negated_windows_skipped": list(
+                    dict.fromkeys(explicitly_negated_windows)
+                ),
                 "semantic_method": best_method,
                 "semantic_match": semantic_match,
                 "flexional_overlap": best_flexional_overlap,
@@ -800,12 +899,11 @@ class HybridConceptualAdjudicator:
             units = _conceptual_units_from_context(context)
             choices = [reference]
             for unit in units:
-                choices += [
-                    unit.get("description", "")
-                ] + list(unit.get("variants", []))
+                choices += [unit.get("description", "")] + list(
+                    unit.get("variants", [])
+                )
             explicit = any(
-                normalize_semantic_text(response) ==
-                normalize_semantic_text(x)
+                normalize_semantic_text(response) == normalize_semantic_text(x)
                 for x in choices if x
             )
             if not explicit:
